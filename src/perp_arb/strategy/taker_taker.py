@@ -4,13 +4,25 @@ Modes:
   * `paper` — full decision math, orders are no-ops that log synthetic fills.
   * `live`  — real `place_market_order` calls on both venues concurrently.
 
+What it bets on:
+  An EWMA of (mid_aster - mid_lighter) tracks the long-run inter-venue
+  *bias*. The bias itself can be structurally non-zero (different oracles,
+  funding rates, USDT-vs-USDC quote currencies). What matters is that the
+  current spread oscillates around the bias. The strategy fires when the
+  current depth-aware spread deviates from the EWMA bias by more than
+  `fees_bps + min_profit_bps`, betting on reversion to bias.
+
 Exit policy is implicit: a reverse-direction entry IS the exit. Direction B
 fires with the same `qty` exactly cancel a direction-A position (and vice
 versa). The risk manager caps absolute exposure via `max_qty`, so positions
-can stack up to the cap and unwind naturally when the spread mean-reverts.
-This assumes the inter-venue bias is mean-reverting — for majors like ETH/BTC
-that's reasonable; for thin alts a permanent shift could trap a max-qty
-position until the operator manually flattens.
+stack up to the cap and unwind naturally when the spread reverts toward bias.
+
+Failure modes (when max-qty position gets stuck):
+  * Spread *trends* away from bias without reverting (regime change faster
+    than the EWMA can chase) → one-direction entries keep stacking.
+  * Spread variance is too low — never exceeds threshold → no signal.
+  * `bias_window_ticks` mistuned: too short tracks noise; too long lags
+    real regime shifts.
 """
 
 from __future__ import annotations
