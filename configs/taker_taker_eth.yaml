@@ -1,0 +1,27 @@
+strategy: taker_taker         # spread_monitor | taker_taker
+mode: paper                   # paper | live  (CLI --mode overrides)
+
+pair:
+  base: ETH
+  aster_symbol: ETHUSDT
+  lighter_symbol: ETH
+
+# sizing
+qty: 0.05                     # per-order size (ETH)
+max_qty: 0.5                  # hard cap on net exposure either venue
+
+# entry math
+fees_bps: 6                   # combined round-trip taker fees
+min_profit_bps: 3             # required edge above fees
+bias_window_ticks: 600        # EWMA window; ~5 min at ~2 ticks/s
+warmup_seconds: 180           # don't trade until bias is stable
+
+# depth / staleness gates
+max_levels: 3                 # qty must fill within top-N levels
+max_slippage_bps: 5           # abort if (vwap - mid) / mid > this
+max_stale_ms: 200             # abort if either quote older than this
+
+risk:
+  max_consecutive_failures: 3
+  max_leg_latency_ms: 500
+  daily_loss_cap_usd: 50

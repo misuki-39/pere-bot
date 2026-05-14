@@ -1,0 +1,59 @@
+[project]
+name = "perp-arb"
+version = "0.1.0"
+description = "Cross-venue perp arbitrage bot (Aster <-> Lighter)"
+authors = [
+    { name = "misuki-39", email = "misuki3939@proton.me" },
+]
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.10",
+    "websockets>=13",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "tenacity>=8.5",
+    "python-dotenv>=1.0",
+    "eth-account>=0.13",
+    "eth-utils>=4.1",
+    "orjson>=3.10",
+]
+
+[project.optional-dependencies]
+lighter = [
+    "lighter-sdk @ git+https://github.com/elliottech/lighter-python.git",
+]
+
+[project.scripts]
+runbot = "perp_arb.runbot:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "types-pyyaml>=6.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.12,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
