@@ -9,39 +9,79 @@ from __future__ import annotations
 from decimal import Decimal
 
 from perp_arb.core.types import BookLevel, OrderBook, Quote, Symbol
-from perp_arb.strategy.base import EwmaTracker
+from perp_arb.strategy.base import SpreadModel, TimeEwma
 from perp_arb.utils.precision import vwap_fill
 
-# ---- EWMA --------------------------------------------------------------
+# ---- TimeEwma ----------------------------------------------------------
 
-def test_ewma_first_sample_seeds_value() -> None:
-    e = EwmaTracker(window=10)
+def test_time_ewma_first_sample_seeds_value() -> None:
+    e = TimeEwma(half_life_s=60)
     assert e.value is None
-    v = e.update(Decimal("5"))
-    assert v == Decimal("5")
+    assert e.update(Decimal("5"), ts_ms=0) == Decimal("5")
+    assert e.value == Decimal("5")
 
 
-def test_ewma_converges_to_mean() -> None:
-    e = EwmaTracker(window=5)
-    for _ in range(200):
-        e.update(Decimal("10"))
+def test_time_ewma_converges_to_mean() -> None:
+    e = TimeEwma(half_life_s=1.0)
+    t = 0
+    for _ in range(500):
+        t += 100
+        e.update(Decimal("10"), ts_ms=t)
     assert e.value is not None
     assert abs(e.value - Decimal("10")) < Decimal("0.001")
 
 
-def test_ewma_is_warm_after_window_samples() -> None:
-    e = EwmaTracker(window=3)
-    for _ in range(2):
-        e.update(Decimal("1"))
-    assert not e.is_warm
-    e.update(Decimal("1"))
-    assert e.is_warm
+def test_time_ewma_one_half_life_halves_the_gap() -> None:
+    # start at 0, then a step to 1; after exactly one half-life the estimate
+    # should sit ~halfway (0.5), independent of how many ticks it took.
+    e = TimeEwma(half_life_s=10)
+    e.update(Decimal("0"), ts_ms=0)
+    e.update(Decimal("1"), ts_ms=10_000)  # one half-life later
+    assert abs(e.value - Decimal("0.5")) < Decimal("1e-9")
 
 
-def test_ewma_alpha_matches_pandas_convention() -> None:
-    e = EwmaTracker(window=10)
-    # alpha = 2 / (10 + 1) = 0.1818...
-    assert e.alpha == Decimal(2) / Decimal(11)
+def test_time_ewma_decay_is_rate_invariant() -> None:
+    # Same elapsed time, different tick counts → same result. This is the
+    # whole point of time-decay over the old tick-count window.
+    coarse = TimeEwma(half_life_s=5)
+    coarse.update(Decimal("0"), 0)
+    coarse.update(Decimal("1"), 5_000)
+
+    fine = TimeEwma(half_life_s=5)
+    fine.update(Decimal("0"), 0)
+    for ms in range(100, 5_001, 100):  # 50 ticks over the same 5 s
+        fine.update(Decimal("1"), ms)
+
+    assert abs(coarse.value - fine.value) < Decimal("0.02")
+
+
+def test_time_ewma_ignores_non_monotonic_ts() -> None:
+    e = TimeEwma(half_life_s=10)
+    e.update(Decimal("1"), ts_ms=1_000)
+    before = e.value
+    e.update(Decimal("99"), ts_ms=1_000)  # duplicate timestamp
+    assert e.value == before
+
+
+def test_spread_model_warmup_is_wall_clock() -> None:
+    m = SpreadModel(center_half_life_s=3600, scale_half_life_s=300, warmup_s=2)
+    assert not m.is_warm
+    m.update(Decimal("0.01"), ts_ms=0)
+    assert not m.is_warm
+    m.update(Decimal("0.01"), ts_ms=1_999)
+    assert not m.is_warm
+    m.update(Decimal("0.01"), ts_ms=2_000)
+    assert m.is_warm
+
+
+def test_spread_model_residual_decomposition() -> None:
+    # A very slow centre barely moves, so residual ≈ deviation from start.
+    m = SpreadModel(center_half_life_s=1e9, scale_half_life_s=1e9, warmup_s=0)
+    m.update(Decimal("0.00"), ts_ms=0)
+    st = m.update(Decimal("0.05"), ts_ms=1_000)
+    assert abs(st.center) < Decimal("1e-6")
+    assert abs(st.residual - Decimal("0.05")) < Decimal("1e-6")
+    assert abs(st.residual_bps(Decimal("100")) - Decimal("5")) < Decimal("1e-3")
 
 
 # ---- entry math, end-to-end against synthetic books -------------------

@@ -14,7 +14,7 @@ from ..core.logging import SPREAD_CSV_HEADER, CsvWriter
 from ..core.types import OrderBook, Quote
 from ..utils.precision import vwap_fill
 from ..utils.time import now_ms
-from .base import BaseStrategy, EwmaTracker
+from .base import BaseStrategy, SpreadModel
 
 _log = logging.getLogger(__name__)
 
@@ -25,7 +25,11 @@ class SpreadMonitor(BaseStrategy):
     def __init__(self, cfg, exchanges, markets) -> None:
         super().__init__(cfg, exchanges, markets)
         self._csv: CsvWriter | None = None
-        self._bias = EwmaTracker(cfg.strategy.bias_window_ticks)
+        self._spread = SpreadModel(
+            center_half_life_s=cfg.strategy.bias_halflife_s,
+            scale_half_life_s=cfg.strategy.scale_halflife_s,
+            warmup_s=0,  # monitor logs from the first tick; no warmup gating
+        )
         self._last_log_ms = 0
 
     async def run(self) -> None:
@@ -63,10 +67,11 @@ class SpreadMonitor(BaseStrategy):
 
         qty = self.cfg.strategy.qty
 
+        ts_ms = now_ms()
         mid_a = a_q.mid
         mid_l = l_q.mid
         raw_spread = mid_a - mid_l
-        bias = self._bias.update(raw_spread)
+        bias = self._spread.update(raw_spread, ts_ms).center
 
         vwap_a_sell, _ = vwap_fill(a_book.bids, qty, max_levels=self.cfg.strategy.max_levels)
         vwap_a_buy,  _ = vwap_fill(a_book.asks, qty, max_levels=self.cfg.strategy.max_levels)
@@ -80,7 +85,6 @@ class SpreadMonitor(BaseStrategy):
         if vwap_l_sell is not None and vwap_a_buy is not None:
             edge_B_bps = ((vwap_l_sell - vwap_a_buy) + bias) / mid_a * Decimal(10_000)
 
-        ts_ms = now_ms()
         gates = (vwap_a_sell is not None and vwap_l_buy is not None
                  and vwap_l_sell is not None and vwap_a_buy is not None)
 

@@ -46,7 +46,13 @@ class StrategyCfg(BaseModel):
     # entry math
     fees_bps: Decimal = Decimal("6")
     min_profit_bps: Decimal = Decimal("3")
-    bias_window_ticks: int = 600
+    # Spread centre ("bias") is a wall-clock half-life EWMA. It must be far
+    # slower than the ~2 s residual reversion so it tracks the slow intraday
+    # centre without eating the tradeable signal — hours-scale by default.
+    bias_halflife_s: float = Field(default=3600.0, gt=0)
+    # Residual dispersion half-life (diagnostics / outlier clamp only, never
+    # the entry gate). Minutes-scale.
+    scale_halflife_s: float = Field(default=300.0, gt=0)
     warmup_seconds: int = 180
 
     # depth / staleness gates

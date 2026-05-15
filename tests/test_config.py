@@ -27,7 +27,8 @@ qty: 0.05
 max_qty: 0.5
 fees_bps: 6
 min_profit_bps: 3
-bias_window_ticks: 600
+bias_halflife_s: 3600
+scale_halflife_s: 300
 warmup_seconds: 180
 max_levels: 3
 max_slippage_bps: 5

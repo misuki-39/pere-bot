@@ -21,8 +21,9 @@ Failure modes (when max-qty position gets stuck):
   * Spread *trends* away from bias without reverting (regime change faster
     than the EWMA can chase) → one-direction entries keep stacking.
   * Spread variance is too low — never exceeds threshold → no signal.
-  * `bias_window_ticks` mistuned: too short tracks noise; too long lags
-    real regime shifts.
+  * `bias_halflife_s` mistuned: too short eats the ~2 s reversion signal
+    (centre chases its own residual to zero); too long lags the slow
+    intraday centre wander.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from ..core.types import OrderResult, Side
 from ..risk.manager import RiskManager
 from ..utils.precision import vwap_fill
 from ..utils.time import mono_ms, now_ms
-from .base import BaseStrategy, EwmaTracker
+from .base import BaseStrategy, SpreadModel
 
 _log = logging.getLogger(__name__)
 
@@ -69,7 +70,11 @@ class TakerTakerArbitrage(BaseStrategy):
     def __init__(self, cfg, exchanges, markets) -> None:
         super().__init__(cfg, exchanges, markets)
         s = cfg.strategy
-        self._bias = EwmaTracker(s.bias_window_ticks)
+        self._spread = SpreadModel(
+            center_half_life_s=s.bias_halflife_s,
+            scale_half_life_s=s.scale_halflife_s,
+            warmup_s=s.warmup_seconds,
+        )
         self._csv: CsvWriter | None = None
         self._start_ts_ms = 0
         self._evaluating = False
@@ -127,11 +132,10 @@ class TakerTakerArbitrage(BaseStrategy):
 
         mid_a = a_q.mid
         mid_l = l_q.mid
-        bias = self._bias.update(mid_a - mid_l)
+        st = self._spread.update(mid_a - mid_l, now)
+        bias = st.center
 
-        if (now - self._start_ts_ms) < s.warmup_seconds * 1000:
-            return
-        if not self._bias.is_warm:
+        if not self._spread.is_warm:
             return
 
         qty = s.qty
