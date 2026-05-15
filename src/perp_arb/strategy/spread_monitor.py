@@ -94,8 +94,8 @@ class SpreadMonitor(BaseStrategy):
                 edge_A_bps, edge_B_bps, gates,
             ])
 
-        # human-readable log throttled to once per second
-        if ts_ms - self._last_log_ms >= 1000:
+        # human-readable log throttled to once per minute; CSV has the full stream
+        if ts_ms - self._last_log_ms >= 60_000:
             self._last_log_ms = ts_ms
             _log.info(
                 "spread: mid_a=%s mid_l=%s spread=%s bias=%s edge_A=%s edge_B=%s gates=%s",

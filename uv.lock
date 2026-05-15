@@ -1186,17 +1186,13 @@ dependencies = [
     { name = "aiohttp" },
     { name = "eth-account" },
     { name = "eth-utils" },
+    { name = "lighter-sdk" },
     { name = "orjson" },
     { name = "pydantic" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "tenacity" },
     { name = "websockets" },
-]
-
-[package.optional-dependencies]
-lighter = [
-    { name = "lighter-sdk" },
 ]
 
 [package.dev-dependencies]
@@ -1213,7 +1209,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.10" },
     { name = "eth-account", specifier = ">=0.13" },
     { name = "eth-utils", specifier = ">=4.1" },
-    { name = "lighter-sdk", marker = "extra == 'lighter'", git = "https://github.com/elliottech/lighter-python.git" },
+    { name = "lighter-sdk", git = "https://github.com/elliottech/lighter-python.git" },
     { name = "orjson", specifier = ">=3.10" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "python-dotenv", specifier = ">=1.0" },
@@ -1221,7 +1217,6 @@ requires-dist = [
     { name = "tenacity", specifier = ">=8.5" },
     { name = "websockets", specifier = ">=13" },
 ]
-provides-extras = ["lighter"]
 
 [package.metadata.requires-dev]
 dev = [

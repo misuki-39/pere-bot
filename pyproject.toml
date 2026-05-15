@@ -16,10 +16,6 @@ dependencies = [
     "eth-account>=0.13",
     "eth-utils>=4.1",
     "orjson>=3.10",
-]
-
-[project.optional-dependencies]
-lighter = [
     "lighter-sdk @ git+https://github.com/elliottech/lighter-python.git",
 ]
 
