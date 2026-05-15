@@ -22,8 +22,8 @@ Failure modes (when max-qty position gets stuck):
     than the EWMA can chase) → one-direction entries keep stacking.
   * Spread variance is too low — never exceeds threshold → no signal.
   * `bias_halflife_s` mistuned: too short eats the ~2 s reversion signal
-    (centre chases its own residual to zero); too long lags the slow
-    intraday centre wander.
+    (center chases its own residual to zero); too long lags the slow
+    intraday center wander.
 """
 
 from __future__ import annotations
@@ -76,7 +76,6 @@ class TakerTakerArbitrage(BaseStrategy):
             warmup_s=s.warmup_seconds,
         )
         self._csv: CsvWriter | None = None
-        self._start_ts_ms = 0
         self._evaluating = False
         self._position = SyntheticPosition()
         self._risk = RiskManager(s.risk, max_qty=s.max_qty)
@@ -92,7 +91,6 @@ class TakerTakerArbitrage(BaseStrategy):
         csv_path = self.cfg.runtime.log_dir / f"trades_taker_taker_{ts}.csv"
         self._csv = CsvWriter(csv_path, TRADES_CSV_HEADER)
         _log.info("taker_taker mode=%s writing %s", self.cfg.strategy.mode, csv_path)
-        self._start_ts_ms = now_ms()
 
         self._aster().subscribe_book(self._aster_market(), lambda _b: self._schedule_eval())
         self._lighter().subscribe_book(self._lighter_market(), lambda _b: self._schedule_eval())

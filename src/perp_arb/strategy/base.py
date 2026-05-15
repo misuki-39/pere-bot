@@ -8,13 +8,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from decimal import Decimal
 
-_LN2 = Decimal(2).ln()
-
 from ..core.config import AppCfg
 from ..core.exchange import BaseExchange
 from ..core.types import MarketInfo
+from ..utils.precision import BPS
 
 _log = logging.getLogger(__name__)
+
+_LN2 = Decimal(2).ln()
 
 
 class BaseStrategy(ABC):
@@ -68,7 +69,7 @@ class TimeEwma:
     so one half-life of elapsed time always discounts the old value by 50%,
     whatever the tick rate. Large gaps self-attenuate (a 26s gap at HL=1h
     moves the estimate <0.5%), which is exactly the robustness we want for a
-    slow centre.
+    slow center.
     """
 
     def __init__(self, half_life_s: float) -> None:
@@ -97,34 +98,30 @@ class SpreadState:
     """One evaluation's view of the spread decomposed into the two timescales
     the strategy actually cares about."""
 
-    center: Decimal      # slow inter-venue centre (the "bias")
+    center: Decimal      # slow inter-venue center (the "bias")
     residual: Decimal    # spread - center: the fast, mean-reverting tradeable
-    scale: Decimal       # running stdev of the residual (dispersion, diag/z)
+    scale: Decimal       # running stdev of the residual (dispersion diagnostic)
 
     def residual_bps(self, ref: Decimal) -> Decimal:
-        return self.residual / ref * Decimal(10_000)
-
-    @property
-    def zscore(self) -> Decimal:
-        return self.residual / self.scale if self.scale > 0 else Decimal(0)
+        return self.residual / ref * BPS
 
 
 class SpreadModel:
-    """Decomposes (mid_a - mid_l) into a slow centre + fast residual.
+    """Decomposes (mid_a - mid_l) into a slow center + fast residual.
 
-    The data says the spread is a slowly-wandering centre (hours, ~5-8 bps
+    The data says the spread is a slowly-wandering center (hours, ~5-8 bps
     range, an intraday session effect) plus a strongly mean-reverting residual
     (AR(1) half-life ~2 s). The strategy trades the residual and bets on it
-    reverting to the centre. Therefore:
+    reverting to the center. Therefore:
 
-      * centre half-life must be FAR slower than the ~2 s reversion, or the
-        centre eats the very signal we trade (a fast EWMA flatters its own
+      * center half-life must be FAR slower than the ~2 s reversion, or the
+        center eats the very signal we trade (a fast EWMA flatters its own
         residual to near zero). Hours-scale is correct.
-      * scale tracks residual dispersion on a minutes half-life. It is for
-        diagnostics and an optional outlier clamp ONLY — never the entry gate:
-        dispersion spikes during a dislocation burst, so z-score shrinks
-        exactly when the absolute opportunity is largest. Volume-farming
-        gating must stay on absolute bps.
+      * scale tracks residual dispersion on a minutes half-life — a dispersion
+        diagnostic only, never the entry gate: it spikes during a dislocation
+        burst, so a scale-relative measure would shrink exactly when the
+        absolute opportunity is largest. Volume-farming gating stays on
+        absolute bps.
     """
 
     def __init__(
@@ -134,7 +131,7 @@ class SpreadModel:
         warmup_s: float,
     ) -> None:
         self._center = TimeEwma(center_half_life_s)
-        self._var = TimeEwma(scale_half_life_s)  # EWMA of residual**2
+        self._resid_sq = TimeEwma(scale_half_life_s)  # EWMA of residual**2
         self._warmup_ms = int(warmup_s * 1000)
         self._first_ts_ms: int | None = None
         self._last_ts_ms: int | None = None
@@ -145,8 +142,8 @@ class SpreadModel:
         self._last_ts_ms = ts_ms
         center = self._center.update(spread, ts_ms)
         residual = spread - center
-        var = self._var.update(residual * residual, ts_ms)
-        scale = var.sqrt() if var > 0 else Decimal(0)
+        resid_sq = self._resid_sq.update(residual * residual, ts_ms)
+        scale = resid_sq.sqrt() if resid_sq > 0 else Decimal(0)
         return SpreadState(center=center, residual=residual, scale=scale)
 
     @property
