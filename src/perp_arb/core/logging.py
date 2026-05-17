@@ -104,18 +104,5 @@ SPREAD_CSV_HEADER = [
     "vwap_a_sell", "vwap_a_buy", "vwap_l_sell", "vwap_l_buy",
     "edge_A_bps", "edge_B_bps", "gates_passed",
 ]
-
-TRADES_CSV_HEADER = [
-    "ts_ms",
-    "leg_pair_id",
-    "exchange",
-    "symbol",
-    "side",
-    "qty",
-    "price",
-    "fee",
-    "status",
-    "order_id",
-    "client_id",
-    "realised_pnl",
-]
+# taker_taker telemetry headers live with their dataclasses in
+# core.exec_record (derived from fields, so they cannot drift).

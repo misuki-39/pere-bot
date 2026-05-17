@@ -36,23 +36,14 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from ..core.config import RunMode
-from ..core.logging import TRADES_CSV_HEADER, CsvWriter
+from ..core.exec_record import Decision, ExecutionRecorder, LegReport
 from ..core.types import OrderResult, Side
 from ..risk.manager import RiskManager
 from ..utils.precision import vwap_fill
-from ..utils.time import mono_ms, now_ms
+from ..utils.time import now_ms
 from .base import BaseStrategy, SpreadModel
 
 _log = logging.getLogger(__name__)
-
-
-@dataclass
-class LegPair:
-    leg_pair_id: str
-    ts_ms: int
-    aster_side: Side
-    lighter_side: Side
-    qty: Decimal
 
 
 @dataclass
@@ -75,7 +66,7 @@ class TakerTakerArbitrage(BaseStrategy):
             scale_half_life_s=s.scale_halflife_s,
             warmup_s=s.warmup_seconds,
         )
-        self._csv: CsvWriter | None = None
+        self._recorder: ExecutionRecorder | None = None
         self._evaluating = False
         self._position = SyntheticPosition()
         self._risk = RiskManager(s.risk, max_qty=s.max_qty)
@@ -89,9 +80,9 @@ class TakerTakerArbitrage(BaseStrategy):
 
     async def run(self) -> None:
         ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        csv_path = self.cfg.runtime.log_dir / f"trades_taker_taker_{ts}.csv"
-        self._csv = CsvWriter(csv_path, TRADES_CSV_HEADER)
-        _log.info("taker_taker mode=%s writing %s", self.cfg.strategy.mode, csv_path)
+        self._recorder = ExecutionRecorder(self.cfg.runtime.log_dir, ts)
+        _log.info("taker_taker mode=%s recording to %s",
+                  self.cfg.strategy.mode, self.cfg.runtime.log_dir)
 
         self._aster().subscribe_book(self._aster_market(), lambda _b: self._schedule_eval())
         self._lighter().subscribe_book(self._lighter_market(), lambda _b: self._schedule_eval())
@@ -99,8 +90,8 @@ class TakerTakerArbitrage(BaseStrategy):
         try:
             await self._stop.wait()
         finally:
-            if self._csv:
-                self._csv.close()
+            if self._recorder:
+                self._recorder.close()
 
     # ---- evaluation ----
 
@@ -117,7 +108,6 @@ class TakerTakerArbitrage(BaseStrategy):
             self._evaluating = False
 
     async def _evaluate(self) -> None:
-        s = self.cfg.strategy
         a_book = self._aster().order_book(self._aster_market())
         l_book = self._lighter().order_book(self._lighter_market())
         a_q = self._aster().best_quote(self._aster_market())
@@ -125,17 +115,41 @@ class TakerTakerArbitrage(BaseStrategy):
         if a_book is None or l_book is None or a_q is None or l_q is None:
             return
 
-        now = now_ms()
-        if (now - max(a_q.ts_ms, l_q.ts_ms)) > s.max_stale_ms:
+        d = self._assess(a_book, l_book, a_q, l_q)
+        if d is None:
             return
+        try:
+            if d.outcome == "FIRED":
+                await self._fire(d)
+        finally:
+            if self._recorder:
+                self._recorder.emit(d)
 
+    def _assess(self, a_book, l_book, a_q, l_q) -> Decision | None:
+        """Pure decision logic: no order placement, no persistence. Returns the
+        Decision to record (outcome already terminal), or None for ticks not
+        worth recording (not warm, or no tradeable edge — that is the spread
+        monitor's job). Gate ordering matches the pre-refactor path exactly,
+        so trading behaviour is unchanged."""
+        s = self.cfg.strategy
+        now = now_ms()
         mid_a = a_q.mid
         mid_l = l_q.mid
-        st = self._spread.update(mid_a - mid_l, now)
-        bias = st.center
 
+        def new(outcome: str, reason: str | None = None, **kw) -> Decision:
+            return Decision(
+                decision_id=f"d-{uuid.uuid4().hex[:10]}",
+                ts_ms=now, mid_a=mid_a, mid_l=mid_l,
+                a_quote_ts_ms=a_q.ts_ms, l_quote_ts_ms=l_q.ts_ms,
+                outcome=outcome, abort_reason=reason, **kw,
+            )
+
+        if (now - max(a_q.ts_ms, l_q.ts_ms)) > s.max_stale_ms:
+            return new("ABORT_STALE", "quote older than max_stale_ms")
+
+        bias = self._spread.update(mid_a - mid_l, now).center
         if not self._spread.is_warm:
-            return
+            return None  # warmup: not interesting telemetry
 
         qty = s.qty
         vwap_a_sell, _ = vwap_fill(a_book.bids, qty, max_levels=s.max_levels)
@@ -143,48 +157,56 @@ class TakerTakerArbitrage(BaseStrategy):
         vwap_l_sell, _ = vwap_fill(l_book.bids, qty, max_levels=s.max_levels)
         vwap_l_buy,  _ = vwap_fill(l_book.asks, qty, max_levels=s.max_levels)
         if None in (vwap_a_sell, vwap_a_buy, vwap_l_sell, vwap_l_buy):
-            return
+            return new("ABORT_NO_DEPTH", "qty does not fill within max_levels",
+                       bias=bias)
+
+        vwaps = dict(vwap_a_sell=vwap_a_sell, vwap_a_buy=vwap_a_buy,
+                     vwap_l_sell=vwap_l_sell, vwap_l_buy=vwap_l_buy)
 
         slip = self._slip_cap
         if (abs((vwap_a_sell - mid_a) / mid_a) > slip
                 or abs((vwap_a_buy - mid_a) / mid_a) > slip
                 or abs((vwap_l_sell - mid_l) / mid_l) > slip
                 or abs((vwap_l_buy - mid_l) / mid_l) > slip):
-            return
+            return new("ABORT_SLIPPAGE", "vwap-mid exceeds max_slippage_bps",
+                       bias=bias, **vwaps)
 
         ref_mid = (mid_a + mid_l) / Decimal(2)
         threshold = ref_mid * (self._fee_frac + self._min_profit_frac)
-
-        # direction A: sell aster, buy lighter; direction B: the reverse
-        edge_A = (vwap_a_sell - vwap_l_buy) - bias - threshold
-        edge_B = (vwap_l_sell - vwap_a_buy) + bias - threshold
+        edge_A = (vwap_a_sell - vwap_l_buy) - bias - threshold   # sell A, buy L
+        edge_B = (vwap_l_sell - vwap_a_buy) + bias - threshold   # reverse
 
         self._maybe_heartbeat(now, mid_a, mid_l, bias, edge_A, edge_B, ref_mid)
 
         if edge_A <= 0 and edge_B <= 0:
-            return
+            return None  # nothing we'd act on
 
-        if edge_A >= edge_B:
-            aster_side, lighter_side = Side.SELL, Side.BUY
-        else:
-            aster_side, lighter_side = Side.BUY, Side.SELL
+        direction = "A" if edge_A >= edge_B else "B"
+        edge = max(edge_A, edge_B)
+        edge_bps = edge / ref_mid * Decimal(10_000)
+        a_side = Side.SELL if direction == "A" else Side.BUY
+        l_side = Side.BUY if direction == "A" else Side.SELL
 
-        post_aster = self._position.aster + qty * Decimal(aster_side.sign)
-        post_lighter = self._position.lighter + qty * Decimal(lighter_side.sign)
+        post_a = self._position.aster + qty * Decimal(a_side.sign)
+        post_l = self._position.lighter + qty * Decimal(l_side.sign)
         ok, reason = self._risk.can_trade(
-            post_trade_abs_position=max(abs(post_aster), abs(post_lighter)),
+            post_trade_abs_position=max(abs(post_a), abs(post_l)),
         )
         if not ok:
             if not self._risk_blocked:
                 self._risk_blocked = True
                 _log.info("entry blocked by risk: %s (suppressing until cleared)", reason)
-            return
+            return new("BLOCKED_RISK", reason, bias=bias,
+                       edge_bps=edge_bps, direction=direction, **vwaps)
 
         if self._risk_blocked:
             self._risk_blocked = False
             _log.info("risk block cleared — resuming entries")
 
-        await self._fire(aster_side, lighter_side, qty)
+        d = new("FIRED", bias=bias, edge_bps=edge_bps,
+                direction=direction, **vwaps)
+        d.timeline.mark("decision")  # latency clock starts at the decision instant
+        return d
 
     def _maybe_heartbeat(
         self,
@@ -206,89 +228,134 @@ class TakerTakerArbitrage(BaseStrategy):
 
     # ---- order firing ----
 
-    async def _fire(self, aster_side: Side, lighter_side: Side, qty: Decimal) -> None:
-        leg_pair_id = f"lp-{uuid.uuid4().hex[:10]}"
-        t0 = mono_ms()
-        _log.info(
-            "[%s] FIRE qty=%s aster=%s lighter=%s mode=%s",
-            leg_pair_id, qty, aster_side, lighter_side, self.cfg.strategy.mode,
+    @staticmethod
+    def _leg_report(venue: str, side: Side, qty: Decimal, expected: Decimal,
+                    r: OrderResult, latency_ms: int | None,
+                    kind: str = "entry") -> LegReport:
+        return LegReport(
+            exchange=venue,
+            side=side.value,
+            requested_qty=qty,
+            filled_qty=r.filled_size,
+            expected_price=expected,
+            realized_price=r.avg_price,
+            status=r.status.value if r.status else "",
+            success=r.success,
+            error=r.error_message,
+            order_id=r.order_id,
+            client_id=r.client_id,
+            fee=None,           # fill in once we have a fee accounting source
+            latency_ms=latency_ms,
+            kind=kind,
         )
 
-        if self.cfg.strategy.mode is RunMode.PAPER:
-            ra, rl = self._paper_fill(aster_side, lighter_side, qty)
+    async def _fire(self, d: Decision) -> None:
+        qty = self.cfg.strategy.qty
+        if d.direction == "A":
+            a_side, l_side = Side.SELL, Side.BUY
+            exp_a, exp_l = d.vwap_a_sell, d.vwap_l_buy
         else:
-            ra_task = asyncio.create_task(self._aster().place_market_order(
-                self._aster_market(), aster_side, qty,
-                client_id=f"{leg_pair_id}-a",
-            ))
-            rl_task = asyncio.create_task(self._lighter().place_market_order(
-                self._lighter_market(), lighter_side, qty,
-                client_id=f"{leg_pair_id}-l",
-            ))
-            ra, rl = await asyncio.gather(ra_task, rl_task)
+            a_side, l_side = Side.BUY, Side.SELL
+            exp_a, exp_l = d.vwap_a_buy, d.vwap_l_sell
 
-        leg_latency = mono_ms() - t0
-        pair = LegPair(
-            leg_pair_id=leg_pair_id,
-            ts_ms=now_ms(),
-            aster_side=aster_side,
-            lighter_side=lighter_side,
-            qty=qty,
-        )
+        _log.info("[%s] FIRE qty=%s aster=%s lighter=%s mode=%s",
+                  d.decision_id, qty, a_side, l_side, self.cfg.strategy.mode)
+
+        d.timeline.mark("send")
+        if self.cfg.strategy.mode is RunMode.PAPER:
+            ra, rl = self._paper_fill(a_side, l_side, qty)
+            d.timeline.mark("result_aster")
+            d.timeline.mark("result_lighter")
+        else:
+            async def _leg(coro, venue: str) -> OrderResult:
+                r = await coro
+                d.timeline.mark(f"result_{venue}")  # this leg's own fill instant
+                return r
+            ra, rl = await asyncio.gather(
+                _leg(self._aster().place_market_order(
+                    self._aster_market(), a_side, qty, client_id=f"{d.decision_id}-a"),
+                    "aster"),
+                _leg(self._lighter().place_market_order(
+                    self._lighter_market(), l_side, qty, client_id=f"{d.decision_id}-l"),
+                    "lighter"),
+            )
+        d.timeline.mark("result")
+
+        lat_a = d.timeline.span("send", "result_aster")
+        lat_l = d.timeline.span("send", "result_lighter")
+        d.legs = [
+            self._leg_report("aster", a_side, qty, exp_a, ra, lat_a),
+            self._leg_report("lighter", l_side, qty, exp_l, rl, lat_l),
+        ]
+        latency = d.timeline.span("send", "result")
 
         if ra.success and rl.success:
-            self._position.aster += qty * Decimal(aster_side.sign)
-            self._position.lighter += qty * Decimal(lighter_side.sign)
-            self._risk.record_success(leg_latency_ms=leg_latency)
-            self._log_fill(pair, "aster", ra)
-            self._log_fill(pair, "lighter", rl)
+            self._position.aster += qty * Decimal(a_side.sign)
+            self._position.lighter += qty * Decimal(l_side.sign)
+            self._risk.record_success(leg_latency_ms=latency or 0)
             _log.info(
-                "[%s] FILLED aster=%s lighter=%s latency=%dms pos_a=%s pos_l=%s",
-                leg_pair_id, ra.order_id, rl.order_id, leg_latency,
+                "[%s] FILLED aster=%s lighter=%s latency=%sms pos_a=%s pos_l=%s",
+                d.decision_id, ra.order_id, rl.order_id, latency,
                 self._position.aster, self._position.lighter,
             )
         else:
-            await self._handle_partial_failure(pair, ra, rl, leg_latency)
+            await self._handle_partial_failure(d, a_side, l_side, qty, ra, rl)
 
     async def _handle_partial_failure(
         self,
-        pair: LegPair,
+        d: Decision,
+        a_side: Side,
+        l_side: Side,
+        qty: Decimal,
         ra: OrderResult,
         rl: OrderResult,
-        leg_latency: int,
     ) -> None:
         if ra.success and not rl.success:
             _log.error(
                 "[%s] PARTIAL: aster filled, lighter failed (%s) — unwinding aster",
-                pair.leg_pair_id, rl.error_message,
+                d.decision_id, rl.error_message,
             )
-            await self._emergency_unwind("aster", pair.aster_side.opposite, pair.qty)
+            await self._unwind_leg(d, "aster", a_side.opposite, qty, ra.avg_price)
             self._risk.record_failure(f"lighter leg failed: {rl.error_message}")
         elif rl.success and not ra.success:
             _log.error(
                 "[%s] PARTIAL: lighter filled, aster failed (%s) — unwinding lighter",
-                pair.leg_pair_id, ra.error_message,
+                d.decision_id, ra.error_message,
             )
-            await self._emergency_unwind("lighter", pair.lighter_side.opposite, pair.qty)
+            await self._unwind_leg(d, "lighter", l_side.opposite, qty, rl.avg_price)
             self._risk.record_failure(f"aster leg failed: {ra.error_message}")
         else:
             _log.warning(
                 "[%s] BOTH FAILED: aster=%s lighter=%s",
-                pair.leg_pair_id, ra.error_message, rl.error_message,
+                d.decision_id, ra.error_message, rl.error_message,
             )
             self._risk.record_failure("both legs failed")
 
-    async def _emergency_unwind(self, venue: str, side: Side, qty: Decimal) -> None:
+    async def _unwind_leg(
+        self, d: Decision, venue: str, side: Side, qty: Decimal,
+        cost_basis: Decimal | None,
+    ) -> None:
+        """Flatten the stranded leg and record the unwind as a first-class leg
+        (kind=unwind). expected_price is the stranded fill we are reversing, so
+        the round-trip cost of a partial is directly computable offline."""
         if self.cfg.strategy.mode is RunMode.PAPER:
             return
         ex = self.exchanges[venue]
         mkt = self.markets[venue]
+        d.timeline.mark("unwind_send")
         try:
             r = await ex.place_market_order(mkt, side, qty, reduce_only=True)
             if not r.success:
                 _log.error("unwind on %s FAILED: %s", venue, r.error_message)
         except Exception as e:  # noqa: BLE001
             _log.exception("unwind on %s raised: %s", venue, e)
+            r = OrderResult(success=False, side=side, requested_size=qty,
+                             error_message=f"unwind raised: {e}")
+        d.timeline.mark("unwind_result")
+        d.legs.append(self._leg_report(
+            venue, side, qty, cost_basis or Decimal(0), r,
+            d.timeline.span("unwind_send", "unwind_result"), kind="unwind",
+        ))
 
     def _paper_fill(
         self,
@@ -325,22 +392,3 @@ class TakerTakerArbitrage(BaseStrategy):
                 avg_price=vwap_l,
             ),
         )
-
-    def _log_fill(self, pair: LegPair, venue: str, r: OrderResult) -> None:
-        if self._csv is None:
-            return
-        market = self.markets[venue]
-        self._csv.write([
-            pair.ts_ms,
-            pair.leg_pair_id,
-            venue,
-            market.symbol.raw,
-            r.side.value if r.side else "",
-            r.filled_size or pair.qty,
-            r.avg_price,
-            None,           # fee — fill in once we have a fee accounting source
-            r.status.value if r.status else "",
-            r.order_id,
-            r.client_id,
-            None,           # realised_pnl — populated on close
-        ])
