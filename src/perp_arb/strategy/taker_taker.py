@@ -80,7 +80,8 @@ class TakerTakerArbitrage(BaseStrategy):
         self._position = SyntheticPosition()
         self._risk = RiskManager(s.risk, max_qty=s.max_qty)
         self._last_heartbeat_ms = 0
-        self._heartbeat_interval_ms = 5000
+        self._heartbeat_interval_ms = 60_000  # liveness only; trades go to CSV
+        self._risk_blocked = False
         # hoist per-tick constants into Decimals once
         self._slip_cap = s.max_slippage_bps / Decimal(10_000)
         self._fee_frac = s.fees_bps / Decimal(10_000)
@@ -174,8 +175,14 @@ class TakerTakerArbitrage(BaseStrategy):
             post_trade_abs_position=max(abs(post_aster), abs(post_lighter)),
         )
         if not ok:
-            _log.info("entry blocked by risk: %s", reason)
+            if not self._risk_blocked:
+                self._risk_blocked = True
+                _log.info("entry blocked by risk: %s (suppressing until cleared)", reason)
             return
+
+        if self._risk_blocked:
+            self._risk_blocked = False
+            _log.info("risk block cleared — resuming entries")
 
         await self._fire(aster_side, lighter_side, qty)
 
