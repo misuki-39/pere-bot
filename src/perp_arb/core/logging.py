@@ -74,6 +74,10 @@ class CsvWriter:
             assert self._writer is not None
             assert self._fp is not None
             self._writer.writerow([_format(v) for v in row])
+            # flush() only (no os.fsync): userspace → page cache, ~1µs, CPU
+            # only. This is load-bearing — taker_taker records a row on every
+            # gate-aborted/blocked tick; a per-row fsync here would turn that
+            # into hot-path I/O. Keep it flush-not-fsync.
             self._fp.flush()
 
     def close(self) -> None:

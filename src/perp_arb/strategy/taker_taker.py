@@ -34,16 +34,35 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import NamedTuple
 
 from ..core.config import RunMode
-from ..core.exec_record import Decision, ExecutionRecorder, LegReport
+from ..core.exec_record import (
+    Decision,
+    Direction,
+    ExecutionRecorder,
+    LegKind,
+    LegReport,
+    Outcome,
+    Phase,
+)
 from ..core.types import OrderResult, Side
 from ..risk.manager import RiskManager
-from ..utils.precision import vwap_fill
+from ..utils.precision import BPS, vwap_fill
 from ..utils.time import now_ms
 from .base import BaseStrategy, SpreadModel
 
 _log = logging.getLogger(__name__)
+
+
+class _Vwaps(NamedTuple):
+    """The four depth-aware fill prices the edge math uses, passed as one
+    typed value so Decision construction stays statically checkable."""
+
+    a_sell: Decimal
+    a_buy: Decimal
+    l_sell: Decimal
+    l_buy: Decimal
 
 
 @dataclass
@@ -74,9 +93,9 @@ class TakerTakerArbitrage(BaseStrategy):
         self._heartbeat_interval_ms = 60_000  # liveness only; trades go to CSV
         self._risk_blocked = False
         # hoist per-tick constants into Decimals once
-        self._slip_cap = s.max_slippage_bps / Decimal(10_000)
-        self._fee_frac = s.fees_bps / Decimal(10_000)
-        self._min_profit_frac = s.min_profit_bps / Decimal(10_000)
+        self._slip_cap = s.max_slippage_bps / BPS
+        self._fee_frac = s.fees_bps / BPS
+        self._min_profit_frac = s.min_profit_bps / BPS
 
     async def run(self) -> None:
         ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -119,7 +138,7 @@ class TakerTakerArbitrage(BaseStrategy):
         if d is None:
             return
         try:
-            if d.outcome == "FIRED":
+            if d.outcome is Outcome.FIRED:
                 await self._fire(d)
         finally:
             if self._recorder:
@@ -129,23 +148,30 @@ class TakerTakerArbitrage(BaseStrategy):
         """Pure decision logic: no order placement, no persistence. Returns the
         Decision to record (outcome already terminal), or None for ticks not
         worth recording (not warm, or no tradeable edge — that is the spread
-        monitor's job). Gate ordering matches the pre-refactor path exactly,
-        so trading behaviour is unchanged."""
+        monitor's job)."""
         s = self.cfg.strategy
         now = now_ms()
         mid_a = a_q.mid
         mid_l = l_q.mid
 
-        def new(outcome: str, reason: str | None = None, **kw) -> Decision:
+        def new(
+            outcome: Outcome, reason: str | None = None, *,
+            bias: Decimal = Decimal(0), edge_bps: Decimal = Decimal(0),
+            direction: Direction | None = None, vwaps: _Vwaps | None = None,
+        ) -> Decision:
+            v = vwaps or _Vwaps(Decimal(0), Decimal(0), Decimal(0), Decimal(0))
             return Decision(
                 decision_id=f"d-{uuid.uuid4().hex[:10]}",
                 ts_ms=now, mid_a=mid_a, mid_l=mid_l,
                 a_quote_ts_ms=a_q.ts_ms, l_quote_ts_ms=l_q.ts_ms,
-                outcome=outcome, abort_reason=reason, **kw,
+                bias=bias, vwap_a_sell=v.a_sell, vwap_a_buy=v.a_buy,
+                vwap_l_sell=v.l_sell, vwap_l_buy=v.l_buy,
+                edge_bps=edge_bps, direction=direction,
+                outcome=outcome, abort_reason=reason,
             )
 
         if (now - max(a_q.ts_ms, l_q.ts_ms)) > s.max_stale_ms:
-            return new("ABORT_STALE", "quote older than max_stale_ms")
+            return new(Outcome.ABORT_STALE, "quote older than max_stale_ms")
 
         bias = self._spread.update(mid_a - mid_l, now).center
         if not self._spread.is_warm:
@@ -157,19 +183,18 @@ class TakerTakerArbitrage(BaseStrategy):
         vwap_l_sell, _ = vwap_fill(l_book.bids, qty, max_levels=s.max_levels)
         vwap_l_buy,  _ = vwap_fill(l_book.asks, qty, max_levels=s.max_levels)
         if None in (vwap_a_sell, vwap_a_buy, vwap_l_sell, vwap_l_buy):
-            return new("ABORT_NO_DEPTH", "qty does not fill within max_levels",
-                       bias=bias)
+            return new(Outcome.ABORT_NO_DEPTH,
+                       "qty does not fill within max_levels", bias=bias)
 
-        vwaps = dict(vwap_a_sell=vwap_a_sell, vwap_a_buy=vwap_a_buy,
-                     vwap_l_sell=vwap_l_sell, vwap_l_buy=vwap_l_buy)
+        vw = _Vwaps(vwap_a_sell, vwap_a_buy, vwap_l_sell, vwap_l_buy)
 
         slip = self._slip_cap
         if (abs((vwap_a_sell - mid_a) / mid_a) > slip
                 or abs((vwap_a_buy - mid_a) / mid_a) > slip
                 or abs((vwap_l_sell - mid_l) / mid_l) > slip
                 or abs((vwap_l_buy - mid_l) / mid_l) > slip):
-            return new("ABORT_SLIPPAGE", "vwap-mid exceeds max_slippage_bps",
-                       bias=bias, **vwaps)
+            return new(Outcome.ABORT_SLIPPAGE, "vwap-mid exceeds max_slippage_bps",
+                       bias=bias, vwaps=vw)
 
         ref_mid = (mid_a + mid_l) / Decimal(2)
         threshold = ref_mid * (self._fee_frac + self._min_profit_frac)
@@ -181,14 +206,11 @@ class TakerTakerArbitrage(BaseStrategy):
         if edge_A <= 0 and edge_B <= 0:
             return None  # nothing we'd act on
 
-        direction = "A" if edge_A >= edge_B else "B"
-        edge = max(edge_A, edge_B)
-        edge_bps = edge / ref_mid * Decimal(10_000)
-        a_side = Side.SELL if direction == "A" else Side.BUY
-        l_side = Side.BUY if direction == "A" else Side.SELL
+        direction = Direction.A if edge_A >= edge_B else Direction.B
+        edge_bps = max(edge_A, edge_B) / ref_mid * BPS
 
-        post_a = self._position.aster + qty * Decimal(a_side.sign)
-        post_l = self._position.lighter + qty * Decimal(l_side.sign)
+        post_a = self._position.aster + qty * Decimal(self._a_side(direction).sign)
+        post_l = self._position.lighter + qty * Decimal(self._l_side(direction).sign)
         ok, reason = self._risk.can_trade(
             post_trade_abs_position=max(abs(post_a), abs(post_l)),
         )
@@ -196,17 +218,25 @@ class TakerTakerArbitrage(BaseStrategy):
             if not self._risk_blocked:
                 self._risk_blocked = True
                 _log.info("entry blocked by risk: %s (suppressing until cleared)", reason)
-            return new("BLOCKED_RISK", reason, bias=bias,
-                       edge_bps=edge_bps, direction=direction, **vwaps)
+            return new(Outcome.BLOCKED_RISK, reason, bias=bias,
+                       edge_bps=edge_bps, direction=direction, vwaps=vw)
 
         if self._risk_blocked:
             self._risk_blocked = False
             _log.info("risk block cleared — resuming entries")
 
-        d = new("FIRED", bias=bias, edge_bps=edge_bps,
-                direction=direction, **vwaps)
-        d.timeline.mark("decision")  # latency clock starts at the decision instant
+        d = new(Outcome.FIRED, bias=bias, edge_bps=edge_bps,
+                direction=direction, vwaps=vw)
+        d.timeline.mark(Phase.DECISION)  # latency clock starts at decision
         return d
+
+    @staticmethod
+    def _a_side(direction: Direction) -> Side:
+        return Side.SELL if direction is Direction.A else Side.BUY
+
+    @staticmethod
+    def _l_side(direction: Direction) -> Side:
+        return Side.BUY if direction is Direction.A else Side.SELL
 
     def _maybe_heartbeat(
         self,
@@ -218,8 +248,8 @@ class TakerTakerArbitrage(BaseStrategy):
         if now - self._last_heartbeat_ms < self._heartbeat_interval_ms:
             return
         self._last_heartbeat_ms = now
-        edge_A_bps = edge_A / ref_mid * Decimal(10_000)
-        edge_B_bps = edge_B / ref_mid * Decimal(10_000)
+        edge_A_bps = edge_A / ref_mid * BPS
+        edge_B_bps = edge_B / ref_mid * BPS
         _log.info(
             "edge: mid_a=%.2f mid_l=%.2f bias=%.4f edge_A=%+.2fbps edge_B=%+.2fbps pos_a=%s pos_l=%s",
             mid_a, mid_l, bias, edge_A_bps, edge_B_bps,
@@ -228,40 +258,18 @@ class TakerTakerArbitrage(BaseStrategy):
 
     # ---- order firing ----
 
-    @staticmethod
-    def _leg_report(venue: str, side: Side, qty: Decimal, expected: Decimal,
-                    r: OrderResult, latency_ms: int | None,
-                    kind: str = "entry") -> LegReport:
-        return LegReport(
-            exchange=venue,
-            side=side.value,
-            requested_qty=qty,
-            filled_qty=r.filled_size,
-            expected_price=expected,
-            realized_price=r.avg_price,
-            status=r.status.value if r.status else "",
-            success=r.success,
-            error=r.error_message,
-            order_id=r.order_id,
-            client_id=r.client_id,
-            fee=None,           # fill in once we have a fee accounting source
-            latency_ms=latency_ms,
-            kind=kind,
-        )
-
     async def _fire(self, d: Decision) -> None:
         qty = self.cfg.strategy.qty
-        if d.direction == "A":
-            a_side, l_side = Side.SELL, Side.BUY
+        a_side, l_side = self._a_side(d.direction), self._l_side(d.direction)
+        if d.direction is Direction.A:
             exp_a, exp_l = d.vwap_a_sell, d.vwap_l_buy
         else:
-            a_side, l_side = Side.BUY, Side.SELL
             exp_a, exp_l = d.vwap_a_buy, d.vwap_l_sell
 
         _log.info("[%s] FIRE qty=%s aster=%s lighter=%s mode=%s",
                   d.decision_id, qty, a_side, l_side, self.cfg.strategy.mode)
 
-        d.timeline.mark("send")
+        d.timeline.mark(Phase.SEND)
         if self.cfg.strategy.mode is RunMode.PAPER:
             ra, rl = self._paper_fill(a_side, l_side, qty)
             d.timeline.mark("result_aster")
@@ -279,15 +287,15 @@ class TakerTakerArbitrage(BaseStrategy):
                     self._lighter_market(), l_side, qty, client_id=f"{d.decision_id}-l"),
                     "lighter"),
             )
-        d.timeline.mark("result")
+        d.timeline.mark(Phase.RESULT)
 
-        lat_a = d.timeline.span("send", "result_aster")
-        lat_l = d.timeline.span("send", "result_lighter")
+        lat_a = d.timeline.span(Phase.SEND, "result_aster")
+        lat_l = d.timeline.span(Phase.SEND, "result_lighter")
         d.legs = [
-            self._leg_report("aster", a_side, qty, exp_a, ra, lat_a),
-            self._leg_report("lighter", l_side, qty, exp_l, rl, lat_l),
+            LegReport.from_result("aster", a_side, qty, exp_a, ra, lat_a),
+            LegReport.from_result("lighter", l_side, qty, exp_l, rl, lat_l),
         ]
-        latency = d.timeline.span("send", "result")
+        latency = d.timeline.span(Phase.SEND, Phase.RESULT)
 
         if ra.success and rl.success:
             self._position.aster += qty * Decimal(a_side.sign)
@@ -352,9 +360,9 @@ class TakerTakerArbitrage(BaseStrategy):
             r = OrderResult(success=False, side=side, requested_size=qty,
                              error_message=f"unwind raised: {e}")
         d.timeline.mark("unwind_result")
-        d.legs.append(self._leg_report(
-            venue, side, qty, cost_basis or Decimal(0), r,
-            d.timeline.span("unwind_send", "unwind_result"), kind="unwind",
+        d.legs.append(LegReport.from_result(
+            venue, side, qty, cost_basis, r,
+            d.timeline.span("unwind_send", "unwind_result"), kind=LegKind.UNWIND,
         ))
 
     def _paper_fill(

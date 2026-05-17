@@ -9,8 +9,12 @@ from decimal import Decimal
 import perp_arb.core.exec_record as er
 from perp_arb.core.exec_record import (
     Decision,
+    Direction,
     ExecutionRecorder,
+    LegKind,
     LegReport,
+    Outcome,
+    Phase,
     Timeline,
     _decision_header,
     _leg_header,
@@ -56,14 +60,14 @@ def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkey
         bias=Decimal("-0.03"), vwap_a_sell=Decimal("100.01"),
         vwap_a_buy=Decimal("100.02"), vwap_l_sell=Decimal("100.04"),
         vwap_l_buy=Decimal("100.06"), edge_bps=Decimal("2.5"),
-        direction="B", outcome="FIRED",
+        direction=Direction.B, outcome=Outcome.FIRED,
     )
     clock["t"] = 5
-    d.timeline.mark("decision")
+    d.timeline.mark(Phase.DECISION)
     clock["t"] = 12
-    d.timeline.mark("send")
+    d.timeline.mark(Phase.SEND)
     clock["t"] = 47
-    d.timeline.mark("result")
+    d.timeline.mark(Phase.RESULT)
     d.legs = [
         LegReport("aster", "buy", Decimal("0.6"), Decimal("0.6"),
                   Decimal("100.02"), Decimal("100.03"), "filled", True),
@@ -77,7 +81,7 @@ def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkey
     legs = _read(tmp_path / "legs_taker_taker_TEST.csv")
     assert dec[0] == _decision_header()
     assert len(dec) == 2  # header + 1
-    row = dict(zip(dec[0], dec[1]))
+    row = dict(zip(dec[0], dec[1], strict=True))
     assert row["decision_id"] == "d-abc"
     assert row["outcome"] == "FIRED"
     assert row["lat_decision_send_ms"] == "7"
@@ -86,9 +90,10 @@ def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkey
 
     assert legs[0] == _leg_header()
     assert len(legs) == 3  # header + 2 legs
-    l0 = dict(zip(legs[0], legs[1]))
+    l0 = dict(zip(legs[0], legs[1], strict=True))
     assert l0["decision_id"] == "d-abc" and l0["exchange"] == "aster"
     assert l0["expected_price"] == "100.02" and l0["realized_price"] == "100.03"
+    assert l0["kind"] == LegKind.ENTRY  # StrEnum serialises to its value
 
 
 def test_abort_decision_emits_row_with_no_legs(tmp_path) -> None:
@@ -98,14 +103,14 @@ def test_abort_decision_emits_row_with_no_legs(tmp_path) -> None:
     d = Decision(
         decision_id="d-x", ts_ms=9, mid_a=Decimal("100"), mid_l=Decimal("100"),
         a_quote_ts_ms=1, l_quote_ts_ms=2,
-        outcome="ABORT_STALE", abort_reason="quote older than max_stale_ms",
+        outcome=Outcome.ABORT_STALE, abort_reason="quote older than max_stale_ms",
     )
     rec.emit(d)
     rec.close()
     dec = _read(tmp_path / "decisions_taker_taker_AB.csv")
     legs = _read(tmp_path / "legs_taker_taker_AB.csv")
     assert len(dec) == 2 and len(legs) == 1  # decision recorded, no leg rows
-    row = dict(zip(dec[0], dec[1]))
+    row = dict(zip(dec[0], dec[1], strict=True))
     assert row["outcome"] == "ABORT_STALE"
     assert row["lat_total_ms"] == ""  # never fired → no timeline
     assert row["direction"] == "" and row["edge_bps"] == "0"

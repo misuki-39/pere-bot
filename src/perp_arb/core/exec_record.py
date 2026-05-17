@@ -15,10 +15,40 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from decimal import Decimal
+from enum import StrEnum
 from pathlib import Path
 
 from ..utils.time import mono_ms
 from .logging import CsvWriter
+from .types import OrderResult, Side
+
+
+class Outcome(StrEnum):
+    PENDING = "PENDING"
+    FIRED = "FIRED"
+    ABORT_STALE = "ABORT_STALE"
+    ABORT_SLIPPAGE = "ABORT_SLIPPAGE"
+    ABORT_NO_DEPTH = "ABORT_NO_DEPTH"
+    BLOCKED_RISK = "BLOCKED_RISK"
+
+
+class LegKind(StrEnum):
+    ENTRY = "entry"
+    UNWIND = "unwind"
+
+
+class Direction(StrEnum):
+    A = "A"   # sell aster, buy lighter
+    B = "B"   # reverse
+
+
+class Phase(StrEnum):
+    """Canonical Timeline checkpoints `latencies()` derives columns from. The
+    recorder depends only on these — the strategy owns any other marks."""
+
+    DECISION = "decision"
+    SEND = "send"
+    RESULT = "result"
 
 
 class Timeline:
@@ -36,6 +66,15 @@ class Timeline:
             return self._marks[b] - self._marks[a]
         return None
 
+    def latencies(self) -> dict[str, int | None]:
+        """The three derived latency columns — the recorder's only contract
+        with Timeline, so the phase names live in exactly one place."""
+        return {
+            "lat_decision_send_ms": self.span(Phase.DECISION, Phase.SEND),
+            "lat_send_result_ms": self.span(Phase.SEND, Phase.RESULT),
+            "lat_total_ms": self.span(Phase.DECISION, Phase.RESULT),
+        }
+
 
 @dataclass
 class LegReport:
@@ -45,7 +84,7 @@ class LegReport:
     side: str
     requested_qty: Decimal
     filled_qty: Decimal | None
-    expected_price: Decimal       # decision-time VWAP for this leg/side
+    expected_price: Decimal | None   # decision-time VWAP / unwind cost basis
     realized_price: Decimal | None
     status: str
     success: bool
@@ -53,8 +92,31 @@ class LegReport:
     order_id: str | None = None
     client_id: str | None = None
     fee: Decimal | None = None
-    latency_ms: int | None = None   # send → THIS leg's result (inter-leg skew)
-    kind: str = "entry"             # "entry" | "unwind"
+    latency_ms: int | None = None    # send → THIS leg's result (inter-leg skew)
+    kind: LegKind = LegKind.ENTRY
+
+    @classmethod
+    def from_result(
+        cls, venue: str, side: Side, qty: Decimal,
+        expected: Decimal | None, r: OrderResult, latency_ms: int | None,
+        kind: LegKind = LegKind.ENTRY,
+    ) -> LegReport:
+        return cls(
+            exchange=venue,
+            side=side.value,
+            requested_qty=qty,
+            filled_qty=r.filled_size,
+            expected_price=expected,
+            realized_price=r.avg_price,
+            status=r.status.value if r.status else "",
+            success=r.success,
+            error=r.error_message,
+            order_id=r.order_id,
+            client_id=r.client_id,
+            fee=None,            # fill in once we have a fee accounting source
+            latency_ms=latency_ms,
+            kind=kind,
+        )
 
 
 @dataclass
@@ -75,20 +137,19 @@ class Decision:
     vwap_l_sell: Decimal = Decimal(0)
     vwap_l_buy: Decimal = Decimal(0)
     edge_bps: Decimal = Decimal(0)  # chosen direction's net edge, bps
-    direction: str = ""             # "A" | "B"
-    outcome: str = "PENDING"        # FIRED|ABORT_STALE|ABORT_SLIPPAGE|
-                                    # ABORT_NO_DEPTH|BLOCKED_RISK
+    direction: Direction | None = None
+    outcome: Outcome = Outcome.PENDING
     abort_reason: str | None = None
     timeline: Timeline = field(default_factory=Timeline)
     legs: list[LegReport] = field(default_factory=list)
 
 
 _DECISION_SKIP = {"timeline", "legs"}
-_LAT_COLS = ["lat_decision_send_ms", "lat_send_result_ms", "lat_total_ms"]
 
 
 def _decision_header() -> list[str]:
-    return [f.name for f in fields(Decision) if f.name not in _DECISION_SKIP] + _LAT_COLS
+    cols = [f.name for f in fields(Decision) if f.name not in _DECISION_SKIP]
+    return cols + list(Timeline().latencies())
 
 
 def _leg_header() -> list[str]:
@@ -101,21 +162,20 @@ class ExecutionRecorder:
 
     def __init__(self, log_dir: Path, run_ts: str | None = None) -> None:
         ts = run_ts or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        self._dec_header = _decision_header()
-        self._leg_header = _leg_header()
-        self._dec = CsvWriter(log_dir / f"decisions_taker_taker_{ts}.csv", self._dec_header)
-        self._legs = CsvWriter(log_dir / f"legs_taker_taker_{ts}.csv", self._leg_header)
+        self._dec = CsvWriter(log_dir / f"decisions_taker_taker_{ts}.csv",
+                              _decision_header())
+        self._legs = CsvWriter(log_dir / f"legs_taker_taker_{ts}.csv",
+                               _leg_header())
 
     def emit(self, d: Decision) -> None:
-        row = {f.name: getattr(d, f.name) for f in fields(d) if f.name not in _DECISION_SKIP}
-        row["lat_decision_send_ms"] = d.timeline.span("decision", "send")
-        row["lat_send_result_ms"] = d.timeline.span("send", "result")
-        row["lat_total_ms"] = d.timeline.span("decision", "result")
-        self._dec.write([row[h] for h in self._dec_header])
+        row = {f.name: getattr(d, f.name)
+               for f in fields(d) if f.name not in _DECISION_SKIP}
+        row |= d.timeline.latencies()
+        self._dec.write([row[h] for h in self._dec.header])
         for leg in d.legs:
             lrow = {"decision_id": d.decision_id, "ts_ms": d.ts_ms}
             lrow |= {f.name: getattr(leg, f.name) for f in fields(leg)}
-            self._legs.write([lrow[h] for h in self._leg_header])
+            self._legs.write([lrow[h] for h in self._legs.header])
 
     def close(self) -> None:
         self._dec.close()
