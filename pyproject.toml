@@ -16,6 +16,7 @@ dependencies = [
     "eth-account>=0.13",
     "eth-utils>=4.1",
     "orjson>=3.10",
+    "pyarrow>=17.0",
     "lighter-sdk @ git+https://github.com/elliottech/lighter-python.git",
 ]
 

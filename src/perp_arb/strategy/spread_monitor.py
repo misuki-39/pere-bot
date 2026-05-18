@@ -1,7 +1,12 @@
-"""Spread monitor — no trading. Streams BBO from both venues, logs spread + CSV.
+"""Spread monitor — no trading. Streams BBO from two venues, records the
+tick-level spread / bias / VWAP-edge series to hourly-rotated Parquet.
 
-Run this for a few hours before turning on taker_taker to understand the
-real-world spread distribution for the chosen pair.
+Venue-agnostic: the pair is `cfg.strategy.monitor_pair` (left, right); absent it
+defaults to aster↔lighter for back-compat. Built for multi-day unattended runs —
+the writer is decoupled from the WS callback and each hour is finalized to its
+own Parquet file, plus per-row data-completeness columns (`gap_ms`,
+`katana_seq`, `katana_seq_gap`, `reconnects`) so dropout can be quantified
+before any feasibility conclusion is drawn.
 """
 
 from __future__ import annotations
@@ -9,8 +14,11 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
-from ..core.logging import SPREAD_CSV_HEADER, CsvWriter
+import pyarrow as pa
+
+from ..core.capture import RotatingParquetWriter
 from ..core.types import OrderBook, Quote
 from ..utils.precision import vwap_fill
 from ..utils.time import now_ms
@@ -18,95 +26,159 @@ from .base import BaseStrategy, SpreadModel
 
 _log = logging.getLogger(__name__)
 
+_STR_COLS = [
+    "left_bid", "left_bid_size", "left_ask", "left_ask_size",
+    "right_bid", "right_bid_size", "right_ask", "right_ask_size",
+    "mid_left", "mid_right", "raw_spread", "bias_ewma",
+    "vwap_left_sell", "vwap_left_buy", "vwap_right_sell", "vwap_right_buy",
+    "edge_A_bps", "edge_B_bps",
+]
+
+SPREAD_PARQUET_SCHEMA = pa.schema(
+    [("ts_ms", pa.int64()), ("left_venue", pa.string()), ("right_venue", pa.string())]
+    + [(c, pa.string()) for c in _STR_COLS]
+    + [
+        ("gates_passed", pa.bool_()),
+        ("gap_ms", pa.int64()),
+        ("katana_seq", pa.int64()),
+        ("katana_seq_gap", pa.int64()),
+        ("reconnects", pa.int64()),
+    ]
+)
+
 
 class SpreadMonitor(BaseStrategy):
     name = "spread_monitor"
 
     def __init__(self, cfg, exchanges, markets) -> None:
         super().__init__(cfg, exchanges, markets)
-        self._csv: CsvWriter | None = None
+        self._writer: RotatingParquetWriter | None = None
         self._spread = SpreadModel(
             center_half_life_s=cfg.strategy.bias_halflife_s,
             scale_half_life_s=cfg.strategy.scale_halflife_s,
             warmup_s=0,  # monitor logs from the first tick; no warmup gating
         )
         self._last_log_ms = 0
+        self._last_row_ms = 0
+
+        mp = cfg.strategy.monitor_pair
+        if mp is not None:
+            self._left_name, self._right_name = mp[0].venue, mp[1].venue
+        else:
+            self._left_name, self._right_name = "aster", "lighter"
 
     async def run(self) -> None:
         ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        csv_path = self.cfg.runtime.log_dir / f"spread_{self.cfg.strategy.pair.base}_{ts}.csv"
-        self._csv = CsvWriter(csv_path, SPREAD_CSV_HEADER)
-        _log.info("spread_monitor writing %s", csv_path)
+        root = self.cfg.runtime.log_dir / f"spread_{self.cfg.strategy.pair.base}_{ts}"
+        self._writer = RotatingParquetWriter(
+            root,
+            SPREAD_PARQUET_SCHEMA,
+            rotation_minutes=self.cfg.strategy.capture_rotation_minutes,
+        )
+        await self._writer.start()
+        _log.info(
+            "spread_monitor %s↔%s writing %s",
+            self._left_name, self._right_name, root,
+        )
 
-        self._aster().subscribe_book(self._aster_market(), self._on_aster_book)
-        self._lighter().subscribe_book(self._lighter_market(), self._on_lighter_book)
+        self._venue(self._left_name).subscribe_book(
+            self._market(self._left_name), self._on_book
+        )
+        self._venue(self._right_name).subscribe_book(
+            self._market(self._right_name), self._on_book
+        )
 
         try:
             await self._stop.wait()
         finally:
-            if self._csv:
-                self._csv.close()
+            if self._writer:
+                await self._writer.close()
 
-    # ---- callbacks: just trigger an evaluation; both books need to be present ----
-
-    def _on_aster_book(self, _: OrderBook) -> None:
-        self._evaluate()
-
-    def _on_lighter_book(self, _: OrderBook) -> None:
+    # both books must be present; either side ticking triggers an evaluation
+    def _on_book(self, _: OrderBook) -> None:
         self._evaluate()
 
     def _evaluate(self) -> None:
-        a_book = self._aster().order_book(self._aster_market())
-        l_book = self._lighter().order_book(self._lighter_market())
-        if a_book is None or l_book is None:
+        lx, rx = self._venue(self._left_name), self._venue(self._right_name)
+        lm, rm = self._market(self._left_name), self._market(self._right_name)
+        l_book = lx.order_book(lm)
+        r_book = rx.order_book(rm)
+        if l_book is None or r_book is None:
             return
-        a_q: Quote | None = self._aster().best_quote(self._aster_market())
-        l_q: Quote | None = self._lighter().best_quote(self._lighter_market())
-        if a_q is None or l_q is None:
+        l_q: Quote | None = lx.best_quote(lm)
+        r_q: Quote | None = rx.best_quote(rm)
+        if l_q is None or r_q is None:
             return
 
         qty = self.cfg.strategy.qty
+        mx = self.cfg.strategy.max_levels
 
         ts_ms = now_ms()
-        mid_a = a_q.mid
         mid_l = l_q.mid
-        raw_spread = mid_a - mid_l
+        mid_r = r_q.mid
+        raw_spread = mid_l - mid_r
         bias = self._spread.update(raw_spread, ts_ms).center
 
-        vwap_a_sell, _ = vwap_fill(a_book.bids, qty, max_levels=self.cfg.strategy.max_levels)
-        vwap_a_buy,  _ = vwap_fill(a_book.asks, qty, max_levels=self.cfg.strategy.max_levels)
-        vwap_l_sell, _ = vwap_fill(l_book.bids, qty, max_levels=self.cfg.strategy.max_levels)
-        vwap_l_buy,  _ = vwap_fill(l_book.asks, qty, max_levels=self.cfg.strategy.max_levels)
+        vwap_l_sell, _ = vwap_fill(l_book.bids, qty, max_levels=mx)
+        vwap_l_buy,  _ = vwap_fill(l_book.asks, qty, max_levels=mx)
+        vwap_r_sell, _ = vwap_fill(r_book.bids, qty, max_levels=mx)
+        vwap_r_buy,  _ = vwap_fill(r_book.asks, qty, max_levels=mx)
 
         edge_A_bps: Decimal | None = None
         edge_B_bps: Decimal | None = None
-        if vwap_a_sell is not None and vwap_l_buy is not None:
-            edge_A_bps = ((vwap_a_sell - vwap_l_buy) - bias) / mid_a * Decimal(10_000)
-        if vwap_l_sell is not None and vwap_a_buy is not None:
-            edge_B_bps = ((vwap_l_sell - vwap_a_buy) + bias) / mid_a * Decimal(10_000)
+        if vwap_l_sell is not None and vwap_r_buy is not None:
+            edge_A_bps = ((vwap_l_sell - vwap_r_buy) - bias) / mid_l * Decimal(10_000)
+        if vwap_r_sell is not None and vwap_l_buy is not None:
+            edge_B_bps = ((vwap_r_sell - vwap_l_buy) + bias) / mid_l * Decimal(10_000)
 
-        gates = (vwap_a_sell is not None and vwap_l_buy is not None
-                 and vwap_l_sell is not None and vwap_a_buy is not None)
+        gates = (vwap_l_sell is not None and vwap_r_buy is not None
+                 and vwap_r_sell is not None and vwap_l_buy is not None)
 
-        if self._csv:
-            self._csv.write([
-                ts_ms,
-                a_q.bid, a_q.bid_size, a_q.ask, a_q.ask_size,
-                l_q.bid, l_q.bid_size, l_q.ask, l_q.ask_size,
-                mid_a, mid_l, raw_spread, bias,
-                vwap_a_sell, vwap_a_buy, vwap_l_sell, vwap_l_buy,
-                edge_A_bps, edge_B_bps, gates,
-            ])
+        gap_ms = 0 if self._last_row_ms == 0 else ts_ms - self._last_row_ms
+        self._last_row_ms = ts_ms
+        health = self._feed_health(lx, lm, rx, rm)
 
-        # human-readable log throttled to once per minute; CSV has the full stream
+        if self._writer:
+            self._writer.submit({
+                "ts_ms": ts_ms,
+                "left_venue": self._left_name, "right_venue": self._right_name,
+                "left_bid": l_q.bid, "left_bid_size": l_q.bid_size,
+                "left_ask": l_q.ask, "left_ask_size": l_q.ask_size,
+                "right_bid": r_q.bid, "right_bid_size": r_q.bid_size,
+                "right_ask": r_q.ask, "right_ask_size": r_q.ask_size,
+                "mid_left": mid_l, "mid_right": mid_r,
+                "raw_spread": raw_spread, "bias_ewma": bias,
+                "vwap_left_sell": vwap_l_sell, "vwap_left_buy": vwap_l_buy,
+                "vwap_right_sell": vwap_r_sell, "vwap_right_buy": vwap_r_buy,
+                "edge_A_bps": edge_A_bps, "edge_B_bps": edge_B_bps,
+                "gates_passed": gates,
+                "gap_ms": gap_ms,
+                "katana_seq": health.get("katana_seq"),
+                "katana_seq_gap": health.get("katana_seq_gap", 0),
+                "reconnects": health.get("reconnects", 0),
+            })
+
+        # human-readable log throttled to once per minute; Parquet has the full stream
         if ts_ms - self._last_log_ms >= 60_000:
             self._last_log_ms = ts_ms
             _log.info(
-                "spread: mid_a=%s mid_l=%s spread=%s bias=%s edge_A=%s edge_B=%s gates=%s",
-                _fmt(mid_a, 2), _fmt(mid_l, 2),
+                "spread: mid_l=%s mid_r=%s spread=%s bias=%s edge_A=%s edge_B=%s "
+                "gates=%s recon=%s seq_gap=%s",
+                _fmt(mid_l, 2), _fmt(mid_r, 2),
                 _fmt(raw_spread, 4), _fmt(bias, 4),
                 _fmt(edge_A_bps, 2), _fmt(edge_B_bps, 2), gates,
+                health.get("reconnects", 0), health.get("katana_seq_gap", 0),
             )
+
+    @staticmethod
+    def _feed_health(lx, lm, rx, rm) -> dict[str, Any]:
+        """Merge `feed_stats()` from whichever leg exposes it (Katana)."""
+        out: dict[str, Any] = {}
+        for ex, m in ((lx, lm), (rx, rm)):
+            fn = getattr(ex, "feed_stats", None)
+            if callable(fn):
+                out.update(fn(m))
+        return out
 
 
 def _fmt(v: Decimal | None, places: int) -> str:

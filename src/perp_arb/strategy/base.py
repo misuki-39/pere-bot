@@ -44,6 +44,12 @@ class BaseStrategy(ABC):
     async def stop(self) -> None:
         self._stop.set()
 
+    def _venue(self, name: str) -> BaseExchange:
+        return self.exchanges[name]
+
+    def _market(self, name: str) -> MarketInfo:
+        return self.markets[name]
+
     def _aster(self) -> BaseExchange:
         return self.exchanges["aster"]
 

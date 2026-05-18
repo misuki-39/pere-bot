@@ -1,0 +1,26 @@
+strategy: spread_monitor      # public-only; no trading, no creds needed
+mode: paper                   # irrelevant for spread_monitor (kept for schema)
+
+pair:                         # required by the schema; used for the run/file tag
+  base: ETH
+  aster_symbol: ETHUSDT
+  lighter_symbol: ETH
+
+# Generic monitor pair (left, right). left = Katana ETH-USD, right = Lighter ETH.
+monitor_pair:
+  - { venue: katana,  symbol: ETH-USD }
+  - { venue: lighter, symbol: ETH }
+
+# small-capital order size used for the VWAP edge columns
+qty: 0.05
+max_qty: 0.5
+
+# spread-centre / dispersion EWMA half-lives (wall-clock seconds)
+bias_halflife_s: 3600
+scale_halflife_s: 300
+
+# depth gate: VWAP over the top-N levels for `qty`
+max_levels: 3
+
+# hourly-rotated Parquet under logs/spread_ETH_<ts>/date=YYYY-MM-DD/HH.parquet
+capture_rotation_minutes: 60

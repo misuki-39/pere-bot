@@ -27,6 +27,13 @@ class PairCfg(BaseModel):
     lighter_symbol: str
 
 
+class VenueLeg(BaseModel):
+    """One side of a generic spread-monitor pair."""
+
+    venue: str   # "aster" | "lighter" | "katana"
+    symbol: str  # venue-native ticker, e.g. "ETH-USD" on katana
+
+
 class RiskCfg(BaseModel):
     max_consecutive_failures: int = 3
     max_leg_latency_ms: int = 500
@@ -38,6 +45,11 @@ class StrategyCfg(BaseModel):
     strategy: Literal["spread_monitor", "taker_taker"]
     mode: RunMode = RunMode.PAPER
     pair: PairCfg
+    # spread_monitor only. Absent ⇒ default to the aster/lighter pair above so
+    # existing configs keep working. (left, right).
+    monitor_pair: tuple[VenueLeg, VenueLeg] | None = None
+    # Hourly-rotated Parquet capture; <60 rotates more often within the hour dir.
+    capture_rotation_minutes: int = Field(default=60, gt=0)
 
     # sizing
     qty: Decimal = Field(gt=0)
@@ -97,6 +109,13 @@ class LighterCreds(BaseModel):
         return self.api_key_private_key == _PLACEHOLDER_PK
 
 
+class KatanaCreds(BaseModel):
+    # Public market data only — no API key required for /v1/markets, /v1/orderbook
+    # or the l2orderbook WS channel.
+    base_url: str = "https://api-perps.katana.network"
+    ws_url: str = "wss://websocket-perps.katana.network/v1"
+
+
 class RuntimeCfg(BaseModel):
     log_dir: Path = Path("./logs")
     log_level: str = "INFO"
@@ -106,6 +125,7 @@ class AppCfg(BaseModel):
     strategy: StrategyCfg
     aster: AsterCreds
     lighter: LighterCreds
+    katana: KatanaCreds = KatanaCreds()
     runtime: RuntimeCfg = RuntimeCfg()
 
 
@@ -141,12 +161,18 @@ def load_app_config(yaml_path: str | Path, *, mode_override: RunMode | None = No
         api_key_index=int(os.getenv("LIGHTER_API_KEY_INDEX") or "0"),
         base_url=os.getenv("LIGHTER_BASE_URL") or "https://mainnet.zklighter.elliot.ai",
     )
+    katana = KatanaCreds(
+        base_url=os.getenv("KATANA_BASE_URL") or "https://api-perps.katana.network",
+        ws_url=os.getenv("KATANA_WS_URL") or "wss://websocket-perps.katana.network/v1",
+    )
     runtime = RuntimeCfg(
         log_dir=Path(os.getenv("LOG_DIR") or "./logs"),
         log_level=os.getenv("LOG_LEVEL") or "INFO",
     )
 
-    return AppCfg(strategy=strategy_cfg, aster=aster, lighter=lighter, runtime=runtime)
+    return AppCfg(
+        strategy=strategy_cfg, aster=aster, lighter=lighter, katana=katana, runtime=runtime,
+    )
 
 
 def require_live_creds(cfg: AppCfg) -> None:
