@@ -48,8 +48,6 @@ class StrategyCfg(BaseModel):
     # spread_monitor only. Absent ⇒ default to the aster/lighter pair above so
     # existing configs keep working. (left, right).
     monitor_pair: tuple[VenueLeg, VenueLeg] | None = None
-    # Hourly-rotated Parquet capture; <60 rotates more often within the hour dir.
-    capture_rotation_minutes: int = Field(default=60, gt=0)
 
     # sizing
     qty: Decimal = Field(gt=0)

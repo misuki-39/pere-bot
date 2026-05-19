@@ -1,16 +1,19 @@
-"""Multi-day capture primitive: queue-decoupled, hourly-rotated Parquet.
+"""Multi-day capture primitive: queue-decoupled, hourly Parquet.
 
 Designed for unattended runs of several days. Two properties matter:
 
 * The producer (a WS callback on the event loop) must never block on disk.
   `submit()` is a non-blocking `put_nowait`; if the writer falls behind and the
   bounded queue fills, rows are dropped and counted rather than stalling the
-  socket recv loop.
-* A crash/restart must not cost more than the in-flight batch. Each wall-clock
-  hour is written to its own file and finalized on rotation, so every closed
-  hour is a complete, independently-readable Parquet file:
+  socket recv loop or growing memory without bound.
+* A clean shutdown loses nothing; an abnormal kill costs at most the
+  currently-open hour. Each wall-clock hour is its own file, finalized on
+  rotation or on `close()`:
 
       <root>/date=YYYY-MM-DD/HH.parquet
+
+  (The realistic data-loss cause here was an OOM from a leak elsewhere, now
+  fixed; one file per hour is an accepted trade for a feasibility capture.)
 
 Numeric fields are stored as strings (lossless for `Decimal`, matching the
 project's CSV convention); the analysis step casts as needed.
@@ -30,7 +33,7 @@ import pyarrow.parquet as pq
 _log = logging.getLogger(__name__)
 
 
-def _bucket(ts_ms: int) -> tuple[str, str]:
+def _hour_key(ts_ms: int) -> tuple[str, str]:
     dt = datetime.fromtimestamp(ts_ms / 1000, tz=UTC)
     return dt.strftime("%Y-%m-%d"), dt.strftime("%H")
 
@@ -43,20 +46,16 @@ class RotatingParquetWriter:
         root: Path,
         schema: pa.Schema,
         *,
-        rotation_minutes: int = 60,
         batch_size: int = 2000,
         queue_max: int = 100_000,
     ) -> None:
         self.root = Path(root)
         self.schema = schema
         self.batch_size = batch_size
-        # rotation_minutes is honored at hour granularity for the on-disk path;
-        # values <60 just rotate more often within the hour partition dir.
-        self._rotation_min = max(1, rotation_minutes)
         self._q: asyncio.Queue[dict | None] = asyncio.Queue(maxsize=queue_max)
         self._task: asyncio.Task[None] | None = None
         self._writer: pq.ParquetWriter | None = None
-        self._cur_key: tuple[str, str, int] | None = None
+        self._cur_key: tuple[str, str] | None = None
         self.dropped = 0
         self._last_drop_log = 0.0
 
@@ -105,27 +104,20 @@ class RotatingParquetWriter:
             _log.exception("parquet writer task failed")
             raise
 
-    def _slot(self, ts_ms: int) -> tuple[str, str, int]:
-        date, hour = _bucket(ts_ms)
-        minute = datetime.fromtimestamp(ts_ms / 1000, tz=UTC).minute
-        sub = minute // self._rotation_min if self._rotation_min < 60 else 0
-        return date, hour, sub
-
-    def _path(self, key: tuple[str, str, int]) -> Path:
-        date, hour, sub = key
-        name = f"{hour}.parquet" if sub == 0 and self._rotation_min >= 60 else f"{hour}-{sub:02d}.parquet"
-        return self.root / f"date={date}" / name
+    def _path(self, key: tuple[str, str]) -> Path:
+        date, hour = key
+        return self.root / f"date={date}" / f"{hour}.parquet"
 
     def _flush(self, batch: list[dict]) -> None:
         if not batch:
             return
-        # Capture is time-ordered, so equal slots form contiguous runs: write
-        # each run as one row group, rotating the file when the slot changes.
+        # Capture is time-ordered, so equal hours form contiguous runs: write
+        # each run as one row group, rotating the file when the hour changes.
         run: list[dict] = []
-        run_key: tuple[str, str, int] | None = None
+        run_key: tuple[str, str] | None = None
         names = self.schema.names
         for row in batch:
-            key = self._slot(int(row["ts_ms"]))
+            key = _hour_key(int(row["ts_ms"]))
             if run and key != run_key:
                 self._write_run(run_key, run, names)
                 run = []
@@ -134,7 +126,9 @@ class RotatingParquetWriter:
         if run:
             self._write_run(run_key, run, names)
 
-    def _write_run(self, key: tuple[str, str, int] | None, rows: list[dict], names: list[str]) -> None:
+    def _write_run(
+        self, key: tuple[str, str] | None, rows: list[dict], names: list[str]
+    ) -> None:
         if key != self._cur_key:
             self._finalize()
             path = self._path(key)  # type: ignore[arg-type]

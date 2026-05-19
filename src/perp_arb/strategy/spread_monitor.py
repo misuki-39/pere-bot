@@ -1,12 +1,17 @@
 """Spread monitor — no trading. Streams BBO from two venues, records the
-tick-level spread / bias / VWAP-edge series to hourly-rotated Parquet.
+tick-level spread / bias / VWAP-edge series to hourly Parquet.
 
 Venue-agnostic: the pair is `cfg.strategy.monitor_pair` (left, right); absent it
-defaults to aster↔lighter for back-compat. Built for multi-day unattended runs —
-the writer is decoupled from the WS callback and each hour is finalized to its
-own Parquet file, plus per-row data-completeness columns (`gap_ms`,
-`katana_seq`, `katana_seq_gap`, `reconnects`) so dropout can be quantified
-before any feasibility conclusion is drawn.
+defaults to aster↔lighter for back-compat.
+
+Order-book maintenance lives entirely in the clients; each exposes `book_ts()`
+— the wall-clock of the last update applied to a *valid, in-sync* book. The
+recorder has one uniform rule: **record a row only when both legs are fresh;
+otherwise skip.** A down/desynced feed applies no in-sync updates, so its
+`book_ts` ages out and rows are simply not written — an outage becomes a gap in
+the captured time series (and a large `gap_ms` on the recovery row), never
+garbage rows. Each row also carries the two legs' source timestamps so
+freshness is auditable offline.
 """
 
 from __future__ import annotations
@@ -14,7 +19,6 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
 
 import pyarrow as pa
 
@@ -39,12 +43,21 @@ SPREAD_PARQUET_SCHEMA = pa.schema(
     + [(c, pa.string()) for c in _STR_COLS]
     + [
         ("gates_passed", pa.bool_()),
+        # each leg's last in-sync book update (wall-clock ms) + time since the
+        # previous *recorded* row: the only completeness signals needed — an
+        # outage shows as a missing time range + a large gap_ms on recovery.
+        ("left_ts_ms", pa.int64()),
+        ("right_ts_ms", pa.int64()),
         ("gap_ms", pa.int64()),
-        ("katana_seq", pa.int64()),
-        ("katana_seq_gap", pa.int64()),
-        ("reconnects", pa.int64()),
     ]
 )
+
+# A leg whose book hasn't applied an in-sync update within this many ms is
+# treated as not fresh — the row is skipped entirely. Set well above the
+# observed healthy Katana inter-update gap (~3 s max on a quiet book) so
+# quiet-but-live books aren't false-skipped; genuine outages (the failure
+# mode) last minutes, so the wider window still catches them.
+_FRESH_MS = 8000
 
 
 class SpreadMonitor(BaseStrategy):
@@ -60,6 +73,7 @@ class SpreadMonitor(BaseStrategy):
         )
         self._last_log_ms = 0
         self._last_row_ms = 0
+        self._skipped = 0  # rows skipped because a leg was not fresh
 
         mp = cfg.strategy.monitor_pair
         if mp is not None:
@@ -70,11 +84,7 @@ class SpreadMonitor(BaseStrategy):
     async def run(self) -> None:
         ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         root = self.cfg.runtime.log_dir / f"spread_{self.cfg.strategy.pair.base}_{ts}"
-        self._writer = RotatingParquetWriter(
-            root,
-            SPREAD_PARQUET_SCHEMA,
-            rotation_minutes=self.cfg.strategy.capture_rotation_minutes,
-        )
+        self._writer = RotatingParquetWriter(root, SPREAD_PARQUET_SCHEMA)
         await self._writer.start()
         _log.info(
             "spread_monitor %s↔%s writing %s",
@@ -94,7 +104,7 @@ class SpreadMonitor(BaseStrategy):
             if self._writer:
                 await self._writer.close()
 
-    # both books must be present; either side ticking triggers an evaluation
+    # both books must be present + fresh; either side ticking triggers an eval
     def _on_book(self, _: OrderBook) -> None:
         self._evaluate()
 
@@ -110,10 +120,19 @@ class SpreadMonitor(BaseStrategy):
         if l_q is None or r_q is None:
             return
 
+        # Uniform freshness gate: skip the row entirely if either leg's book is
+        # not in-sync / not recently updated. Outage ⇒ gap in the series.
+        ts_ms = now_ms()
+        l_ts = lx.book_ts(lm)
+        r_ts = rx.book_ts(rm)
+        if (l_ts is None or r_ts is None
+                or ts_ms - l_ts > _FRESH_MS or ts_ms - r_ts > _FRESH_MS):
+            self._skipped += 1
+            return
+
         qty = self.cfg.strategy.qty
         mx = self.cfg.strategy.max_levels
 
-        ts_ms = now_ms()
         mid_l = l_q.mid
         mid_r = r_q.mid
         raw_spread = mid_l - mid_r
@@ -136,7 +155,6 @@ class SpreadMonitor(BaseStrategy):
 
         gap_ms = 0 if self._last_row_ms == 0 else ts_ms - self._last_row_ms
         self._last_row_ms = ts_ms
-        health = self._feed_health(lx, lm, rx, rm)
 
         if self._writer:
             self._writer.submit({
@@ -152,10 +170,8 @@ class SpreadMonitor(BaseStrategy):
                 "vwap_right_sell": vwap_r_sell, "vwap_right_buy": vwap_r_buy,
                 "edge_A_bps": edge_A_bps, "edge_B_bps": edge_B_bps,
                 "gates_passed": gates,
+                "left_ts_ms": l_ts, "right_ts_ms": r_ts,
                 "gap_ms": gap_ms,
-                "katana_seq": health.get("katana_seq"),
-                "katana_seq_gap": health.get("katana_seq_gap", 0),
-                "reconnects": health.get("reconnects", 0),
             })
 
         # human-readable log throttled to once per minute; Parquet has the full stream
@@ -163,22 +179,12 @@ class SpreadMonitor(BaseStrategy):
             self._last_log_ms = ts_ms
             _log.info(
                 "spread: mid_l=%s mid_r=%s spread=%s bias=%s edge_A=%s edge_B=%s "
-                "gates=%s recon=%s seq_gap=%s",
+                "gates=%s age_l=%dms age_r=%dms skipped=%d",
                 _fmt(mid_l, 2), _fmt(mid_r, 2),
                 _fmt(raw_spread, 4), _fmt(bias, 4),
                 _fmt(edge_A_bps, 2), _fmt(edge_B_bps, 2), gates,
-                health.get("reconnects", 0), health.get("katana_seq_gap", 0),
+                ts_ms - l_ts, ts_ms - r_ts, self._skipped,
             )
-
-    @staticmethod
-    def _feed_health(lx, lm, rx, rm) -> dict[str, Any]:
-        """Merge `feed_stats()` from whichever leg exposes it (Katana)."""
-        out: dict[str, Any] = {}
-        for ex, m in ((lx, lm), (rx, rm)):
-            fn = getattr(ex, "feed_stats", None)
-            if callable(fn):
-                out.update(fn(m))
-        return out
 
 
 def _fmt(v: Decimal | None, places: int) -> str:

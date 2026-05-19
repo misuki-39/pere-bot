@@ -11,9 +11,13 @@ snapshot over the socket. The book is bootstrapped from the REST
 
 `size == 0` removes a level. The REST snapshot carries `sequence`; diffs with
 `u <= sequence` are stale and dropped, the rest applied in order. A jump in `u`
-means missed messages — counted (`seq_gap_total`) and resynced from a fresh
-snapshot. `reconnects` counts (re)connections. Both feed the spread monitor's
-data-completeness columns.
+means missed messages — counted (`seq_gap_total`) and resynced.
+
+Memory safety (this leaked and OOM-killed a ≤1 GB VPS): while desynced the
+diff stream must NOT accumulate unbounded. `_buffer` is a bounded `deque`
+(old diffs are useless anyway — a successful bootstrap reseeds from a *fresh*
+snapshot at the current sequence), and bootstrap is single-in-flight with a
+timed retry rather than one task per sequence-gap.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections import deque
 from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
@@ -39,6 +44,8 @@ BookCallback = Callable[[OrderBook], None]
 QuoteCallback = Callable[[Quote], None]
 
 _TOP_N = 20
+_BUFFER_MAX = 4096       # bounded; a fresh snapshot makes older diffs irrelevant
+_RESYNC_RETRY_S = 3.0    # snapshot-bootstrap retry cadence while desynced
 
 
 class KatanaPublicWs:
@@ -68,13 +75,22 @@ class KatanaPublicWs:
         self._last_quote: Quote | None = None
 
         self._synced = False
-        self._buffer: list[dict[str, Any]] = []
+        self._buffer: deque[dict[str, Any]] = deque(maxlen=_BUFFER_MAX)
         self._last_u: int | None = None
+        self._gen = 0                       # bumped each (re)connect
+        self._bootstrap_task: asyncio.Task[None] | None = None
 
-        # data-completeness counters (read by the spread monitor)
+        # wall-clock ms of the last update applied to the in-sync book —
+        # liveness, exposed via the client's book_ts(). 0 until first sync.
+        self._last_update_ms = 0
+        # internal diagnostics only (drive the adapter's own log warnings)
         self.reconnects = 0
         self.seq_gap_total = 0
         self.last_seq: int | None = None
+
+    @property
+    def last_update_ms(self) -> int:
+        return self._last_update_ms
 
     def add_book_callback(self, cb: BookCallback) -> None:
         self._book_cbs.append(cb)
@@ -97,6 +113,8 @@ class KatanaPublicWs:
 
     async def stop(self) -> None:
         self._stop.set()
+        if self._bootstrap_task:
+            self._bootstrap_task.cancel()
         if self._task:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -136,11 +154,15 @@ class KatanaPublicWs:
                 backoff = min(backoff * 2, 30.0)
 
     def _reset_book(self) -> None:
+        self._gen += 1
         self._bids.clear()
         self._asks.clear()
         self._synced = False
         self._buffer.clear()
         self._last_u = None
+        if self._bootstrap_task and not self._bootstrap_task.done():
+            self._bootstrap_task.cancel()
+        self._bootstrap_task = None
 
     async def _handle(self, ws, raw: str | bytes) -> None:
         msg = orjson.loads(raw)
@@ -150,62 +172,85 @@ class KatanaPublicWs:
         if t == "ping":
             await ws.send(orjson.dumps({"type": "pong"}).decode())
         elif t == "subscriptions":
-            # ack: now safe to bootstrap the snapshot (diffs buffer until then)
-            await self._bootstrap()
+            self._schedule_bootstrap()
         elif t == "error":
             _log.error("katana-pubws server error: %s", msg.get("data"))
         elif t == "l2orderbook":
             self._on_diff(msg.get("data") or {})
 
-    async def _bootstrap(self) -> None:
-        """Fetch the REST snapshot and reconcile buffered diffs against it."""
-        url = f"{self.rest_base_url}/v1/orderbook?market={self.market}&level=2"
-        try:
-            timeout = aiohttp.ClientTimeout(total=15)
-            async with aiohttp.ClientSession(trust_env=True, timeout=timeout) as s, s.get(url) as r:
-                r.raise_for_status()
-                snap = await r.json(content_type=None)
-        except Exception as e:  # noqa: BLE001
-            _log.warning("katana-pubws snapshot fetch failed: %s — will retry on next ack", e)
+    def _schedule_bootstrap(self) -> None:
+        """Start a single bootstrap task; no-op if one is already running."""
+        if self._bootstrap_task is not None and not self._bootstrap_task.done():
             return
-        seq = int(snap["sequence"])
-        self._bids = {
-            p: sz for lvl in snap.get("bids", [])
-            if (sz := Decimal(str(lvl[1]))) > 0
-            for p in (Decimal(str(lvl[0])),)
-        }
-        self._asks = {
-            p: sz for lvl in snap.get("asks", [])
-            if (sz := Decimal(str(lvl[1]))) > 0
-            for p in (Decimal(str(lvl[0])),)
-        }
-        self._last_u = seq
-        # replay buffered diffs newer than the snapshot, in order
-        for d in sorted(self._buffer, key=lambda d: int(d.get("u", 0))):
-            if int(d.get("u", 0)) > seq:
-                self._apply(d)
-        self._buffer.clear()
-        self._synced = True
-        self._emit_book()
+        self._bootstrap_task = asyncio.create_task(
+            self._bootstrap(self._gen), name=f"katana-bootstrap-{self.market}"
+        )
+
+    async def _bootstrap(self, gen: int) -> None:
+        """Fetch the REST snapshot and reconcile; retry on a timer while desynced.
+
+        Tied to the connection generation `gen` so a bootstrap from a previous
+        socket cannot clobber a newer connection's state.
+        """
+        url = f"{self.rest_base_url}/v1/orderbook?market={self.market}&level=2"
+        while not self._stop.is_set() and gen == self._gen and not self._synced:
+            try:
+                timeout = aiohttp.ClientTimeout(total=15)
+                async with aiohttp.ClientSession(trust_env=True, timeout=timeout) as s, \
+                        s.get(url) as r:
+                    r.raise_for_status()
+                    snap = await r.json(content_type=None)
+            except asyncio.CancelledError:
+                return
+            except Exception as e:  # noqa: BLE001
+                _log.warning(
+                    "katana-pubws snapshot fetch failed (%s: %r) — retrying in %.1fs",
+                    type(e).__name__, e, _RESYNC_RETRY_S,
+                )
+                await asyncio.sleep(_RESYNC_RETRY_S)
+                continue
+            if gen != self._gen:
+                return  # reconnected underneath us
+            seq = int(snap["sequence"])
+            self._bids = {
+                p: sz for lvl in snap.get("bids", [])
+                if (sz := Decimal(str(lvl[1]))) > 0
+                for p in (Decimal(str(lvl[0])),)
+            }
+            self._asks = {
+                p: sz for lvl in snap.get("asks", [])
+                if (sz := Decimal(str(lvl[1]))) > 0
+                for p in (Decimal(str(lvl[0])),)
+            }
+            self._last_u = seq
+            for d in sorted(self._buffer, key=lambda d: int(d.get("u", 0))):
+                if int(d.get("u", 0)) > seq:
+                    self._apply(d)
+            self._buffer.clear()
+            self._synced = True
+            self._last_update_ms = now_ms()  # liveness: book is now valid
+            self._emit_book()
+            return
 
     def _on_diff(self, d: dict[str, Any]) -> None:
         u = int(d.get("u", 0))
         self.last_seq = u
         if not self._synced:
-            self._buffer.append(d)
+            self._buffer.append(d)  # bounded deque: oldest auto-dropped
+            self._schedule_bootstrap()
             return
         assert self._last_u is not None
         if u <= self._last_u:
             return  # stale / duplicate
         if u > self._last_u + 1:
-            # missed messages — count them and resync from a fresh snapshot
+            # missed messages — count, mark desynced, resync from a fresh snapshot
             self.seq_gap_total += u - self._last_u - 1
             _log.warning(
                 "katana-pubws sequence gap: %d -> %d (resync)", self._last_u, u,
             )
-            self._reset_book()
-            asyncio.create_task(self._bootstrap(), name=f"katana-resync-{self.market}")
+            self._synced = False
             self._buffer.append(d)
+            self._schedule_bootstrap()
             return
         self._apply(d)
         self._emit_book()
@@ -216,6 +261,7 @@ class KatanaPublicWs:
         for p, sz, _c in d.get("a", []):
             self._set(self._asks, Decimal(str(p)), Decimal(str(sz)))
         self._last_u = int(d.get("u", 0))
+        self._last_update_ms = now_ms()  # liveness: in-sync update applied
 
     @staticmethod
     def _set(side: dict[Decimal, Decimal], price: Decimal, size: Decimal) -> None:

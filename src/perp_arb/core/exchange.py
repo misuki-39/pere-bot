@@ -82,6 +82,16 @@ class BaseExchange(ABC):
         also catches external changes: manual closes, liquidations, funding).
         """
 
+    def book_ts(self, market: MarketInfo) -> int | None:
+        """Wall-clock ms of the last update applied to a valid, in-sync local
+        book for `market`; None until first sync.
+
+        Concrete (non-abstract) so venues opt in. Recorders use this as a
+        uniform liveness signal: a down/desynced feed applies no in-sync
+        updates, so this timestamp ages out and the recorder can skip.
+        """
+        return None
+
     @abstractmethod
     def best_quote(self, market: MarketInfo) -> Quote | None:
         """Cached most-recent Quote (None until first WS frame)."""

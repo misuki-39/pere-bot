@@ -13,6 +13,7 @@ import websockets
 
 from ...core.types import BookLevel, OrderBook, Quote, Symbol
 from ...utils.proxy import get_proxy_url
+from ...utils.time import now_ms
 from .rest import AsterRest
 
 _log = logging.getLogger(__name__)
@@ -49,6 +50,13 @@ class AsterPublicWs:
 
         self._last_book: OrderBook | None = None
         self._last_quote: Quote | None = None
+        # wall-clock ms of the last received depth frame — feed liveness,
+        # exposed via the client's book_ts(). 0 until the first frame.
+        self._last_update_ms = 0
+
+    @property
+    def last_update_ms(self) -> int:
+        return self._last_update_ms
 
     @property
     def stream_name(self) -> str:
@@ -113,6 +121,7 @@ class AsterPublicWs:
         asks = [BookLevel(Decimal(p), s) for p, q in payload["a"] if (s := Decimal(q)) > 0]
         if not bids or not asks:
             return
+        self._last_update_ms = now_ms()  # liveness: every valid frame
 
         prev = self._last_quote
         new_quote = (bids[0].price, bids[0].size, asks[0].price, asks[0].size)

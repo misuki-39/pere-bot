@@ -70,12 +70,19 @@ class LighterPublicWs:
         self._asks: dict[Decimal, Decimal] = {}
         self._last_book: OrderBook | None = None
         self._last_quote: Quote | None = None
+        # wall-clock ms of the last applied book message — feed liveness,
+        # exposed via the client's book_ts(). 0 until the first snapshot.
+        self._last_update_ms = 0
 
     def add_book_callback(self, cb: BookCallback) -> None:
         self._book_cbs.append(cb)
 
     def add_quote_callback(self, cb: QuoteCallback) -> None:
         self._quote_cbs.append(cb)
+
+    @property
+    def last_update_ms(self) -> int:
+        return self._last_update_ms
 
     @property
     def last_book(self) -> OrderBook | None:
@@ -148,11 +155,13 @@ class LighterPublicWs:
                 if (s := Decimal(lvl["size"])) > 0
                 for p in (Decimal(lvl["price"]),)
             }
+            self._last_update_ms = now_ms()
             self._emit_book()
         elif t == "update/order_book":
             ob = data["order_book"]
             _apply_diff(self._bids, ob.get("bids", []))
             _apply_diff(self._asks, ob.get("asks", []))
+            self._last_update_ms = now_ms()
             self._emit_book()
 
     def _emit_book(self) -> None:

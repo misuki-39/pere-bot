@@ -132,6 +132,10 @@ class AsterClient(BaseExchange):
         ws = self._public_ws_by_symbol.get(market.symbol.raw)
         return ws.last_book if ws else None
 
+    def book_ts(self, market: MarketInfo) -> int | None:
+        ws = self._public_ws_by_symbol.get(market.symbol.raw)
+        return ws.last_update_ms if ws and ws.last_update_ms else None
+
     # ----- orders -----
 
     async def place_market_order(

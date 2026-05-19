@@ -11,7 +11,6 @@ import asyncio
 import contextlib
 import logging
 from decimal import Decimal
-from typing import Any
 
 import aiohttp
 
@@ -133,16 +132,9 @@ class KatanaClient(BaseExchange):
     def live_position(self, market: MarketInfo) -> Position | None:
         return None
 
-    def feed_stats(self, market: MarketInfo) -> dict[str, Any]:
-        """Data-completeness counters for the spread monitor (not in BaseExchange)."""
+    def book_ts(self, market: MarketInfo) -> int | None:
         ws = self._public_ws_by_symbol.get(market.symbol.raw)
-        if ws is None:
-            return {}
-        return {
-            "katana_seq": ws.last_seq,
-            "katana_seq_gap": ws.seq_gap_total,
-            "reconnects": ws.reconnects,
-        }
+        return ws.last_update_ms if ws and ws.last_update_ms else None
 
     # ---- trading surface: unimplemented this phase ----
 

@@ -88,7 +88,12 @@ async def _async_main(cfg: AppCfg) -> int:
             _log.warning("signal %d received; shutting down", sig)
             stop_evt.set()
 
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        # SIGHUP too: on a VPS a dropped SSH (if the job wasn't disowned) would
+        # otherwise kill the process abruptly and skip the writer's clean close.
+        sigs = [signal.SIGINT, signal.SIGTERM]
+        if hasattr(signal, "SIGHUP"):
+            sigs.append(signal.SIGHUP)
+        for sig in sigs:
             with contextlib.suppress(NotImplementedError):
                 loop.add_signal_handler(sig, _on_signal, sig)
 

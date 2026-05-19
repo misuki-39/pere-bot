@@ -21,6 +21,5 @@ scale_halflife_s: 300
 
 # depth gate: VWAP over the top-N levels for `qty`
 max_levels: 3
-
-# hourly-rotated Parquet under logs/spread_ETH_<ts>/date=YYYY-MM-DD/HH.parquet
-capture_rotation_minutes: 60
+# capture lands in logs/spread_ETH_<ts>/date=YYYY-MM-DD/HH.parquet
+# (one Parquet file per hour, finalized on rotation / clean shutdown)
