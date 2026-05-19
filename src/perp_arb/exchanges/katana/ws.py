@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import heapq
 import logging
 from collections import deque
 from collections.abc import Callable
@@ -34,6 +35,7 @@ import aiohttp
 import orjson
 import websockets
 
+from ...core.logging import RateLimited
 from ...core.types import BookLevel, OrderBook, Quote, Symbol
 from ...utils.proxy import get_proxy_url
 from ...utils.time import now_ms
@@ -46,6 +48,26 @@ QuoteCallback = Callable[[Quote], None]
 _TOP_N = 20
 _BUFFER_MAX = 4096       # bounded; a fresh snapshot makes older diffs irrelevant
 _RESYNC_RETRY_S = 3.0    # snapshot-bootstrap retry cadence while desynced
+# A session must stay up at least this long to count as "stable"; otherwise
+# connect-then-drop flapping (e.g. a flaky proxy) keeps growing the backoff
+# instead of resetting it to 1 s on every bare connect.
+_STABLE_S = 30.0
+# Diff venues only remove a level on an explicit size=0; levels that simply
+# leave the top are never zeroed, so an unpruned book dict grows for the whole
+# run (memory) and the per-message sort cost grows with it (CPU). Keep only the
+# best _BOOK_CAP levels — far deeper than _TOP_N / any VWAP need — and only
+# prune once it has drifted well past the cap (amortized O(1)).
+_BOOK_CAP = 512
+
+
+def _trim(side: dict[Decimal, Decimal], *, keep_highest: bool) -> None:
+    survivors = set(
+        heapq.nlargest(_BOOK_CAP, side) if keep_highest
+        else heapq.nsmallest(_BOOK_CAP, side)
+    )
+    for p in list(side):
+        if p not in survivors:
+            del side[p]
 
 
 class KatanaPublicWs:
@@ -122,18 +144,21 @@ class KatanaPublicWs:
             self._task = None
 
     async def _run(self) -> None:
+        loop = asyncio.get_running_loop()
         backoff = 1.0
+        errlim = RateLimited(10.0)
         sub = orjson.dumps({
             "method": "subscribe",
             "subscriptions": [{"name": "l2orderbook", "markets": [self.market]}],
         }).decode()
         while not self._stop.is_set():
+            t0: float | None = None
             try:
                 _log.info("katana-pubws connecting: %s", self.ws_url)
                 async with websockets.connect(
                     self.ws_url, ping_interval=20, open_timeout=30, proxy=get_proxy_url(),
                 ) as ws:
-                    backoff = 1.0
+                    t0 = loop.time()
                     self.reconnects += 1
                     self._reset_book()
                     await ws.send(sub)
@@ -143,15 +168,20 @@ class KatanaPublicWs:
                         try:
                             await self._handle(ws, raw)
                         except Exception:  # noqa: BLE001
-                            _log.exception("katana-pubws _handle failed; raw=%r", raw)
+                            if (n := errlim.tick(loop.time())) is not None:
+                                _log.exception(
+                                    "katana-pubws _handle failed (%d in interval); raw=%r",
+                                    n, raw,
+                                )
             except asyncio.CancelledError:
                 return
             except Exception as e:  # noqa: BLE001
+                lasted = (loop.time() - t0) if t0 is not None else 0.0
+                backoff = 1.0 if lasted >= _STABLE_S else min(backoff * 2, 30.0)
                 _log.warning(
                     "katana-pubws disconnected: %s — reconnecting in %.1fs", e, backoff,
                 )
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
 
     def _reset_book(self) -> None:
         self._gen += 1
@@ -271,22 +301,33 @@ class KatanaPublicWs:
             side[price] = size
 
     def _emit_book(self) -> None:
-        top_bids = sorted(self._bids.items(), key=lambda x: x[0], reverse=True)[:_TOP_N]
-        top_asks = sorted(self._asks.items(), key=lambda x: x[0])[:_TOP_N]
-        if not top_bids or not top_asks:
+        bids, asks = self._bids, self._asks
+        if not bids or not asks:
             return
+        if len(bids) > _BOOK_CAP * 2:
+            _trim(bids, keep_highest=True)
+        if len(asks) > _BOOK_CAP * 2:
+            _trim(asks, keep_highest=False)
+        # Best bid/ask + dedup BEFORE building the top-N levels, so an
+        # unchanged-BBO message (the common case) allocates nothing.
+        best_bid = max(bids)
+        best_ask = min(asks)
+        new_top = (best_bid, bids[best_bid], best_ask, asks[best_ask])
         prev = self._last_quote
-        new_top = (top_bids[0][0], top_bids[0][1], top_asks[0][0], top_asks[0][1])
         if prev is not None and (prev.bid, prev.bid_size, prev.ask, prev.ask_size) == new_top:
             return
-        bids = [BookLevel(p, s) for p, s in top_bids]
-        asks = [BookLevel(p, s) for p, s in top_asks]
+        top_bids = heapq.nlargest(_TOP_N, bids.items(), key=lambda kv: kv[0])
+        top_asks = heapq.nsmallest(_TOP_N, asks.items(), key=lambda kv: kv[0])
+        bid_levels = [BookLevel(p, s) for p, s in top_bids]
+        ask_levels = [BookLevel(p, s) for p, s in top_asks]
         ts = now_ms()
-        self._last_book = OrderBook(symbol=self.symbol, bids=bids, asks=asks, ts_ms=ts)
+        self._last_book = OrderBook(
+            symbol=self.symbol, bids=bid_levels, asks=ask_levels, ts_ms=ts
+        )
         self._last_quote = Quote(
             symbol=self.symbol,
-            bid=bids[0].price, bid_size=bids[0].size,
-            ask=asks[0].price, ask_size=asks[0].size,
+            bid=bid_levels[0].price, bid_size=bid_levels[0].size,
+            ask=ask_levels[0].price, ask_size=ask_levels[0].size,
             ts_ms=ts,
         )
         for cb in self._book_cbs:

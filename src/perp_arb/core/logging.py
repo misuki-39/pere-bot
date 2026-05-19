@@ -13,12 +13,36 @@ import logging
 import sys
 from datetime import UTC, datetime
 from decimal import Decimal
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from threading import Lock
 from typing import TextIO
 
 _DEFAULT_FORMAT = "%(asctime)s.%(msecs)03d %(levelname)-7s [%(name)s] %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+class RateLimited:
+    """Counts events; lets the caller emit at most once per `every_s`.
+
+    Stops a per-message failure (a malformed-frame storm at tick rate, days
+    long) from flooding the log even with rotation. `tick(now)` returns the
+    number of events since the last emit when it's time to log again, else
+    None.
+    """
+
+    def __init__(self, every_s: float = 10.0) -> None:
+        self.every_s = every_s
+        self._count = 0
+        self._last = 0.0
+
+    def tick(self, now: float) -> int | None:
+        self._count += 1
+        if now - self._last >= self.every_s:
+            self._last = now
+            n, self._count = self._count, 0
+            return n
+        return None
 
 
 def setup_logging(log_dir: Path, level: str = "INFO", run_tag: str = "run") -> Path:
@@ -41,7 +65,12 @@ def setup_logging(log_dir: Path, level: str = "INFO", run_tag: str = "run") -> P
     sh.setFormatter(fmt)
     root.addHandler(sh)
 
-    fh = logging.FileHandler(log_path, encoding="utf-8")
+    # Rotating, not plain: a multi-day run that hits a reconnect / bad-frame
+    # warning storm must not fill a small VPS disk (a full disk stalls the
+    # Parquet writer thread). 50 MB × 5 ≈ 250 MB hard cap.
+    fh = RotatingFileHandler(
+        log_path, maxBytes=50 * 1024 * 1024, backupCount=5, encoding="utf-8",
+    )
     fh.setFormatter(fmt)
     root.addHandler(fh)
 

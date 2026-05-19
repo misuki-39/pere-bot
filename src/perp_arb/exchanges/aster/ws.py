@@ -11,6 +11,7 @@ from decimal import Decimal
 
 import websockets
 
+from ...core.logging import RateLimited
 from ...core.types import BookLevel, OrderBook, Quote, Symbol
 from ...utils.proxy import get_proxy_url
 from ...utils.time import now_ms
@@ -21,6 +22,8 @@ _log = logging.getLogger(__name__)
 DepthCallback = Callable[[OrderBook], None]
 QuoteCallback = Callable[[Quote], None]
 UserEventCallback = Callable[[dict], None]
+
+_STABLE_S = 30.0  # min session uptime to reset reconnect backoff to 1 s
 
 
 class AsterPublicWs:
@@ -91,26 +94,31 @@ class AsterPublicWs:
             self._task = None
 
     async def _run(self) -> None:
+        loop = asyncio.get_running_loop()
         url = f"{self.ws_url}/stream?streams={self.stream_name}"
         backoff = 1.0
+        errlim = RateLimited(10.0)
         while not self._stop.is_set():
+            t0: float | None = None
             try:
                 _log.info("aster-ws connecting: %s", url)
                 async with websockets.connect(url, ping_interval=20, proxy=get_proxy_url()) as ws:
-                    backoff = 1.0
+                    t0 = loop.time()
                     async for msg in ws:
                         if self._stop.is_set():
                             break
                         try:
                             self._handle(msg)
-                        except Exception as e:  # noqa: BLE001
-                            _log.exception("aster-ws handle error: %s", e)
+                        except Exception:  # noqa: BLE001
+                            if (n := errlim.tick(loop.time())) is not None:
+                                _log.exception("aster-ws handle error (%d in interval)", n)
             except asyncio.CancelledError:
                 return
             except Exception as e:  # noqa: BLE001
+                lasted = (loop.time() - t0) if t0 is not None else 0.0
+                backoff = 1.0 if lasted >= _STABLE_S else min(backoff * 2, 30.0)
                 _log.warning("aster-ws disconnected: %s — reconnecting in %.1fs", e, backoff)
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
 
     def _handle(self, raw: str | bytes) -> None:
         # Combined-stream wraps as {"stream": "...", "data": {...depthUpdate...}}.

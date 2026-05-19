@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import heapq
 import logging
 import time
 import uuid
@@ -35,6 +36,7 @@ from typing import Any
 import orjson
 import websockets
 
+from ...core.logging import RateLimited
 from ...core.types import BookLevel, OrderBook, Quote, Symbol
 from ...utils.proxy import get_proxy_url
 from ...utils.time import now_ms
@@ -46,6 +48,23 @@ QuoteCallback = Callable[[Quote], None]
 AccountCallback = Callable[[dict[str, Any]], None]
 
 _TOP_N = 20    # cap on book levels we expose downstream
+# Lighter has no resync path (book only clears on a full socket reconnect), so
+# an unpruned diff-merged dict grows for the whole multi-day run — memory plus
+# a per-message O(n log n) sort. Keep only the best _BOOK_CAP levels.
+_BOOK_CAP = 512
+
+
+_STABLE_S = 30.0  # min session uptime to reset reconnect backoff to 1 s
+
+
+def _trim(side: dict[Decimal, Decimal], *, keep_highest: bool) -> None:
+    survivors = set(
+        heapq.nlargest(_BOOK_CAP, side) if keep_highest
+        else heapq.nsmallest(_BOOK_CAP, side)
+    )
+    for p in list(side):
+        if p not in survivors:
+            del side[p]
 
 
 def _ws_url(base_url: str) -> str:
@@ -108,14 +127,17 @@ class LighterPublicWs:
             self._task = None
 
     async def _run(self) -> None:
+        loop = asyncio.get_running_loop()
         backoff = 1.0
+        errlim = RateLimited(10.0)
         while not self._stop.is_set():
+            t0: float | None = None
             try:
                 _log.info("lighter-pubws connecting: %s", self.ws_url)
                 async with websockets.connect(
                     self.ws_url, ping_interval=20, proxy=get_proxy_url(),
                 ) as ws:
-                    backoff = 1.0
+                    t0 = loop.time()
                     self._bids.clear()
                     self._asks.clear()
                     await ws.send(orjson.dumps({
@@ -128,15 +150,20 @@ class LighterPublicWs:
                         try:
                             await self._handle(ws, raw)
                         except Exception:  # noqa: BLE001
-                            _log.exception("lighter-pubws _handle failed; raw=%r", raw)
+                            if (n := errlim.tick(loop.time())) is not None:
+                                _log.exception(
+                                    "lighter-pubws _handle failed (%d in interval); raw=%r",
+                                    n, raw,
+                                )
             except asyncio.CancelledError:
                 return
             except Exception as e:  # noqa: BLE001
+                lasted = (loop.time() - t0) if t0 is not None else 0.0
+                backoff = 1.0 if lasted >= _STABLE_S else min(backoff * 2, 30.0)
                 _log.warning(
                     "lighter-pubws disconnected: %s — reconnecting in %.1fs", e, backoff,
                 )
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
 
     async def _handle(self, ws, raw: str | bytes) -> None:
         data = orjson.loads(raw)
@@ -165,22 +192,33 @@ class LighterPublicWs:
             self._emit_book()
 
     def _emit_book(self) -> None:
-        top_bids = sorted(self._bids.items(), key=lambda x: x[0], reverse=True)[:_TOP_N]
-        top_asks = sorted(self._asks.items(), key=lambda x: x[0])[:_TOP_N]
-        if not top_bids or not top_asks:
+        bids, asks = self._bids, self._asks
+        if not bids or not asks:
             return
+        if len(bids) > _BOOK_CAP * 2:
+            _trim(bids, keep_highest=True)
+        if len(asks) > _BOOK_CAP * 2:
+            _trim(asks, keep_highest=False)
+        # Best bid/ask + dedup BEFORE building the top-N levels, so an
+        # unchanged-BBO message (the common case) allocates nothing.
+        best_bid = max(bids)
+        best_ask = min(asks)
+        new_top = (best_bid, bids[best_bid], best_ask, asks[best_ask])
         prev = self._last_quote
-        new_top = (top_bids[0][0], top_bids[0][1], top_asks[0][0], top_asks[0][1])
         if prev is not None and (prev.bid, prev.bid_size, prev.ask, prev.ask_size) == new_top:
             return
-        bids = [BookLevel(p, s) for p, s in top_bids]
-        asks = [BookLevel(p, s) for p, s in top_asks]
+        top_bids = heapq.nlargest(_TOP_N, bids.items(), key=lambda kv: kv[0])
+        top_asks = heapq.nsmallest(_TOP_N, asks.items(), key=lambda kv: kv[0])
+        bid_levels = [BookLevel(p, s) for p, s in top_bids]
+        ask_levels = [BookLevel(p, s) for p, s in top_asks]
         ts = now_ms()
-        self._last_book = OrderBook(symbol=self.symbol, bids=bids, asks=asks, ts_ms=ts)
+        self._last_book = OrderBook(
+            symbol=self.symbol, bids=bid_levels, asks=ask_levels, ts_ms=ts
+        )
         self._last_quote = Quote(
             symbol=self.symbol,
-            bid=bids[0].price, bid_size=bids[0].size,
-            ask=asks[0].price, ask_size=asks[0].size,
+            bid=bid_levels[0].price, bid_size=bid_levels[0].size,
+            ask=ask_levels[0].price, ask_size=ask_levels[0].size,
             ts_ms=ts,
         )
         for cb in self._book_cbs:

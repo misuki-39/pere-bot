@@ -52,7 +52,7 @@ class RotatingParquetWriter:
         *,
         batch_size: int = 2000,
         flush_interval_s: float = 5.0,
-        queue_max: int = 50_000,
+        queue_max: int = 10_000,
     ) -> None:
         self.root = Path(root)
         self.schema = schema
@@ -75,20 +75,27 @@ class RotatingParquetWriter:
             self._q.put_nowait(row)
         except asyncio.QueueFull:
             self.dropped += 1
-            loop_t = asyncio.get_event_loop().time()
+            loop_t = asyncio.get_running_loop().time()
             if loop_t - self._last_drop_log >= 10.0:
                 self._last_drop_log = loop_t
                 _log.warning("parquet writer behind: dropped=%d (queue full)", self.dropped)
 
     async def close(self) -> None:
+        """Bounded, lossless-on-the-happy-path shutdown. The writer task is the
+        sole owner of `self._writer`: close() only delivers the sentinel and
+        waits — it never touches the ParquetWriter itself (no cross-thread
+        race), and never runs blocking pyarrow on the event loop."""
         if self._task is None:
             return
-        with contextlib.suppress(asyncio.QueueFull):
-            self._q.put_nowait(_CLOSE)  # drain remaining batch then stop
-        with contextlib.suppress(asyncio.CancelledError):
-            await self._task
-        self._task = None
-        await asyncio.to_thread(self._finalize)
+        try:
+            await asyncio.wait_for(self._q.put(_CLOSE), timeout=5.0)
+            await asyncio.wait_for(self._task, timeout=30.0)
+        except (TimeoutError, asyncio.CancelledError):
+            self._task.cancel()  # task's CancelledError branch finalizes (bounded)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._task
+        finally:
+            self._task = None
 
     # ---- writer task ----
 
@@ -96,7 +103,7 @@ class RotatingParquetWriter:
         """Buffer rows; flush a batch on size OR a time bound. The blocking
         pyarrow write/close runs in a thread so a slow disk or the hourly
         close can never freeze the event loop (and the WS feeds with it)."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         batch: list[dict] = []
         deadline = loop.time() + self.flush_interval_s
         try:
@@ -110,6 +117,7 @@ class RotatingParquetWriter:
                     item = _FLUSH
                 if item is _CLOSE:
                     await self._flush_async(batch)
+                    await asyncio.to_thread(self._finalize)  # close the open file
                     return
                 if item is not _FLUSH:
                     batch.append(item)  # type: ignore[arg-type]
@@ -118,7 +126,14 @@ class RotatingParquetWriter:
                     batch = []
                     deadline = loop.time() + self.flush_interval_s
         except asyncio.CancelledError:
-            self._flush(batch)  # best-effort, synchronous on shutdown
+            # Best-effort, OFF the event loop, bounded. Never run sync pyarrow
+            # on the loop (the original freeze) and never exceed the budget;
+            # shield so the threaded flush+close survives the cancellation.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    asyncio.shield(asyncio.to_thread(self._flush_and_finalize, batch)),
+                    timeout=10.0,
+                )
             raise
         except Exception:  # noqa: BLE001 — a writer crash must not be silent
             _log.exception("parquet writer task failed")
@@ -127,6 +142,11 @@ class RotatingParquetWriter:
     async def _flush_async(self, batch: list[dict]) -> None:
         if batch:
             await asyncio.to_thread(self._flush, batch)
+
+    def _flush_and_finalize(self, batch: list[dict]) -> None:
+        """Sole shutdown helper run in a worker thread (never on the loop)."""
+        self._flush(batch)
+        self._finalize()
 
     def _path(self, key: tuple[str, str]) -> Path:
         date, hour = key
