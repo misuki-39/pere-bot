@@ -5,7 +5,11 @@ Designed for unattended runs of several days. Two properties matter:
 * The producer (a WS callback on the event loop) must never block on disk.
   `submit()` is a non-blocking `put_nowait`; if the writer falls behind and the
   bounded queue fills, rows are dropped and counted rather than stalling the
-  socket recv loop or growing memory without bound.
+  socket recv loop or growing memory without bound. Rows are buffered and
+  written in batches (by size or a time bound) as one Parquet row group per
+  flush — never one row group per row — and the blocking pyarrow write/close
+  runs in a worker thread so a slow disk or the hourly close cannot freeze the
+  event loop.
 * A clean shutdown loses nothing; an abnormal kill costs at most the
   currently-open hour. Each wall-clock hour is its own file, finalized on
   rotation or on `close()`:
@@ -29,6 +33,9 @@ import pyarrow.parquet as pq
 
 _log = logging.getLogger(__name__)
 
+_CLOSE = object()  # queue sentinel: drain remaining batch then stop
+_FLUSH = object()  # internal: time-bound flush tick
+
 
 def _hour_key(ts_ms: int) -> tuple[str, str]:
     dt = datetime.fromtimestamp(ts_ms / 1000, tz=UTC)
@@ -44,12 +51,14 @@ class RotatingParquetWriter:
         schema: pa.Schema,
         *,
         batch_size: int = 2000,
-        queue_max: int = 100_000,
+        flush_interval_s: float = 5.0,
+        queue_max: int = 50_000,
     ) -> None:
         self.root = Path(root)
         self.schema = schema
         self.batch_size = batch_size
-        self._q: asyncio.Queue[dict | None] = asyncio.Queue(maxsize=queue_max)
+        self.flush_interval_s = flush_interval_s
+        self._q: asyncio.Queue[object] = asyncio.Queue(maxsize=queue_max)
         self._task: asyncio.Task[None] | None = None
         self._writer: pq.ParquetWriter | None = None
         self._cur_key: tuple[str, str] | None = None
@@ -74,32 +83,50 @@ class RotatingParquetWriter:
     async def close(self) -> None:
         if self._task is None:
             return
-        await self._q.put(None)  # sentinel: drain then stop
+        with contextlib.suppress(asyncio.QueueFull):
+            self._q.put_nowait(_CLOSE)  # drain remaining batch then stop
         with contextlib.suppress(asyncio.CancelledError):
             await self._task
         self._task = None
-        self._finalize()
+        await asyncio.to_thread(self._finalize)
 
     # ---- writer task ----
 
     async def _run(self) -> None:
+        """Buffer rows; flush a batch on size OR a time bound. The blocking
+        pyarrow write/close runs in a thread so a slow disk or the hourly
+        close can never freeze the event loop (and the WS feeds with it)."""
+        loop = asyncio.get_event_loop()
         batch: list[dict] = []
+        deadline = loop.time() + self.flush_interval_s
         try:
             while True:
-                row = await self._q.get()
-                if row is None:
-                    self._flush(batch)
+                # Block indefinitely when idle; otherwise wake to flush by the
+                # time bound even if batch_size hasn't been reached.
+                timeout = None if not batch else max(0.0, deadline - loop.time())
+                try:
+                    item = await asyncio.wait_for(self._q.get(), timeout)
+                except TimeoutError:
+                    item = _FLUSH
+                if item is _CLOSE:
+                    await self._flush_async(batch)
                     return
-                batch.append(row)
-                if len(batch) >= self.batch_size or self._q.empty():
-                    self._flush(batch)
+                if item is not _FLUSH:
+                    batch.append(item)  # type: ignore[arg-type]
+                if batch and (item is _FLUSH or len(batch) >= self.batch_size):
+                    await self._flush_async(batch)
                     batch = []
+                    deadline = loop.time() + self.flush_interval_s
         except asyncio.CancelledError:
-            self._flush(batch)
+            self._flush(batch)  # best-effort, synchronous on shutdown
             raise
         except Exception:  # noqa: BLE001 — a writer crash must not be silent
             _log.exception("parquet writer task failed")
             raise
+
+    async def _flush_async(self, batch: list[dict]) -> None:
+        if batch:
+            await asyncio.to_thread(self._flush, batch)
 
     def _path(self, key: tuple[str, str]) -> Path:
         date, hour = key
