@@ -12,9 +12,6 @@ Designed for unattended runs of several days. Two properties matter:
 
       <root>/date=YYYY-MM-DD/HH.parquet
 
-  (The realistic data-loss cause here was an OOM from a leak elsewhere, now
-  fixed; one file per hour is an accepted trade for a feasibility capture.)
-
 Numeric fields are stored as strings (lossless for `Decimal`, matching the
 project's CSV convention); the analysis step casts as needed.
 """

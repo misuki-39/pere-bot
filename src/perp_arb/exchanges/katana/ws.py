@@ -13,11 +13,11 @@ snapshot over the socket. The book is bootstrapped from the REST
 `u <= sequence` are stale and dropped, the rest applied in order. A jump in `u`
 means missed messages — counted (`seq_gap_total`) and resynced.
 
-Memory safety (this leaked and OOM-killed a ≤1 GB VPS): while desynced the
-diff stream must NOT accumulate unbounded. `_buffer` is a bounded `deque`
-(old diffs are useless anyway — a successful bootstrap reseeds from a *fresh*
-snapshot at the current sequence), and bootstrap is single-in-flight with a
-timed retry rather than one task per sequence-gap.
+Memory safety: while desynced the diff stream must NOT accumulate unbounded.
+`_buffer` is a bounded `deque` (old diffs are useless anyway — a successful
+bootstrap reseeds from a *fresh* snapshot at the current sequence), and
+bootstrap is single-in-flight with a timed retry rather than one task per
+sequence-gap.
 """
 
 from __future__ import annotations
