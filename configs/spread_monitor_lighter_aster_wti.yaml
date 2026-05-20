@@ -1,0 +1,29 @@
+strategy: spread_monitor      # public-only; no trading, no creds needed
+mode: paper                   # irrelevant for spread_monitor (kept for schema)
+
+pair:                         # required by the schema; used for the run/file tag
+  base: WTI
+  aster_symbol: CLUSDT
+  lighter_symbol: WTI
+
+# Generic monitor pair (left, right). left = Lighter WTI, right = Aster CLUSDT.
+monitor_pair:
+  - { venue: lighter, symbol: WTI }
+  - { venue: aster,   symbol: CLUSDT }
+
+# small-capital order size used for the VWAP edge columns
+qty: 1
+max_qty: 10
+
+# aster taker fee = 1 bps; lighter taker fee = 0 bps (maker-rebated venue).
+# spread_monitor itself does not consume this — kept here for downstream analysis.
+fees_bps: 1
+
+# spread-centre / dispersion EWMA half-lives (wall-clock seconds)
+bias_halflife_s: 3600
+scale_halflife_s: 300
+
+# depth gate: VWAP over the top-N levels for `qty`
+max_levels: 3
+# capture lands in logs/spread_WTI_<ts>/date=YYYY-MM-DD/HH.parquet
+# (one Parquet file per hour, finalized on rotation / clean shutdown)
