@@ -17,14 +17,10 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from ..utils.time import mono_ms
 from .logging import CsvWriter
-from .types import OrderResult, Side
-
-if TYPE_CHECKING:
-    from ..strategy.taker_taker import _FillAccumulator
+from .types import OrderResult, Side, TerminalFill
 
 
 class Outcome(StrEnum):
@@ -114,7 +110,7 @@ class LegReport:
     def build(
         cls, *, venue: str, side: Side, qty: Decimal,
         expected: Decimal | None, rest: OrderResult,
-        fill: _FillAccumulator | None = None,
+        fill: TerminalFill | None = None,
         latency_ms: int | None, kind: LegKind = LegKind.ENTRY,
     ) -> LegReport:
         """Single LegReport constructor: merges REST submit-ack with the

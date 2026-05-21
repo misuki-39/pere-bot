@@ -55,6 +55,7 @@ class AsterClient(BaseExchange):
         signer: AsterSigner | None = None,
         public_only: bool = False,
     ) -> None:
+        super().__init__()
         self.rest = AsterRest(base_url=rest_url, signer=signer)
         self.ws_url = ws_url
         self.signer = signer
@@ -243,9 +244,6 @@ class AsterClient(BaseExchange):
         if market is None:
             _log.warning("aster ORDER_TRADE_UPDATE for unloaded symbol %s", raw_symbol)
             return
-        cbs = self._fill_cbs.get(raw_symbol)
-        if not cbs:
-            return
         # `l` / `L` = THIS event's per-fill delta (Binance-fork convention).
         # Non-fill events (NEW / pure-CANCELED) carry l=0 and are dropped at
         # the source — the accumulator only sees real fills, so its
@@ -264,7 +262,12 @@ class AsterClient(BaseExchange):
             order_id=str(o["i"]),
             terminal_status=status if status.terminal else None,
         )
-        for cb in cbs:
+        # Internal: feed the per-cid tracker (submit_and_await's awaitable).
+        # Must precede the per-symbol fan-out: once the strategy stops
+        # subscribing, `_fill_cbs[raw_symbol]` is empty but the tracker
+        # still needs the event.
+        self._fill_tracker.on_event(delta)
+        for cb in self._fill_cbs.get(raw_symbol, ()):
             cb(delta)
 
     def _handle_account_update(self, data: dict) -> None:

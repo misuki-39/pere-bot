@@ -32,7 +32,9 @@ from perp_arb.core.types import (
     Side,
     Symbol,
 )
-from perp_arb.strategy.taker_taker import _FillAccumulator
+from perp_arb.core.types import (
+    TerminalFill as _FillAccumulator,
+)
 
 _SYM = Symbol(exchange="aster", raw="CLUSDT", base="WTI", quote="USDT")
 

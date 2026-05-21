@@ -63,6 +63,7 @@ class LighterClient(BaseExchange):
         api_key_index: int = 0,
         public_only: bool = False,
     ) -> None:
+        super().__init__()
         self.base_url = base_url.rstrip("/")
         self.api_key_private_key = api_key_private_key
         self.account_index = account_index
@@ -384,11 +385,13 @@ class LighterClient(BaseExchange):
         raw_symbol = self._symbol_by_market_index.get(int(o["market_index"]))
         if raw_symbol is None:
             return
-        cbs = self._fill_cbs.get(raw_symbol)
-        if not cbs:
-            return
         snap = _order_to_snapshot(o, self._meta_by_symbol[raw_symbol].symbol)
-        for cb in cbs:
+        # Internal: feed the per-cid tracker (submit_and_await's awaitable).
+        # Must precede the per-symbol fan-out: once the strategy stops
+        # subscribing, `_fill_cbs[raw_symbol]` is empty but the tracker
+        # still needs the event.
+        self._fill_tracker.on_event(snap)
+        for cb in self._fill_cbs.get(raw_symbol, ()):
             cb(snap)
 
 

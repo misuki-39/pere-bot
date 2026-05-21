@@ -48,6 +48,7 @@ class KatanaClient(BaseExchange):
         ws_url: str,
         public_only: bool = True,
     ) -> None:
+        super().__init__()
         self.base_url = base_url.rstrip("/")
         self.ws_url = ws_url
         self.public_only = public_only

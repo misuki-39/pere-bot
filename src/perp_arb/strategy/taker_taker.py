@@ -1,8 +1,15 @@
 """TakerTakerArbitrage — depth-aware VWAP edge vs EWMA bias on mid-mid.
 
-Modes:
-  * `paper` — full decision math, orders are no-ops that log synthetic fills.
-  * `live`  — real `place_market_order` calls on both venues concurrently.
+Layering: this module is the *signal* layer. It produces a `Decision`
+per tick (via `assess_taker_taker`) and hands fired decisions to
+`TwoLegExecutor`, which owns cid generation, the two-leg gather, WS
+fill tracking, partial-failure unwind, and paper-mode synth. The
+strategy only feeds `TradeReport` back into position / risk /
+throttle / heartbeat state — it never sees REST results or WS fills.
+
+Modes (passed through to the executor at construction time):
+  * `paper` — synthetic fills from current book VWAP; no REST calls.
+  * `live`  — real submits on both venues, gathered concurrently.
 
 What it bets on:
   An EWMA of (mid_aster - mid_lighter) tracks the long-run inter-venue
@@ -30,7 +37,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -40,14 +46,11 @@ from ..core.exec_record import (
     Decision,
     Direction,
     ExecutionRecorder,
-    LegKind,
-    LegReport,
     Outcome,
     Phase,
 )
-from ..core.types import FillDelta, OrderResult, OrderSnapshot, OrderStatus, Side
+from ..core.executor import LegIntent, TwoLegExecutor
 from ..risk.manager import RiskManager
-from ..utils.precision import vwap_fill
 from ..utils.time import now_ms
 from .base import BaseStrategy, SpreadModel, TimeEwma
 from .markout import MarkoutTable
@@ -69,52 +72,6 @@ class SyntheticPosition:
     aster: Decimal = Decimal("0")
     lighter: Decimal = Decimal("0")
     realised_pnl: Decimal = Decimal("0")
-
-
-@dataclass(slots=True)
-class _FillAccumulator:
-    """Per-`client_id` aggregate of two event types:
-
-      * `OrderSnapshot` — cumulative running totals (lighter
-        `account_market.orders`); accumulator OVERWRITES filled_qty + price.
-      * `FillDelta` — per-fill event (aster `l`/`L`); accumulator
-        ACCUMULATES qty * price.
-
-    `last_status` is taken from any terminal-status signal so `is_complete`
-    can short-circuit the wait the moment the venue confirms the parent
-    order is settled (FILLED / CANCELED / REJECTED / EXPIRED)."""
-
-    filled_qty: Decimal = Decimal("0")
-    weighted_price_sum: Decimal = Decimal("0")
-    last_ts_ms: int = 0
-    last_status: OrderStatus | None = None
-
-    def add(self, event: OrderSnapshot | FillDelta) -> None:
-        if event.ts_ms:
-            self.last_ts_ms = max(self.last_ts_ms, event.ts_ms)
-        match event:
-            case OrderSnapshot():
-                if event.status.terminal:
-                    self.last_status = event.status
-                if event.filled_qty > 0:
-                    self.filled_qty = event.filled_qty
-                    if event.realized_price is not None:
-                        self.weighted_price_sum = event.filled_qty * event.realized_price
-            case FillDelta():
-                if event.terminal_status is not None:
-                    self.last_status = event.terminal_status
-                # FillDelta adapter invariant: qty > 0 (non-fills dropped at source).
-                self.filled_qty += event.qty
-                self.weighted_price_sum += event.qty * event.price
-
-    def is_complete(self, requested_qty: Decimal) -> bool:
-        # Terminal status = no more fills coming (filled / canceled /
-        # rejected / expired) → stop waiting. Otherwise fall back to qty
-        # comparison for the trade-only path (account_orders unsubscribed
-        # or lagging).
-        if self.last_status is not None and self.last_status.terminal:
-            return True
-        return self.filled_qty >= requested_qty
 
 
 class TakerTakerArbitrage(BaseStrategy):
@@ -177,15 +134,16 @@ class TakerTakerArbitrage(BaseStrategy):
         self._inflight_cap = int(opt.in_flight_cap_per_direction)
         self._inflight_dir: dict[str, Direction] = {}
 
-        # Per-`client_id` fill-event slots. Pre-registered in `_fire` BEFORE
-        # the REST submit, so a fast aster fill can't race past the
-        # registration and be dropped by `_on_fill`'s unknown-cid guard.
-        # Lighter's REST returns submit-ack only, so the WS fill event is
-        # the ONLY source of realized_price + fill_ts_ms for that leg.
-        self._fill_events: dict[str, asyncio.Event] = {}
-        self._fill_acc: dict[str, _FillAccumulator] = {}
-        # 5 s comfortably absorbs lighter sequencer's long tail (typical <1 s).
-        self._fill_wait_timeout_s = 5.0
+        # Execution is delegated: two-leg gather, WS fill tracking,
+        # partial-failure unwind, paper synth all live in the executor +
+        # driver layers. Strategy resolves Direction→sides itself and
+        # hands the executor concrete LegIntents — the executor never
+        # sees strategy-internal concepts.
+        self._executor = TwoLegExecutor(
+            exchanges, markets,
+            is_paper=(s.mode is RunMode.PAPER),
+            max_levels=s.max_levels,
+        )
 
         if markout.direction_A or markout.direction_B:
             _log.info(
@@ -213,52 +171,11 @@ class TakerTakerArbitrage(BaseStrategy):
         self._aster().subscribe_book(self._aster_market(), lambda _b: self._schedule_eval())
         self._lighter().subscribe_book(self._lighter_market(), lambda _b: self._schedule_eval())
 
-        if self.cfg.strategy.mode is RunMode.LIVE:
-            self._aster().subscribe_fills(self._aster_market(), self._on_fill)
-            self._lighter().subscribe_fills(self._lighter_market(), self._on_fill)
-
         try:
             await self._stop.wait()
         finally:
             if self._recorder:
                 self._recorder.close()
-
-    # ---- fill event handling ----
-
-    def _on_fill(self, event: OrderSnapshot | FillDelta) -> None:
-        # Drop fills for cids we didn't pre-register (stale orders, other
-        # sessions on the same account).
-        cid = event.client_id
-        if not cid or cid not in self._fill_events:
-            return
-        self._fill_acc.setdefault(cid, _FillAccumulator()).add(event)
-        self._fill_events[cid].set()
-
-    async def _await_fill(
-        self, client_id: str, requested_qty: Decimal,
-    ) -> _FillAccumulator | None:
-        """Wait up to `_fill_wait_timeout_s` for accumulated fills to reach
-        `requested_qty`. Returns whatever landed (None if no events at all)
-        and unconditionally releases the slot."""
-        ev = self._fill_events.get(client_id)
-        if ev is None:
-            return None
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + self._fill_wait_timeout_s
-        try:
-            while (remaining := deadline - loop.time()) > 0:
-                try:
-                    await asyncio.wait_for(ev.wait(), timeout=remaining)
-                except TimeoutError:
-                    break
-                acc = self._fill_acc.get(client_id)
-                if acc and acc.is_complete(requested_qty):
-                    return acc
-                ev.clear()
-            return self._fill_acc.get(client_id)
-        finally:
-            self._fill_events.pop(client_id, None)
-            self._fill_acc.pop(client_id, None)
 
     # ---- evaluation ----
 
@@ -402,72 +319,49 @@ class TakerTakerArbitrage(BaseStrategy):
     # ---- order firing ----
 
     async def _fire(self, d: Decision) -> None:
+        """Resolve Direction → venue-side intents, delegate execution,
+        then apply the TradeReport to position / risk / throttle.
+
+        Strategy owns the Direction→Side resolution because Direction is
+        a strategy concept; the executor only sees concrete `Side`s.
+        Strategy also owns position / risk / throttle updates because
+        they feed back into the next `_assess`."""
         assert d.direction is not None
         qty = self.cfg.strategy.qty
         a_side, l_side = left_side(d.direction), right_side(d.direction)
         if d.direction is Direction.A:
-            exp_a, exp_l = d.vwap_left_sell, d.vwap_right_buy
+            a_exp, l_exp = d.vwap_left_sell, d.vwap_right_buy
         else:
-            exp_a, exp_l = d.vwap_left_buy, d.vwap_right_sell
+            a_exp, l_exp = d.vwap_left_buy, d.vwap_right_sell
 
         _log.info("[%s] FIRE qty=%s aster=%s lighter=%s mode=%s",
                   d.decision_id, qty, a_side, l_side, self.cfg.strategy.mode)
 
         if self._inflight_cap > 0:
             self._inflight_dir[d.decision_id] = d.direction
-
-        aster_cid = f"{d.decision_id}-a"
-        lighter_cid = f"{d.decision_id}-l"
-        is_live = self.cfg.strategy.mode is RunMode.LIVE
-
         try:
-            if is_live:
-                # Register fill slots BEFORE submit so a fast aster fill
-                # can't race past `_on_fill`'s unknown-cid guard.
-                self._fill_events[aster_cid] = asyncio.Event()
-                self._fill_events[lighter_cid] = asyncio.Event()
+            report = await self._executor.execute(
+                trade_id=d.decision_id,
+                legs=(
+                    LegIntent(
+                        venue="aster", side=a_side, expected_price=a_exp,
+                        client_id=f"{d.decision_id}-a",
+                    ),
+                    LegIntent(
+                        venue="lighter", side=l_side, expected_price=l_exp,
+                        client_id=f"{d.decision_id}-l",
+                    ),
+                ),
+                qty=qty,
+                timeline=d.timeline,
+            )
+            d.legs = report.legs
+            d.send_ts_ms = report.send_ts_ms
 
-            d.timeline.mark(Phase.SEND)
-            d.send_ts_ms = now_ms()
-            if self.cfg.strategy.mode is RunMode.PAPER:
-                ra, rl = self._paper_fill(a_side, l_side, qty)
-                d.timeline.mark("result_aster")
-                d.timeline.mark("result_lighter")
-                aster_fill: _FillAccumulator | None = None
-                lighter_fill: _FillAccumulator | None = None
-            else:
-                async def _submit_and_await(
-                    place_coro, venue: str, cid: str,
-                ) -> tuple[OrderResult, _FillAccumulator | None]:
-                    r = await place_coro
-                    d.timeline.mark(f"result_{venue}")
-                    fill = await self._await_fill(cid, qty) if r.success else None
-                    return r, fill
-
-                (ra, aster_fill), (rl, lighter_fill) = await asyncio.gather(
-                    _submit_and_await(self._aster().place_market_order(
-                        self._aster_market(), a_side, qty, client_id=aster_cid),
-                        "aster", aster_cid),
-                    _submit_and_await(self._lighter().place_market_order(
-                        self._lighter_market(), l_side, qty, client_id=lighter_cid),
-                        "lighter", lighter_cid),
-                )
-            d.timeline.mark(Phase.RESULT)
-
-            lat_a = d.timeline.span(Phase.SEND, "result_aster")
-            lat_l = d.timeline.span(Phase.SEND, "result_lighter")
-            d.legs = [
-                LegReport.build(venue="aster", side=a_side, qty=qty, expected=exp_a,
-                                rest=ra, fill=aster_fill, latency_ms=lat_a),
-                LegReport.build(venue="lighter", side=l_side, qty=qty, expected=exp_l,
-                                rest=rl, fill=lighter_fill, latency_ms=lat_l),
-            ]
-            latency = d.timeline.span(Phase.SEND, Phase.RESULT)
-
-            if ra.success and rl.success:
+            if report.success:
                 self._position.aster += qty * Decimal(a_side.sign)
                 self._position.lighter += qty * Decimal(l_side.sign)
-                self._risk.record_success(leg_latency_ms=latency or 0)
+                self._risk.record_success(leg_latency_ms=report.latency_ms or 0)
 
                 # Seed throttle bump only on confirmed FILLED — a partial /
                 # both-fail consumed no edge.
@@ -476,112 +370,12 @@ class TakerTakerArbitrage(BaseStrategy):
                     target.bump(self._throttle_bump_bps, now_ms())
 
                 _log.info(
-                    "[%s] FILLED aster=%s lighter=%s latency=%sms pos_a=%s pos_l=%s",
-                    d.decision_id, ra.order_id, rl.order_id, latency,
+                    "[%s] pos_a=%s pos_l=%s",
+                    d.decision_id,
                     self._position.aster, self._position.lighter,
                 )
             else:
-                await self._handle_partial_failure(d, a_side, l_side, qty, ra, rl)
+                self._risk.record_failure(report.failure_reason or "unknown")
         finally:
             if self._inflight_cap > 0:
                 self._inflight_dir.pop(d.decision_id, None)
-            # `_await_fill` cleans up on the happy path; this covers the
-            # short window where Event() registered but REST never reached
-            # `_await_fill` (e.g. failed REST + exception before gather).
-            self._fill_events.pop(aster_cid, None)
-            self._fill_acc.pop(aster_cid, None)
-            self._fill_events.pop(lighter_cid, None)
-            self._fill_acc.pop(lighter_cid, None)
-
-    async def _handle_partial_failure(
-        self,
-        d: Decision,
-        a_side: Side,
-        l_side: Side,
-        qty: Decimal,
-        ra: OrderResult,
-        rl: OrderResult,
-    ) -> None:
-        if ra.success and not rl.success:
-            _log.error(
-                "[%s] PARTIAL: aster filled, lighter failed (%s) — unwinding aster",
-                d.decision_id, rl.error_message,
-            )
-            await self._unwind_leg(d, "aster", a_side.opposite, qty, ra.avg_price)
-            self._risk.record_failure(f"lighter leg failed: {rl.error_message}")
-        elif rl.success and not ra.success:
-            _log.error(
-                "[%s] PARTIAL: lighter filled, aster failed (%s) — unwinding lighter",
-                d.decision_id, ra.error_message,
-            )
-            await self._unwind_leg(d, "lighter", l_side.opposite, qty, rl.avg_price)
-            self._risk.record_failure(f"aster leg failed: {ra.error_message}")
-        else:
-            _log.warning(
-                "[%s] BOTH FAILED: aster=%s lighter=%s",
-                d.decision_id, ra.error_message, rl.error_message,
-            )
-            self._risk.record_failure("both legs failed")
-
-    async def _unwind_leg(
-        self, d: Decision, venue: str, side: Side, qty: Decimal,
-        cost_basis: Decimal | None,
-    ) -> None:
-        """Flatten the stranded leg and record the unwind as a first-class leg
-        (kind=unwind). expected_price is the stranded fill we are reversing, so
-        the round-trip cost of a partial is directly computable offline."""
-        if self.cfg.strategy.mode is RunMode.PAPER:
-            return
-        ex = self.exchanges[venue]
-        mkt = self.markets[venue]
-        d.timeline.mark("unwind_send")
-        try:
-            r = await ex.place_market_order(mkt, side, qty, reduce_only=True)
-            if not r.success:
-                _log.error("unwind on %s FAILED: %s", venue, r.error_message)
-        except Exception as e:  # noqa: BLE001
-            _log.exception("unwind on %s raised: %s", venue, e)
-            r = OrderResult(success=False, side=side, requested_qty=qty,
-                             error_message=f"unwind raised: {e}")
-        d.timeline.mark("unwind_result")
-        d.legs.append(LegReport.build(
-            venue=venue, side=side, qty=qty, expected=cost_basis,
-            rest=r, latency_ms=d.timeline.span("unwind_send", "unwind_result"),
-            kind=LegKind.UNWIND,
-        ))
-
-    def _paper_fill(
-        self,
-        aster_side: Side,
-        lighter_side: Side,
-        qty: Decimal,
-    ) -> tuple[OrderResult, OrderResult]:
-        # use current book VWAP as the synthetic fill price
-        a_book = self._aster().order_book(self._aster_market())
-        l_book = self._lighter().order_book(self._lighter_market())
-        assert a_book is not None and l_book is not None
-
-        a_levels = a_book.bids if aster_side is Side.SELL else a_book.asks
-        l_levels = l_book.bids if lighter_side is Side.SELL else l_book.asks
-        vwap_a, _ = vwap_fill(a_levels, qty, max_levels=self.cfg.strategy.max_levels)
-        vwap_l, _ = vwap_fill(l_levels, qty, max_levels=self.cfg.strategy.max_levels)
-        assert vwap_a is not None and vwap_l is not None
-
-        return (
-            OrderResult(
-                success=True,
-                order_id="paper-" + uuid.uuid4().hex[:8],
-                side=aster_side,
-                requested_qty=qty,
-                filled_qty=qty,
-                avg_price=vwap_a,
-            ),
-            OrderResult(
-                success=True,
-                order_id="paper-" + uuid.uuid4().hex[:8],
-                side=lighter_side,
-                requested_qty=qty,
-                filled_qty=qty,
-                avg_price=vwap_l,
-            ),
-        )

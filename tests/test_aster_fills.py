@@ -10,9 +10,16 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from perp_arb.core.types import FillDelta, MarketInfo, Symbol
+from perp_arb.core.fill_tracker import _PerCidFillTracker
+from perp_arb.core.types import (
+    FillDelta,
+    MarketInfo,
+    Symbol,
+)
+from perp_arb.core.types import (
+    TerminalFill as _FillAccumulator,
+)
 from perp_arb.exchanges.aster.client import AsterClient
-from perp_arb.strategy.taker_taker import _FillAccumulator
 
 _SYM = Symbol(exchange="aster", raw="CLUSDT", base="WTI", quote="USDT")
 _MARKET = MarketInfo(
@@ -42,6 +49,7 @@ def _make_client_with_market() -> tuple[AsterClient, list[FillDelta]]:
     c = AsterClient.__new__(AsterClient)
     c._fill_cbs = {}      # type: ignore[attr-defined]
     c._markets = {"CLUSDT": _MARKET}  # type: ignore[attr-defined]
+    c._fill_tracker = _PerCidFillTracker()  # type: ignore[attr-defined]
     received: list[FillDelta] = []
     c._fill_cbs["CLUSDT"] = [received.append]   # type: ignore[index]
     return c, received

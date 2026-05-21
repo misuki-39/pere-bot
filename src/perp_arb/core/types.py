@@ -185,3 +185,68 @@ class Position:
     @property
     def is_flat(self) -> bool:
         return self.size == 0
+
+
+@dataclass(slots=True)
+class TerminalFill:
+    """Per-`client_id` aggregate of WS fill events, the canonical "what
+    actually filled" view that callers see.
+
+    Absorbs two event types with different semantics:
+
+      * `OrderSnapshot` — cumulative running totals (lighter
+        `account_market.orders`); OVERWRITES filled_qty + weighted_price_sum.
+      * `FillDelta` — per-fill event (aster `l`/`L`); ACCUMULATES qty * price.
+
+    `last_status` is taken from any terminal-status signal so `is_complete`
+    can short-circuit the wait the moment the venue confirms the parent
+    order is settled (FILLED / CANCELED / REJECTED / EXPIRED)."""
+
+    filled_qty: Decimal = Decimal("0")
+    weighted_price_sum: Decimal = Decimal("0")
+    last_ts_ms: int = 0
+    last_status: OrderStatus | None = None
+
+    def add(self, event: OrderSnapshot | FillDelta) -> None:
+        if event.ts_ms:
+            self.last_ts_ms = max(self.last_ts_ms, event.ts_ms)
+        match event:
+            case OrderSnapshot():
+                if event.status.terminal:
+                    self.last_status = event.status
+                if event.filled_qty > 0:
+                    self.filled_qty = event.filled_qty
+                    if event.realized_price is not None:
+                        self.weighted_price_sum = event.filled_qty * event.realized_price
+            case FillDelta():
+                if event.terminal_status is not None:
+                    self.last_status = event.terminal_status
+                # FillDelta adapter invariant: qty > 0 (non-fills dropped at source).
+                self.filled_qty += event.qty
+                self.weighted_price_sum += event.qty * event.price
+
+    def is_complete(self, requested_qty: Decimal) -> bool:
+        # Terminal status = no more fills coming (filled / canceled /
+        # rejected / expired) → stop waiting. Otherwise fall back to qty
+        # comparison for the trade-only path (account_orders unsubscribed
+        # or lagging).
+        if self.last_status is not None and self.last_status.terminal:
+            return True
+        return self.filled_qty >= requested_qty
+
+    @property
+    def avg_price(self) -> Decimal | None:
+        if self.filled_qty == 0:
+            return None
+        return self.weighted_price_sum / self.filled_qty
+
+
+@dataclass(slots=True)
+class OrderOutcome:
+    """Driver-layer return: REST submit result + WS-tracked terminal fill.
+
+    `fill is None` when REST submit failed (no point awaiting) OR the
+    tracker timed out before any event arrived."""
+
+    rest: OrderResult
+    fill: TerminalFill | None
