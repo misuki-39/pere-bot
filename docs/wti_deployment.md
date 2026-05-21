@@ -206,6 +206,26 @@ backtest regression on 2026-05-21).
    add later: extend `OptimisationsCfg` in `core/config.py` and thread
    through `taker_taker.py`'s `AssessParams` construction.
 
+6. **Lighter asset / collateral balance is NOT tracked.** We subscribe
+   `account_market/<m>/<a>` which gives positions + orders + trades but
+   `assets` is `null` for perp markets (per Lighter spec). We don't
+   currently read USDC balance from anywhere on lighter — no REST poll,
+   no `account_all_assets` WS subscription. Consequences:
+     * "Realized PnL" in CSVs is the strategy's own SyntheticPosition
+       math, NOT the venue's view. Reconciliation against the lighter
+       UI requires reading balance separately.
+     * No pre-trade "do I have enough collateral" check — we rely on
+       `max_qty` to keep absolute exposure bounded.
+     * `RiskManager.daily_loss_cap_usd` is enforced against our internal
+       PnL accumulator, not actual account drawdown.
+   Tolerable for small-cap launch (qty ≤ 1). Add before scaling beyond
+   $10 k notional: either `LighterClient.get_account_balance()` polled
+   every N seconds, or extend `LighterUserWs` with an
+   `account_all_assets/<a>` subscription (channel exists per apidocs;
+   SDK doesn't expose it — would need hand-rolled subscribe like
+   `subscribe_account_market`). Aster's balance comes via REST
+   `/fapi/v2/account` if/when we need it.
+
 ---
 
 ## Reference numbers (Wave-1 backtest, 20 h on 2026-05-20 WTI capture)
