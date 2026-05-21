@@ -324,13 +324,17 @@ class LighterClient(BaseExchange):
         meta = self._meta_by_symbol[market.symbol.raw]
         pos = Position(symbol=market.symbol, size=Decimal("0"))
         if data and data.accounts:
-            for p in data.accounts[0].positions:
-                if int(p.market_id) == meta.market_index:
+            # Normalize SDK pydantic positions → plain dict so the
+            # downstream helpers see the same shape as WS payloads
+            # (field names are identical: market_id / sign / position /
+            #  avg_entry_price / unrealized_pnl).
+            for p in (sdk_p.to_dict() for sdk_p in data.accounts[0].positions):
+                if int(p["market_id"]) == meta.market_index:
                     pos = Position(
                         symbol=market.symbol,
                         size=_signed_size(p),
-                        entry_price=Decimal(str(getattr(p, "avg_entry_price", 0) or 0)),
-                        unrealised_pnl=Decimal(str(getattr(p, "unrealized_pnl", 0) or 0)),
+                        entry_price=Decimal(str(p.get("avg_entry_price") or 0)),
+                        unrealised_pnl=Decimal(str(p.get("unrealized_pnl") or 0)),
                     )
                     break
         # Pattern A: WS owns the cache; REST only seeds. See docs/position_cache.md.
@@ -403,15 +407,10 @@ def _worst_acceptable_price(q: Quote | None, is_ask: bool) -> Decimal:
     return Decimal("0.01") if is_ask else Decimal("1000000000")
 
 
-def _signed_size(p: Any) -> Decimal:
+def _signed_size(p: dict[str, Any]) -> Decimal:
     """Lighter encodes position as unsigned `position` + separate `sign` (+1/-1)."""
-    if isinstance(p, dict):
-        size = Decimal(p["position"])
-        sign = int(p["sign"])
-    else:
-        size = Decimal(str(p.position))
-        sign = int(p.sign)
-    return size if sign >= 0 else -size
+    size = Decimal(p["position"])
+    return size if int(p["sign"]) >= 0 else -size
 
 
 def _sendtx_outcome(reply: dict[str, Any]) -> tuple[bool, str]:
