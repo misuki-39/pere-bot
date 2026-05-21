@@ -422,6 +422,17 @@ def _sendtx_outcome(reply: dict[str, Any]) -> tuple[bool, str]:
     return True, ""
 
 
+# Lighter has two distinct status vocabularies. We keep them as two
+# functions because they really are different — collapsing into one map
+# would obscure the venue's actual asymmetry. Compare with aster, which
+# uses a single `_ASTER_STATUS_MAP` because its REST and WS share one
+# vocabulary.
+#
+#   REST  `account_active_orders.status` →  UPPERCASE tokens, no variants.
+#     Used by: `_status_from_str` (called from `get_order`).
+#   WS    `account_market.orders.status` →  lowercase, with `canceled-*`
+#     variants that fold into CANCELED / EXPIRED. Used by:
+#     `_account_orders_status` (called from `_order_to_snapshot`).
 _LIGHTER_STATUS_MAP = {
     "OPEN": OrderStatus.OPEN,
     "FILLED": OrderStatus.FILLED,
@@ -437,8 +448,7 @@ def _status_from_str(s: str) -> OrderStatus:
 
 
 def _account_orders_status(s: str) -> OrderStatus:
-    """Map `account_orders.status` (lowercase, doc-listed values) to our enum.
-    The various `canceled-*` variants all collapse to CANCELED except
+    """`canceled-*` variants all collapse to CANCELED except
     `canceled-expired`, which is semantically EXPIRED."""
     s = (s or "").lower()
     if s == "pending":
