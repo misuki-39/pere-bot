@@ -31,9 +31,15 @@ def _parse_delays(s: str) -> dict[str, int]:
 
 
 def _load_params(config_path: Path, override_qty: Decimal | None) -> StrategyParams:
-    """Reuse live's YAML schema (subset of fields we need)."""
+    """Reuse live's YAML schema (subset of fields we need).
+
+    The Wave-1 optimisation knobs are read from an optional `optimisations:`
+    block; legacy configs that omit it get the default-off behaviour.
+    """
     raw = yaml.safe_load(config_path.read_text())
     qty = override_qty if override_qty is not None else Decimal(str(raw["qty"]))
+    opt = raw.get("optimisations", {}) or {}
+    markout_path = opt.get("markout_table_path")
     return StrategyParams(
         qty=qty,
         fees_bps=Decimal(str(raw.get("fees_bps", 0))),
@@ -44,6 +50,11 @@ def _load_params(config_path: Path, override_qty: Decimal | None) -> StrategyPar
         scale_halflife_s=float(raw.get("scale_halflife_s", 300)),
         warmup_seconds=float(raw.get("warmup_seconds", 180)),
         max_qty=Decimal(str(raw.get("max_qty", raw["qty"] * 100))),
+        markout_table_path=Path(markout_path) if markout_path else None,
+        inventory_skew_bps=Decimal(str(opt.get("inventory_skew_bps", 0))),
+        throttle_bump_bps=Decimal(str(opt.get("throttle_bump_bps", 0))),
+        throttle_halflife_s=float(opt.get("throttle_halflife_s", 3.0)),
+        in_flight_cap_per_direction=int(opt.get("in_flight_cap_per_direction", 0)),
     )
 
 

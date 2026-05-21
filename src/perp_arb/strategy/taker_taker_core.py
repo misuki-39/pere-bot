@@ -21,6 +21,7 @@ from typing import NamedTuple
 from ..core.exec_record import Decision, Direction, Outcome
 from ..core.types import OrderBook, Quote, Side
 from ..utils.precision import BPS, vwap_fill
+from .markout import MarkoutTable
 
 
 class _Vwaps(NamedTuple):
@@ -32,7 +33,17 @@ class _Vwaps(NamedTuple):
 
 @dataclass(frozen=True, slots=True)
 class AssessParams:
-    """Static decision parameters; build once per strategy instance."""
+    """Static decision parameters; build once per strategy instance.
+
+    Optional tuning knobs (default-off = same behaviour as v0):
+      markout: per-direction adverse-selection table, subtracted from raw
+               edge before threshold check. `MarkoutTable.disabled()` is the
+               no-op default. See `strategy/markout.py`.
+      inventory_skew_bps: κ in the AS-style threshold widener. Per unit of
+               |position|/max_qty, raise the entry threshold by κ bps when
+               the trade GROWS |position|, lower it by κ bps when it FLATTENS.
+               κ=0 = current binary max_qty gate only.
+    """
     qty: Decimal
     max_levels: int
     fees_bps: Decimal
@@ -40,12 +51,20 @@ class AssessParams:
     max_slippage_bps: Decimal
     max_stale_ms: int
     max_qty: Decimal
+    markout: MarkoutTable = MarkoutTable.disabled()
+    inventory_skew_bps: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True, slots=True)
 class AssessInputs:
     """Per-tick inputs. Caller is responsible for updating the EWMA model and
-    passing the resulting `bias` + warm flag; we never touch EWMA state here."""
+    passing the resulting `bias` + warm flag; we never touch EWMA state here.
+
+    Optional same-direction throttle bumps (default 0 = throttle off). When the
+    caller maintains a per-direction TimeEwma of "recently fired" bumps,
+    `bump_a_bps` and `bump_b_bps` add directly to that direction's threshold;
+    the pure function does not own the EWMA state.
+    """
     now_ms: int
     left_book: OrderBook
     right_book: OrderBook
@@ -55,6 +74,8 @@ class AssessInputs:
     is_warm: bool
     position_left: Decimal
     position_right: Decimal
+    bump_a_bps: Decimal = Decimal(0)
+    bump_b_bps: Decimal = Decimal(0)
 
 
 def left_side(direction: Direction) -> Side:
@@ -120,9 +141,29 @@ def assess_taker_taker(p: AssessParams, x: AssessInputs) -> Decision | None:
                    bias=x.bias, vwaps=vw)
 
     ref_mid = (mid_left + mid_right) / Decimal(2)
-    threshold = ref_mid * (p.fees_bps + p.min_profit_bps) / BPS
-    edge_A = (vwap_left_sell  - vwap_right_buy) - x.bias - threshold
-    edge_B = (vwap_right_sell - vwap_left_buy)  + x.bias - threshold
+
+    # Raw bias-adjusted edge in PRICE units (positive = arb in that direction).
+    raw_edge_A = (vwap_left_sell  - vwap_right_buy) - x.bias
+    raw_edge_B = (vwap_right_sell - vwap_left_buy)  + x.bias
+
+    # Threshold contributors. All in bps; converted to price units below.
+    fee_bps = p.fees_bps + p.min_profit_bps
+    raw_edge_A_bps = raw_edge_A / ref_mid * BPS
+    raw_edge_B_bps = raw_edge_B / ref_mid * BPS
+    markout_A_bps = p.markout.markout_bps(direction_a=True,  raw_edge_bps=raw_edge_A_bps)
+    markout_B_bps = p.markout.markout_bps(direction_a=False, raw_edge_bps=raw_edge_B_bps)
+    skew_A_bps = _inventory_skew_bps(
+        p.inventory_skew_bps, x.position_left, left_side(Direction.A).sign, p.max_qty)
+    skew_B_bps = _inventory_skew_bps(
+        p.inventory_skew_bps, x.position_left, left_side(Direction.B).sign, p.max_qty)
+
+    total_thresh_A_bps = fee_bps + markout_A_bps + skew_A_bps + x.bump_a_bps
+    total_thresh_B_bps = fee_bps + markout_B_bps + skew_B_bps + x.bump_b_bps
+
+    threshold_A = ref_mid * total_thresh_A_bps / BPS
+    threshold_B = ref_mid * total_thresh_B_bps / BPS
+    edge_A = raw_edge_A - threshold_A
+    edge_B = raw_edge_B - threshold_B
 
     if edge_A <= 0 and edge_B <= 0:
         return None
@@ -142,3 +183,32 @@ def assess_taker_taker(p: AssessParams, x: AssessInputs) -> Decision | None:
     # coupling.
     return new(Outcome.FIRED, bias=x.bias, edge_bps=edge_bps,
                direction=direction, vwaps=vw)
+
+
+def _inventory_skew_bps(
+    kappa_bps: Decimal,
+    position_left: Decimal,
+    delta_sign: int,
+    max_qty: Decimal,
+) -> Decimal:
+    """Avellaneda-Stoikov-shape inventory skew.
+
+    Returns a bps shift to ADD to the entry threshold (positive = harder to
+    fire, negative = easier). The shift is proportional to current
+    |position|/max_qty and signed by whether the trade grows or shrinks
+    |position|:
+
+      skew = kappa_bps * (position_left * delta_sign) / max_qty
+
+    With `delta_sign = left_side(direction).sign` (sell=−1, buy=+1):
+      - If `position_left` and `delta_sign` AGREE in sign  → growing |pos|
+        → positive skew (raise threshold; require stronger edge to add more).
+      - If they DISAGREE                                   → shrinking |pos|
+        → negative skew (lower threshold; reward flattening).
+      - At `|position_left| = max_qty`, |skew| = kappa_bps (full strength).
+
+    κ=0 disables the skew (same as binary max_qty gate downstream).
+    """
+    if kappa_bps == 0 or max_qty == 0:
+        return Decimal(0)
+    return kappa_bps * (position_left * Decimal(delta_sign)) / max_qty

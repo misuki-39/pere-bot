@@ -12,6 +12,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+from pathlib import Path
+
 from ..core.exec_record import ExecutionRecorder
 from .fills import FillModelKind
 from .intents import FillEvent, OrderIntent
@@ -40,17 +42,34 @@ class StrategyContext:
     right_venue: str
     fill_model: FillModelKind
     recorder: ExecutionRecorder
+    # Optional Wave-1 optimisation knobs. All default-off so the legacy
+    # strategy behaviour is preserved when the YAML omits these fields.
+    markout_table_path: Path | None = None     # JSON from scripts/markout_analysis.py
+    inventory_skew_bps: Decimal = Decimal(0)   # κ for AS-style threshold widener
+    throttle_bump_bps: Decimal = Decimal(0)    # Δ added to same-direction threshold on FIRED
+    throttle_halflife_s: float = 3.0           # decay of the throttle bump
+    in_flight_cap_per_direction: int = 0       # 0 = unlimited; K = at most K same-dir entries pending
 
 
 @dataclass(slots=True)
 class EngineView:
-    """Read-only proxy over engine state for the strategy."""
+    """Read-only proxy over engine state for the strategy.
+
+    `position(venue)` returns the *committed* exposure — settled fills plus
+    any signed quantity currently in-flight (scheduled but not yet resolved).
+    This matches the live model where `await self._fire(d)` serialises ticks,
+    so by the time the next decision is assessed the in-flight delta has
+    already been folded in. The backtest doesn't serialise, so it has to
+    expose in-flight explicitly or `max_qty` is unenforceable under latency.
+    """
     _positions: dict[str, Decimal] = field(default_factory=dict)
+    _in_flight: dict[str, Decimal] = field(default_factory=dict)
     _sim_now_ms: int = 0
     _pending_count: int = 0
 
     def position(self, venue: str) -> Decimal:
-        return self._positions.get(venue, Decimal("0"))
+        return (self._positions.get(venue, Decimal("0"))
+                + self._in_flight.get(venue, Decimal("0")))
 
     def sim_now_ms(self) -> int:
         return self._sim_now_ms

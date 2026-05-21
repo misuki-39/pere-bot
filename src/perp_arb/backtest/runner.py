@@ -9,6 +9,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
 from ..core.exec_record import ExecutionRecorder
 from .dataset import load_capture
@@ -32,6 +33,12 @@ class StrategyParams:
     scale_halflife_s: float
     warmup_seconds: float
     max_qty: Decimal
+    # Optional Wave-1 knobs. Default = legacy behaviour.
+    markout_table_path: Path | None = None
+    inventory_skew_bps: Decimal = Decimal(0)
+    throttle_bump_bps: Decimal = Decimal(0)
+    throttle_halflife_s: float = 3.0
+    in_flight_cap_per_direction: int = 0       # 0 = unlimited (current behaviour)
 
 
 def build_context(
@@ -60,6 +67,11 @@ def build_context(
         right_venue=right_venue,
         fill_model=cfg.fill_model,
         recorder=recorder,
+        markout_table_path=params.markout_table_path,
+        inventory_skew_bps=params.inventory_skew_bps,
+        throttle_bump_bps=params.throttle_bump_bps,
+        throttle_halflife_s=params.throttle_halflife_s,
+        in_flight_cap_per_direction=params.in_flight_cap_per_direction,
     )
 
 

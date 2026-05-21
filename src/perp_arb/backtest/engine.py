@@ -115,8 +115,14 @@ class Engine:
         }
         self.in_flight: dict[str, Decision] = {}
         self.remaining_legs: dict[str, int] = {}
+        # signed in-flight qty per venue (scheduled but not yet resolved).
+        # Combined with `positions.sizes` by `EngineView.position()` so
+        # `max_qty` caps total commitment, not just settled exposure.
+        self.in_flight_qty: dict[str, Decimal] = {ctx.left_venue: Decimal("0"),
+                                                  ctx.right_venue: Decimal("0")}
         self.summary = EngineSummary()
         self.view = EngineView(_positions=self.positions.sizes,
+                               _in_flight=self.in_flight_qty,
                                _sim_now_ms=0, _pending_count=0)
 
     def _pop_due(self, venue: str, up_to: int) -> list[PendingOrder]:
@@ -127,6 +133,13 @@ class Engine:
         return due
 
     def _apply_fill(self, fill: FillEvent, intent: OrderIntent) -> None:
+        # Decrement in-flight regardless of success — the intent has now
+        # resolved one way or the other and no longer represents pending
+        # exposure. Settled positions only move via `apply_pair` (atomic).
+        self.in_flight_qty[intent.venue] = (
+            self.in_flight_qty.get(intent.venue, Decimal("0"))
+            - intent.qty * Decimal(intent.side.sign)
+        )
         d = self.in_flight[fill.decision_id]
         r = OrderResult(
             success=fill.success,
@@ -183,6 +196,10 @@ class Engine:
         arrival = self.cfg.latency.arrival_ts(intent.venue, intent.sim_ts_ms)
         insort(self.pending[intent.venue], PendingOrder(intent, arrival),
                key=lambda p: p.arrival_ts_ms)
+        self.in_flight_qty[intent.venue] = (
+            self.in_flight_qty.get(intent.venue, Decimal("0"))
+            + intent.qty * Decimal(intent.side.sign)
+        )
         self.summary.intents_emitted += 1
 
     def _refresh_view(self, now_ms: int) -> None:

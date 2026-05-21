@@ -49,7 +49,8 @@ from ..core.types import OrderResult, Side
 from ..risk.manager import RiskManager
 from ..utils.precision import vwap_fill
 from ..utils.time import now_ms
-from .base import BaseStrategy, SpreadModel
+from .base import BaseStrategy, SpreadModel, TimeEwma
+from .markout import MarkoutTable
 from .taker_taker_core import (
     AssessInputs,
     AssessParams,
@@ -88,7 +89,16 @@ class TakerTakerArbitrage(BaseStrategy):
         self._last_heartbeat_ms = 0
         self._heartbeat_interval_ms = 60_000  # liveness only; trades go to CSV
         self._risk_blocked = False
-        # parameters consumed by the pure decision function
+        # parameters consumed by the pure decision function.
+        # Wave-1 optimisations (markout, throttle, cap) come from
+        # `s.optimisations` — defaults are all "off" so legacy configs that
+        # omit the block keep their pre-Wave-1 behaviour.
+        opt = s.optimisations
+        markout = (
+            MarkoutTable.from_json(opt.markout_table_path)
+            if opt.markout_table_path is not None
+            else MarkoutTable.disabled()
+        )
         self._params = AssessParams(
             qty=Decimal(str(s.qty)),
             max_levels=s.max_levels,
@@ -97,7 +107,46 @@ class TakerTakerArbitrage(BaseStrategy):
             max_slippage_bps=Decimal(str(s.max_slippage_bps)),
             max_stale_ms=s.max_stale_ms,
             max_qty=Decimal(str(s.max_qty)),
+            markout=markout,
+            # inventory_skew_bps intentionally left at default 0; not
+            # exposed in OptimisationsCfg until rolling markout calibration
+            # is stable.
         )
+
+        # Same-direction throttle: each FILLED on direction X bumps that
+        # direction's threshold by `throttle_bump_bps`; the bump decays
+        # back toward 0 with `throttle_halflife_s` half-life. Δ=0 disables.
+        self._throttle_enabled = opt.throttle_bump_bps > 0
+        self._throttle_bump_bps = Decimal(str(opt.throttle_bump_bps))
+        self._bump_a = TimeEwma(half_life_s=opt.throttle_halflife_s)
+        self._bump_b = TimeEwma(half_life_s=opt.throttle_halflife_s)
+
+        # Per-direction in-flight cap. K=0 disables. K=1 = at most one
+        # outstanding entry of that direction at a time.
+        # NOTE: live's `_evaluating` gate in `_schedule_eval` already
+        # serializes evaluation, so `_inflight_dir` is in practice always
+        # empty by the time `_assess` runs. The cap is wired for parity
+        # with the backtest path and as a forward-safety belt if the gate
+        # is ever relaxed.
+        self._inflight_cap = int(opt.in_flight_cap_per_direction)
+        self._inflight_dir: dict[str, Direction] = {}
+
+        if markout.direction_A or markout.direction_B:
+            _log.info(
+                "markout enabled: %s",
+                markout.latency_label or "(unlabelled)",
+            )
+        if self._throttle_enabled:
+            _log.info(
+                "same-side throttle enabled: bump=%s bps halflife=%ss",
+                self._throttle_bump_bps, opt.throttle_halflife_s,
+            )
+        if self._inflight_cap > 0:
+            _log.info(
+                "in-flight cap enabled K=%d (note: structural no-op in "
+                "live due to _evaluating serialization)",
+                self._inflight_cap,
+            )
 
     async def run(self) -> None:
         ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -155,6 +204,18 @@ class TakerTakerArbitrage(BaseStrategy):
         emit the throttled heartbeat log."""
         now = now_ms()
         bias = self._spread.update(a_q.mid - l_q.mid, now).center
+
+        # Same-side throttle bumps: decay to "now" before reading. Calling
+        # `update` with the current value advances the internal timestamp
+        # without altering the value, so a follow-up `update(0, now+dt)` in
+        # a later tick decays correctly. We pass 0 here as the new sample
+        # to push the EWMA toward 0 over the halflife.
+        bump_a = Decimal(0)
+        bump_b = Decimal(0)
+        if self._throttle_enabled and self._bump_a.value is not None:
+            bump_a = self._bump_a.update(Decimal(0), now)
+            bump_b = self._bump_b.update(Decimal(0), now)
+
         d = assess_taker_taker(self._params, AssessInputs(
             now_ms=now,
             left_book=a_book, right_book=l_book,
@@ -162,10 +223,36 @@ class TakerTakerArbitrage(BaseStrategy):
             bias=bias, is_warm=self._spread.is_warm,
             position_left=self._position.aster,
             position_right=self._position.lighter,
+            bump_a_bps=bump_a,
+            bump_b_bps=bump_b,
         ))
 
         if d is not None and d.outcome is Outcome.FIRED:
             assert d.direction is not None
+
+            # In-flight cap: block if K same-direction entries are already
+            # pending. Live's `_evaluating` gate already serializes
+            # evaluation so this is in practice unreachable, but it
+            # mirrors the backtest contract and protects against future
+            # async relaxation. Records BLOCKED_RISK with a distinct
+            # `abort_reason` so the cap can be distinguished from
+            # RiskManager blocks in logs.
+            if self._inflight_cap > 0:
+                same_dir = sum(
+                    1 for x in self._inflight_dir.values() if x is d.direction
+                )
+                if same_dir >= self._inflight_cap:
+                    d.outcome = Outcome.BLOCKED_RISK
+                    d.abort_reason = (
+                        f"in-flight cap {self._inflight_cap} reached for "
+                        f"direction {d.direction.value}"
+                    )
+
+        # The RiskManager gate runs on the (possibly already-blocked-by-cap)
+        # decision. If the cap already rewrote to BLOCKED_RISK we still let
+        # RiskManager observe the FIRED-intent state via the position math —
+        # but we must not overwrite the cap's reason. Guard with the outcome.
+        if d is not None and d.outcome is Outcome.FIRED:
             d.timeline.mark(Phase.DECISION)
             qty = self.cfg.strategy.qty
             post_a = self._position.aster + qty * Decimal(left_side(d.direction).sign)
@@ -229,45 +316,71 @@ class TakerTakerArbitrage(BaseStrategy):
         _log.info("[%s] FIRE qty=%s aster=%s lighter=%s mode=%s",
                   d.decision_id, qty, a_side, l_side, self.cfg.strategy.mode)
 
-        d.timeline.mark(Phase.SEND)
-        if self.cfg.strategy.mode is RunMode.PAPER:
-            ra, rl = self._paper_fill(a_side, l_side, qty)
-            d.timeline.mark("result_aster")
-            d.timeline.mark("result_lighter")
-        else:
-            async def _leg(coro, venue: str) -> OrderResult:
-                r = await coro
-                d.timeline.mark(f"result_{venue}")  # this leg's own fill instant
-                return r
-            ra, rl = await asyncio.gather(
-                _leg(self._aster().place_market_order(
-                    self._aster_market(), a_side, qty, client_id=f"{d.decision_id}-a"),
-                    "aster"),
-                _leg(self._lighter().place_market_order(
-                    self._lighter_market(), l_side, qty, client_id=f"{d.decision_id}-l"),
-                    "lighter"),
-            )
-        d.timeline.mark(Phase.RESULT)
+        # Track in-flight before send so the slot is held even across an
+        # await. Released in the `finally` below regardless of outcome
+        # (success, partial, both-fail).
+        if self._inflight_cap > 0:
+            self._inflight_dir[d.decision_id] = d.direction
 
-        lat_a = d.timeline.span(Phase.SEND, "result_aster")
-        lat_l = d.timeline.span(Phase.SEND, "result_lighter")
-        d.legs = [
-            LegReport.from_result("aster", a_side, qty, exp_a, ra, lat_a),
-            LegReport.from_result("lighter", l_side, qty, exp_l, rl, lat_l),
-        ]
-        latency = d.timeline.span(Phase.SEND, Phase.RESULT)
+        try:
+            d.timeline.mark(Phase.SEND)
+            if self.cfg.strategy.mode is RunMode.PAPER:
+                ra, rl = self._paper_fill(a_side, l_side, qty)
+                d.timeline.mark("result_aster")
+                d.timeline.mark("result_lighter")
+            else:
+                async def _leg(coro, venue: str) -> OrderResult:
+                    r = await coro
+                    d.timeline.mark(f"result_{venue}")  # this leg's own fill instant
+                    return r
+                ra, rl = await asyncio.gather(
+                    _leg(self._aster().place_market_order(
+                        self._aster_market(), a_side, qty, client_id=f"{d.decision_id}-a"),
+                        "aster"),
+                    _leg(self._lighter().place_market_order(
+                        self._lighter_market(), l_side, qty, client_id=f"{d.decision_id}-l"),
+                        "lighter"),
+                )
+            d.timeline.mark(Phase.RESULT)
 
-        if ra.success and rl.success:
-            self._position.aster += qty * Decimal(a_side.sign)
-            self._position.lighter += qty * Decimal(l_side.sign)
-            self._risk.record_success(leg_latency_ms=latency or 0)
-            _log.info(
-                "[%s] FILLED aster=%s lighter=%s latency=%sms pos_a=%s pos_l=%s",
-                d.decision_id, ra.order_id, rl.order_id, latency,
-                self._position.aster, self._position.lighter,
-            )
-        else:
-            await self._handle_partial_failure(d, a_side, l_side, qty, ra, rl)
+            lat_a = d.timeline.span(Phase.SEND, "result_aster")
+            lat_l = d.timeline.span(Phase.SEND, "result_lighter")
+            d.legs = [
+                LegReport.from_result("aster", a_side, qty, exp_a, ra, lat_a),
+                LegReport.from_result("lighter", l_side, qty, exp_l, rl, lat_l),
+            ]
+            latency = d.timeline.span(Phase.SEND, Phase.RESULT)
+
+            if ra.success and rl.success:
+                self._position.aster += qty * Decimal(a_side.sign)
+                self._position.lighter += qty * Decimal(l_side.sign)
+                self._risk.record_success(leg_latency_ms=latency or 0)
+
+                # Seed the same-side throttle bump on confirmed FILLED only —
+                # a partial/both-fail decision doesn't actually consume any
+                # edge, so we shouldn't widen the threshold for it.
+                if self._throttle_enabled:
+                    target = self._bump_a if d.direction is Direction.A else self._bump_b
+                    current = target.value if target.value is not None else Decimal(0)
+                    # Hard-set (not EWMA-blend) so the bump is exactly Δ on top
+                    # of whatever already-decaying bump remains. The tick-level
+                    # decay in `_assess` is what brings it back toward 0.
+                    target.value = current + self._throttle_bump_bps
+                    target._last_ts_ms = now_ms()
+
+                _log.info(
+                    "[%s] FILLED aster=%s lighter=%s latency=%sms pos_a=%s pos_l=%s",
+                    d.decision_id, ra.order_id, rl.order_id, latency,
+                    self._position.aster, self._position.lighter,
+                )
+            else:
+                await self._handle_partial_failure(d, a_side, l_side, qty, ra, rl)
+        finally:
+            # Always release the in-flight slot, even on exception. The
+            # `_evaluating` gate elsewhere ensures only one `_fire` runs at
+            # a time so this dict will normally hit 0 entries here.
+            if self._inflight_cap > 0:
+                self._inflight_dir.pop(d.decision_id, None)
 
     async def _handle_partial_failure(
         self,

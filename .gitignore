@@ -18,8 +18,13 @@ wheels/
 logs/
 *.log
 
+# Markout tables: rebuilt locally on each host from rolling captures.
+# Operator must build via `scripts/build_markout_table.py` before first
+# live launch. The directory is kept (via .gitkeep); only the *.json
+# content is host-specific.
+configs/markout/*.json
+
 # IDE
 .idea/
 .vscode/
 .DS_Store
-scripts/

@@ -124,3 +124,62 @@ def test_mode_override_replaces_yaml_mode(tmp_path: Path) -> None:
     cfg_path.write_text(SAMPLE_YAML)
     cfg = load_app_config(cfg_path, mode_override=RunMode.LIVE)
     assert cfg.strategy.mode is RunMode.LIVE
+
+
+# ---- Wave-1 optimisations block ----
+
+def test_optimisations_defaults_when_block_absent() -> None:
+    cfg = StrategyCfg.model_validate(yaml.safe_load(SAMPLE_YAML))
+    opt = cfg.optimisations
+    assert opt.markout_table_path is None
+    assert opt.throttle_bump_bps == Decimal("0")
+    assert opt.throttle_halflife_s == 3.0
+    assert opt.in_flight_cap_per_direction == 0
+
+
+def test_optimisations_block_fully_populated(tmp_path: Path) -> None:
+    # write a fake markout JSON so the validator passes
+    table = tmp_path / "m.json"
+    table.write_text('{"direction_A":{"buckets":[]},"direction_B":{"buckets":[]}}')
+    raw = yaml.safe_load(SAMPLE_YAML)
+    raw["optimisations"] = {
+        "markout_table_path": str(table),
+        "throttle_bump_bps": "2",
+        "throttle_halflife_s": 5.0,
+        "in_flight_cap_per_direction": 1,
+    }
+    cfg = StrategyCfg.model_validate(raw)
+    assert cfg.optimisations.markout_table_path == table
+    assert cfg.optimisations.throttle_bump_bps == Decimal("2")
+    assert cfg.optimisations.throttle_halflife_s == 5.0
+    assert cfg.optimisations.in_flight_cap_per_direction == 1
+
+
+def test_optimisations_missing_markout_path_raises() -> None:
+    raw = yaml.safe_load(SAMPLE_YAML)
+    raw["optimisations"] = {"markout_table_path": "/tmp/__no_such_file__.json"}
+    with pytest.raises(ValueError, match="markout_table_path does not exist"):
+        StrategyCfg.model_validate(raw)
+
+
+def test_spread_monitor_config_still_validates_without_optimisations() -> None:
+    """Regression: existing spread_monitor YAMLs omit `optimisations:` and
+    must keep parsing cleanly (the field is defaulted)."""
+    sm_yaml = """
+strategy: spread_monitor
+mode: paper
+pair: { base: WTI, aster_symbol: CLUSDT, lighter_symbol: WTI }
+monitor_pair:
+  - { venue: lighter, symbol: WTI }
+  - { venue: aster,   symbol: CLUSDT }
+qty: 1
+max_qty: 10
+fees_bps: 1
+bias_halflife_s: 3600
+scale_halflife_s: 300
+max_levels: 3
+"""
+    cfg = StrategyCfg.model_validate(yaml.safe_load(sm_yaml))
+    assert cfg.strategy == "spread_monitor"
+    # default block fills in
+    assert cfg.optimisations.markout_table_path is None

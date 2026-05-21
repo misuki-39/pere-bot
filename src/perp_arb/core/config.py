@@ -41,6 +41,37 @@ class RiskCfg(BaseModel):
     min_free_margin_usd: Decimal = Decimal("0")
 
 
+class OptimisationsCfg(BaseModel):
+    """Wave-1 optional knobs. All default-off = identical pre-Wave-1 behaviour.
+
+    Live `taker_taker` consumes these via `taker_taker.__init__`. The pure
+    decision function `assess_taker_taker` already accepts the corresponding
+    `AssessParams` / `AssessInputs` fields, so the live wiring is just
+    plumbing.
+
+    `inventory_skew_bps` is intentionally NOT exposed here — the backtest
+    sweep showed it is alone-bad / combined-good with markout; rolling
+    markout calibration must stabilise first.
+    """
+    # Per-(direction, edge-bucket) adverse-selection table built offline by
+    # `scripts/build_markout_table.py`. None ⇒ MarkoutTable.disabled().
+    # Path is relative to the cwd at runbot startup.
+    markout_table_path: Path | None = None
+
+    # Same-direction threshold throttle. After each FILLED on direction X,
+    # raise X's threshold by `throttle_bump_bps`; decay back over half-life
+    # `throttle_halflife_s`. bump=0 disables.
+    throttle_bump_bps: Decimal = Decimal("0")
+    throttle_halflife_s: float = Field(default=3.0, gt=0)
+
+    # Per-direction in-flight cap. K=0 disables. K=1 = at most one outstanding
+    # entry of that direction at a time. Note: live's `_evaluating` gate in
+    # `taker_taker._schedule_eval` already serializes evaluation, so this is
+    # in practice a no-op in live; kept for parity with the backtest path and
+    # as a forward-safety belt if the gate is ever relaxed.
+    in_flight_cap_per_direction: int = Field(default=0, ge=0)
+
+
 class StrategyCfg(BaseModel):
     strategy: Literal["spread_monitor", "taker_taker"]
     mode: RunMode = RunMode.PAPER
@@ -71,11 +102,19 @@ class StrategyCfg(BaseModel):
     max_stale_ms: int = 200
 
     risk: RiskCfg = RiskCfg()
+    optimisations: OptimisationsCfg = OptimisationsCfg()
 
     @model_validator(mode="after")
     def _validate_sizes(self) -> StrategyCfg:
         if self.max_qty < self.qty:
             raise ValueError("max_qty must be >= qty")
+        # Fail fast if a markout table path is configured but missing — easier
+        # to debug at startup than at the first FIRED tick.
+        mp = self.optimisations.markout_table_path
+        if mp is not None and not Path(mp).exists():
+            raise ValueError(
+                f"optimisations.markout_table_path does not exist: {mp}"
+            )
         return self
 
 

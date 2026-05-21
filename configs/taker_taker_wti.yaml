@@ -1,0 +1,57 @@
+strategy: taker_taker
+mode: paper                   # CLI --mode live to flip to real trading
+
+pair:
+  base: WTI
+  aster_symbol: CLUSDT
+  lighter_symbol: WTI
+
+# sizing — qty=1 is the operational target; start smaller for first live runs
+qty: 1
+max_qty: 10
+
+# entry math — WTI fee = 1 bps RT (lighter taker 0 + aster taker 1).
+# min_profit_bps=0: the markout table already prices the expected adverse
+# drift; an additional safety margin above markout double-discounts and
+# materially suppresses fires (Wave-1 sweep was validated at this value).
+# Bump back to 1-3 only if live realised-vs-predicted markout drifts.
+fees_bps: 1
+min_profit_bps: 0
+bias_halflife_s: 3600         # ~1h slow-center
+scale_halflife_s: 300         # 5m dispersion diagnostic
+warmup_seconds: 180
+
+# depth / staleness gates
+max_levels: 3
+max_slippage_bps: 5
+max_stale_ms: 200
+
+risk:
+  max_consecutive_failures: 3
+  max_leg_latency_ms: 500
+  daily_loss_cap_usd: 50
+
+# Wave-1 optimisations (see docs/notes; backtest sweep 2026-05-21).
+# inventory_skew intentionally omitted — single-feature unstable in OOS.
+optimisations:
+  # Per-(direction, edge-bucket) adverse-selection table, rebuilt rolling
+  # by `scripts/build_markout_table.py`. Path is relative to runbot cwd.
+  # Operator must build this once before first launch:
+  #   mkdir -p configs/markout
+  #   python scripts/build_markout_table.py \
+  #     --bbo-root logs/spread_WTI_<ts> \
+  #     --left-latency-ms 350 --right-latency-ms 50 \
+  #     --lookback-days 7 \
+  #     --out configs/markout/wti_lighter_aster.json
+  markout_table_path: configs/markout/wti_lighter_aster.json
+
+  # Same-side threshold throttle: Δ=2 bps, halflife=3s.
+  # Picked by reasoning: Δ ~ 4× median bucket markout, halflife ~ 8× lighter
+  # one-way latency. Not data-tuned (no overfit).
+  throttle_bump_bps: 2
+  throttle_halflife_s: 3
+
+  # Per-direction in-flight cap. K=1 = at most one same-direction entry
+  # pending. Structurally a no-op in live (the `_evaluating` gate already
+  # serializes), but kept for parity + observability.
+  in_flight_cap_per_direction: 1

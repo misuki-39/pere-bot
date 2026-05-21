@@ -11,8 +11,11 @@ job, not ours.
 
 from __future__ import annotations
 
-from ...core.exec_record import Outcome, Phase
-from ...strategy.base import SpreadModel
+from decimal import Decimal
+
+from ...core.exec_record import Direction, Outcome, Phase
+from ...strategy.base import SpreadModel, TimeEwma
+from ...strategy.markout import MarkoutTable
 from ...strategy.taker_taker_core import (
     AssessInputs,
     AssessParams,
@@ -35,6 +38,11 @@ class TakerTakerBT(BacktestStrategy):
             scale_half_life_s=ctx.scale_halflife_s,
             warmup_s=ctx.warmup_seconds,
         )
+        markout = (
+            MarkoutTable.from_json(ctx.markout_table_path)
+            if ctx.markout_table_path is not None
+            else MarkoutTable.disabled()
+        )
         self._params = AssessParams(
             qty=ctx.capture_qty,
             max_levels=1,                      # BBO snapshot → one level
@@ -43,10 +51,38 @@ class TakerTakerBT(BacktestStrategy):
             max_slippage_bps=ctx.max_slippage_bps,
             max_stale_ms=ctx.max_stale_ms,
             max_qty=ctx.max_qty,
+            markout=markout,
+            inventory_skew_bps=ctx.inventory_skew_bps,
         )
+        # Same-direction throttle: each FIRED on direction X bumps that
+        # direction's threshold by `throttle_bump_bps`; the bump decays back
+        # toward 0 with `throttle_halflife_s` half-life. Δ=0 = throttle off.
+        self._throttle_enabled = ctx.throttle_bump_bps > 0
+        self._bump_a = TimeEwma(half_life_s=ctx.throttle_halflife_s)
+        self._bump_b = TimeEwma(half_life_s=ctx.throttle_halflife_s)
+        self._throttle_bump_bps = ctx.throttle_bump_bps
+        # Per-direction in-flight cap. K=0 disables. K=1 = at most one outstanding
+        # entry of that direction at a time; new fires are recorded as
+        # BLOCKED_RISK (no intents emitted). State here, not in the engine,
+        # because Direction is a strategy concept.
+        self._inflight_cap = int(ctx.in_flight_cap_per_direction)
+        self._inflight_dir: dict[str, Direction] = {}     # decision_id -> direction
+        self._inflight_legs: dict[str, int] = {}          # decision_id -> legs remaining
 
     def on_tick(self, snap: MarketSnapshot, view: EngineView) -> list[OrderIntent]:
         bias = self._spread.update(snap.left_quote.mid - snap.right_quote.mid, snap.ts_ms).center
+
+        # Decay current bumps to "now" before reading them (TimeEwma.update with
+        # the current value acts as a pure time-decay step — alpha applies to
+        # the new sample which equals the current value, so output = current
+        # * (1 - alpha) + current * alpha = current; the side-effect is the
+        # advancement of _last_ts_ms so the *next* update sees the right dt).
+        bump_a = self._bump_a.value if self._bump_a.value is not None else Decimal(0)
+        bump_b = self._bump_b.value if self._bump_b.value is not None else Decimal(0)
+        if self._throttle_enabled and self._bump_a.value is not None:
+            bump_a = self._bump_a.update(Decimal(0), snap.ts_ms)  # decay toward 0
+            bump_b = self._bump_b.update(Decimal(0), snap.ts_ms)
+
         d = assess_taker_taker(self._params, AssessInputs(
             now_ms=snap.ts_ms,
             left_book=snap.left_book,
@@ -57,6 +93,8 @@ class TakerTakerBT(BacktestStrategy):
             is_warm=self._spread.is_warm,
             position_left=view.position(self.ctx.left_venue),
             position_right=view.position(self.ctx.right_venue),
+            bump_a_bps=bump_a if self._throttle_enabled else Decimal(0),
+            bump_b_bps=bump_b if self._throttle_enabled else Decimal(0),
         ))
         if d is None:
             return []
@@ -67,7 +105,39 @@ class TakerTakerBT(BacktestStrategy):
 
         # FIRED → two legs sharing this Decision.
         assert d.direction is not None
+
+        # Per-direction in-flight cap: block if already K same-direction
+        # entries pending. Records as BLOCKED_RISK (no intents emitted).
+        if self._inflight_cap > 0:
+            same_dir_inflight = sum(
+                1 for dir_ in self._inflight_dir.values() if dir_ is d.direction
+            )
+            if same_dir_inflight >= self._inflight_cap:
+                d.outcome = Outcome.BLOCKED_RISK
+                d.abort_reason = (
+                    f"in-flight cap {self._inflight_cap} reached "
+                    f"for direction {d.direction.value}"
+                )
+                self.ctx.recorder.emit(d)
+                return []
+
         d.timeline.mark_at(Phase.DECISION, snap.ts_ms)
+
+        # Same-direction throttle: bump this direction's threshold; let it
+        # decay over `throttle_halflife_s` (handled at top-of-tick).
+        if self._throttle_enabled:
+            target = self._bump_a if d.direction is Direction.A else self._bump_b
+            current = target.value if target.value is not None else Decimal(0)
+            # Seed the EWMA so it actually carries non-zero state forward; we
+            # bypass the standard update (which would average toward current)
+            # because we want a hard "set" semantic.
+            target.value = current + self._throttle_bump_bps
+            target._last_ts_ms = snap.ts_ms
+
+        # Track this decision for the in-flight cap.
+        if self._inflight_cap > 0:
+            self._inflight_dir[d.decision_id] = d.direction
+            self._inflight_legs[d.decision_id] = 2
         l_side = left_side(d.direction)
         r_side = right_side(d.direction)
         l_exp = d.vwap_left_sell  if l_side.value == "sell" else d.vwap_left_buy
@@ -87,5 +157,14 @@ class TakerTakerBT(BacktestStrategy):
         return [intent_left, intent_right]
 
     def on_fill(self, fill: FillEvent, view: EngineView) -> None:
-        # Engine handles position bookkeeping; nothing strategy-specific to do.
-        return
+        # Engine handles position bookkeeping; strategy only tracks per-direction
+        # in-flight count (needed when in_flight_cap_per_direction > 0).
+        if self._inflight_cap <= 0:
+            return
+        did = fill.decision_id
+        if did not in self._inflight_legs:
+            return
+        self._inflight_legs[did] -= 1
+        if self._inflight_legs[did] <= 0:
+            del self._inflight_legs[did]
+            del self._inflight_dir[did]
