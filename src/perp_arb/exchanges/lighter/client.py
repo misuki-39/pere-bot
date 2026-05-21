@@ -311,7 +311,7 @@ class LighterClient(BaseExchange):
                     side=Side.SELL if o.is_ask else Side.BUY,
                     size=Decimal(str(o.initial_base_amount)),
                     price=Decimal(str(o.price)),
-                    status=_status_from_str(o.status),
+                    status=_LIGHTER_REST_STATUS.get(o.status.upper(), OrderStatus.UNKNOWN),
                     filled_qty=Decimal(str(o.filled_base_amount)),
                     realized_price=None,
                 )
@@ -422,18 +422,12 @@ def _sendtx_outcome(reply: dict[str, Any]) -> tuple[bool, str]:
     return True, ""
 
 
-# Lighter has two distinct status vocabularies. We keep them as two
-# functions because they really are different — collapsing into one map
-# would obscure the venue's actual asymmetry. Compare with aster, which
-# uses a single `_ASTER_STATUS_MAP` because its REST and WS share one
-# vocabulary.
-#
-#   REST  `account_active_orders.status` →  UPPERCASE tokens, no variants.
-#     Used by: `_status_from_str` (called from `get_order`).
-#   WS    `account_market.orders.status` →  lowercase, with `canceled-*`
-#     variants that fold into CANCELED / EXPIRED. Used by:
-#     `_account_orders_status` (called from `_order_to_snapshot`).
-_LIGHTER_STATUS_MAP = {
+# Lighter has two distinct status vocabularies — same concept, two
+# wire forms. REST `account_active_orders.status` returns UPPERCASE no
+# variants. WS `account_market.orders.status` returns lowercase + a few
+# enumerated `canceled-*` suffixes per apidocs. Aster has only one
+# vocabulary so it gets one map (`_ASTER_STATUS_MAP`); lighter needs two.
+_LIGHTER_REST_STATUS = {
     "OPEN": OrderStatus.OPEN,
     "FILLED": OrderStatus.FILLED,
     "CANCELED": OrderStatus.CANCELED,
@@ -442,26 +436,15 @@ _LIGHTER_STATUS_MAP = {
     "EXPIRED": OrderStatus.EXPIRED,
 }
 
-
-def _status_from_str(s: str) -> OrderStatus:
-    return _LIGHTER_STATUS_MAP.get(s.upper(), OrderStatus.UNKNOWN)
-
-
-def _account_orders_status(s: str) -> OrderStatus:
-    """`canceled-*` variants all collapse to CANCELED except
-    `canceled-expired`, which is semantically EXPIRED."""
-    s = (s or "").lower()
-    if s == "pending":
-        return OrderStatus.PENDING
-    if s == "open":
-        return OrderStatus.OPEN
-    if s == "filled":
-        return OrderStatus.FILLED
-    if s == "canceled-expired":
-        return OrderStatus.EXPIRED
-    if s.startswith("canceled"):
-        return OrderStatus.CANCELED
-    return OrderStatus.UNKNOWN
+_LIGHTER_WS_STATUS = {
+    "pending": OrderStatus.PENDING,
+    "open": OrderStatus.OPEN,
+    "filled": OrderStatus.FILLED,
+    "canceled": OrderStatus.CANCELED,
+    "canceled-post-only": OrderStatus.CANCELED,
+    "canceled-reduce-only": OrderStatus.CANCELED,
+    "canceled-expired": OrderStatus.EXPIRED,
+}
 
 
 def _order_to_snapshot(o: dict[str, Any], symbol: Symbol) -> OrderSnapshot:
@@ -478,7 +461,7 @@ def _order_to_snapshot(o: dict[str, Any], symbol: Symbol) -> OrderSnapshot:
         side=Side.SELL if o["is_ask"] else Side.BUY,
         size=Decimal(o["initial_base_amount"]),
         price=Decimal(o["price"]),
-        status=_account_orders_status(o["status"]),
+        status=_LIGHTER_WS_STATUS.get(o["status"], OrderStatus.UNKNOWN),
         filled_qty=filled_base,
         realized_price=avg_price,
         ts_ms=int(o["transaction_time"]) // 1000,
