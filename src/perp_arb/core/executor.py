@@ -159,8 +159,16 @@ class TwoLegExecutor:
 
         if ack_a.success and ack_b.success:
             report.success = True
-            _log.info("[%s] FILLED cid=%s latency=%sms",
-                      trade_id, cid, latency)
+            ap = legs_out[0].realized_price
+            bp = legs_out[1].realized_price
+            spread = f" spread={ap - bp}" if ap is not None and bp is not None else ""
+            _log.info(
+                "[%s] FILLED %s=%s %s=%s%s latency=%sms",
+                trade_id,
+                self.exchanges[a_intent.venue].name, ap,
+                self.exchanges[b_intent.venue].name, bp,
+                spread, latency,
+            )
             return report
 
         await self._handle_partial_failure(
