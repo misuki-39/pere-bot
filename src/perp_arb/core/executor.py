@@ -149,14 +149,25 @@ class TwoLegExecutor:
 
         if ack_a.success and ack_b.success:
             report.success = True
+            # Sign-encode: sell → -price (cash given up), buy → +price
+            # (cash gained). Sum is then the direction-invariant per-unit
+            # net cost — negative = profit captured pre-fees, positive
+            # = paid premium. Aster sells at 101.68, lighter buys at
+            # 101.685 → -101.68 + 101.685 = +0.005 (paid 0.5 cents/unit).
             ap = legs_out[0].realized_price
             bp = legs_out[1].realized_price
-            spread = f" spread={ap - bp}" if ap is not None and bp is not None else ""
+            if ap is not None and bp is not None:
+                ap_s = -ap if a_intent.side is Side.SELL else ap
+                bp_s = -bp if b_intent.side is Side.SELL else bp
+                spread = f" spread={ap_s + bp_s}"
+            else:
+                ap_s, bp_s = ap, bp
+                spread = ""
             _log.info(
                 "[%s] FILLED %s=%s %s=%s%s latency=%sms",
                 trade_id,
-                self.exchanges[a_intent.venue].name, ap,
-                self.exchanges[b_intent.venue].name, bp,
+                self.exchanges[a_intent.venue].name, ap_s,
+                self.exchanges[b_intent.venue].name, bp_s,
                 spread, latency,
             )
             return report
