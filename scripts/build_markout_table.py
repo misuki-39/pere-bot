@@ -28,15 +28,12 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import re
 import sys
+from decimal import Decimal
 from pathlib import Path
-
-# scripts/ is not a package; add its parent to sys.path so we can import the
-# sibling module.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from markout_analysis import _df_to_arrays, _LOAD_COLS  # noqa: E402
 
 # Minimum sample count per direction across all buckets for the table to be
 # considered "viable". Below this we refuse to write — operator must
@@ -45,6 +42,65 @@ _MIN_TOTAL_TICKS_PER_DIRECTION = 200
 
 # Hive-partition date format used by the BBO recorder.
 _DATE_PARTITION_RE = re.compile(r"date=(\d{4}-\d{2}-\d{2})")
+
+# Edge-magnitude buckets (bps). Open-ended on the right via `math.inf`.
+_BUCKETS = [0.0, 1.0, 2.0, 5.0, 10.0, math.inf]
+
+# Capture columns this script reads. Strategy code keeps Decimal; we cast to
+# float for the numpy math (bps-scale slippage estimation tolerates the
+# microscopic precision loss).
+_LOAD_COLS = [
+    "ts_ms",
+    "vwap_left_sell", "vwap_left_buy",
+    "vwap_right_sell", "vwap_right_buy",
+    "mid_left", "mid_right",
+    "edge_A_bps", "edge_B_bps",
+    "gates_passed",
+]
+
+
+def _df_to_arrays(df):
+    """Convert the loaded DataFrame to per-column numpy arrays. NaN-tolerant
+    (the recorder writes the literal string "None" when depth gates fail —
+    those rows are mapped to NaN and filtered downstream)."""
+    import numpy as np
+
+    out = {"ts_ms": df["ts_ms"].astype(np.int64).to_numpy()}
+
+    def _to_float(s):
+        if s in ("None", "nan", "NaN", ""):
+            return float("nan")
+        try:
+            return float(Decimal(s))
+        except Exception:
+            return float("nan")
+
+    for c in _LOAD_COLS[1:]:
+        if c == "gates_passed":
+            out[c] = df[c].to_numpy().astype(bool)
+        else:
+            out[c] = df[c].astype(str).map(_to_float).to_numpy()
+    return out
+
+
+def _arrival_index(ts_ms, latency_ms: int):
+    """For each row i, the smallest index j>=i s.t. ts_ms[j] >= ts_ms[i]+latency.
+
+    Returns -1 when no such j exists (capture ends before τ elapses).
+    """
+    import numpy as np
+
+    target = ts_ms + latency_ms
+    j = np.searchsorted(ts_ms, target, side="left")
+    j[j >= len(ts_ms)] = -1
+    return j
+
+
+def _bucket(edge_bps: float) -> int:
+    for i, hi in enumerate(_BUCKETS[1:]):
+        if edge_bps <= hi:
+            return i
+    return len(_BUCKETS) - 2
 
 
 def _select_parquets_by_date(bbo_root: Path, lookback_days: int) -> list[Path]:
@@ -78,14 +134,18 @@ def _select_parquets_by_date(bbo_root: Path, lookback_days: int) -> list[Path]:
 
 
 def _analyze_paths(paths: list[Path], left_lat_ms: int, right_lat_ms: int) -> dict:
-    """Direct re-implementation of `markout_analysis.analyze` but operating
-    on a pre-filtered list of paths instead of a root directory.
+    """Compute the markout table from a pre-filtered list of parquet paths.
 
-    We don't reuse `analyze()` directly because that function takes
-    `data_root: Path` and rglobs internally — we want the date-filtered set.
+    For each tick with `edge_A>0` (resp. `edge_B>0`), join the snapshot at
+    `t + left_lat_ms` / `t + right_lat_ms` and compute the per-leg slippage
+    in the bot's PnL direction. Output: per-(direction, edge-bucket) mean /
+    median / p25 / p75 of adverse markout in bps.
+
+    The two latencies are leg-specific because the strategy fires both legs
+    simultaneously but each lands after its own venue's network delay; the
+    markout is the *atomic-pair* drift, not a single-side markout.
     """
     import numpy as np
-
     import pyarrow.parquet as pq
     frames = []
     for p in sorted(paths):
@@ -98,12 +158,6 @@ def _analyze_paths(paths: list[Path], left_lat_ms: int, right_lat_ms: int) -> di
     import pandas as pd
     df = pd.concat(frames, ignore_index=True).sort_values("ts_ms").reset_index(drop=True)
     d = _df_to_arrays(df)
-
-    # The analysis logic below is intentionally duplicated rather than
-    # imported from markout_analysis.analyze() because that function couples
-    # data loading with analysis. Refactor opportunity: extract the
-    # numeric kernel; for now this duplication is small and direct.
-    from markout_analysis import _arrival_index, _bucket, _BUCKETS  # noqa: E402
 
     n = len(d["ts_ms"])
     j_left = _arrival_index(d["ts_ms"], left_lat_ms)

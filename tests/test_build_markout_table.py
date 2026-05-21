@@ -19,10 +19,10 @@ from pathlib import Path
 
 import pytest
 
-# The build_markout_table script depends on numpy + pandas (via the
-# markout_analysis module it imports). The project's .venv has pyarrow but
-# not numpy/pandas; operators run the script under their own analysis env.
-# Skip these smoke tests gracefully when the deps aren't present.
+# The build script depends on numpy + pandas at run time. The project's
+# .venv ships pyarrow but not numpy/pandas (those live in operators' own
+# analysis env). Skip these smoke tests gracefully when those deps aren't
+# present.
 np = pytest.importorskip("numpy")
 pd = pytest.importorskip("pandas")
 pa = pytest.importorskip("pyarrow")

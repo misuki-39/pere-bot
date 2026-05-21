@@ -44,7 +44,7 @@ class StrategyContext:
     recorder: ExecutionRecorder
     # Optional Wave-1 optimisation knobs. All default-off so the legacy
     # strategy behaviour is preserved when the YAML omits these fields.
-    markout_table_path: Path | None = None     # JSON from scripts/markout_analysis.py
+    markout_table_path: Path | None = None     # JSON from scripts/build_markout_table.py
     inventory_skew_bps: Decimal = Decimal(0)   # κ for AS-style threshold widener
     throttle_bump_bps: Decimal = Decimal(0)    # Δ added to same-direction threshold on FIRED
     throttle_halflife_s: float = 3.0           # decay of the throttle bump

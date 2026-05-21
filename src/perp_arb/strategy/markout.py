@@ -1,6 +1,6 @@
 """Markout lookup table for adverse-selection-adjusted edge.
 
-The offline script `scripts/markout_analysis.py` measures, on a historical
+The offline script `scripts/build_markout_table.py` measures, on a historical
 capture, the per-direction expected adverse price-drift between decision and
 fill (under a given latency profile). The strategy then subtracts this
 expected drift from the raw decision-time edge, so the threshold check becomes:
@@ -53,7 +53,7 @@ class MarkoutTable:
 
     @classmethod
     def from_json(cls, path: Path) -> MarkoutTable:
-        """Load output of `scripts/markout_analysis.py`.
+        """Load output of `scripts/build_markout_table.py`.
 
         Buckets with n=0 (insufficient samples) get 0-bps markout so they don't
         spuriously block fires — the offline tooling logs n per bucket for the
