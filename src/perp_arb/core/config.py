@@ -21,17 +21,22 @@ _PLACEHOLDER_ADDR = "0x" + "0" * 40
 _PLACEHOLDER_PK = "0x" + "0" * 64
 
 
-class PairCfg(BaseModel):
-    base: str
-    aster_symbol: str
-    lighter_symbol: str
-
-
 class VenueLeg(BaseModel):
-    """One side of a generic spread-monitor pair."""
+    """One leg of a two-venue strategy. Names which venue driver to spin
+    up and which native symbol to trade on it."""
 
-    venue: str   # "aster" | "lighter" | "katana"
-    symbol: str  # venue-native ticker, e.g. "ETH-USD" on katana
+    venue: str   # driver key — must be in factory `_BUILDERS` (aster|lighter|katana)
+    symbol: str  # venue-native ticker, e.g. "ETHUSDT" on aster, "ETH-USD" on katana
+
+
+class PairCfg(BaseModel):
+    """The two venues a two-venue strategy is bound to. The strategy
+    refers to them only as leg_a / leg_b; the actual venue mapping lives
+    here in config (and in `monitor_pair` for spread_monitor)."""
+
+    base: str
+    leg_a: VenueLeg
+    leg_b: VenueLeg
 
 
 class RiskCfg(BaseModel):
@@ -76,8 +81,7 @@ class StrategyCfg(BaseModel):
     strategy: Literal["spread_monitor", "taker_taker"]
     mode: RunMode = RunMode.PAPER
     pair: PairCfg
-    # spread_monitor only. Absent ⇒ default to the aster/lighter pair above so
-    # existing configs keep working. (left, right).
+    # spread_monitor only. Absent ⇒ fall back to the `pair` legs above.
     monitor_pair: tuple[VenueLeg, VenueLeg] | None = None
 
     # sizing
@@ -215,15 +219,19 @@ def load_app_config(yaml_path: str | Path, *, mode_override: RunMode | None = No
 def require_live_creds(cfg: AppCfg) -> None:
     """Raise MissingCredsError if any credential is still a placeholder.
 
+    Only checks venues actually referenced by the bound legs — a config
+    that uses only aster doesn't need lighter creds (and vice versa).
+
     Called only when mode == LIVE; paper / spread_monitor tolerate placeholders.
     """
-    missing: list[str] = []
-    if cfg.aster.is_placeholder:
-        missing.append("aster")
-    if cfg.lighter.is_placeholder:
-        missing.append("lighter")
+    venues_in_use = {cfg.strategy.pair.leg_a.venue, cfg.strategy.pair.leg_b.venue}
+    creds_by_venue = {"aster": cfg.aster, "lighter": cfg.lighter}
+    missing = [
+        v for v in venues_in_use
+        if v in creds_by_venue and creds_by_venue[v].is_placeholder
+    ]
     if missing:
         raise MissingCredsError(
-            f"LIVE mode requires real credentials for: {', '.join(missing)}. "
+            f"LIVE mode requires real credentials for: {', '.join(sorted(missing))}. "
             f"Set them in .env (see .env.example)."
         )

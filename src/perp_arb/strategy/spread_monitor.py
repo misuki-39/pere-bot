@@ -1,8 +1,10 @@
 """Spread monitor — no trading. Streams BBO from two venues, records the
 tick-level spread / bias / VWAP-edge series to hourly Parquet.
 
-Venue-agnostic: the pair is `cfg.strategy.monitor_pair` (left, right); absent it
-defaults to aster↔lighter for back-compat.
+Venue-agnostic: the strategy refers to its two venues only as `leg_a` /
+`leg_b`. The actual venue binding lives in config — either
+`strategy.monitor_pair` (preferred) or, as fallback, `strategy.pair.leg_a/b`.
+The factory wires both into the same `{leg_a, leg_b} -> BaseExchange` dict.
 
 Order-book maintenance lives entirely in the clients; each exposes `book_ts()`
 — the wall-clock of the last update applied to a *valid, in-sync* book. The
@@ -74,12 +76,11 @@ class SpreadMonitor(BaseStrategy):
         self._last_log_ms = 0
         self._last_row_ms = 0
         self._skipped = 0  # rows skipped because a leg was not fresh
-
-        mp = cfg.strategy.monitor_pair
-        if mp is not None:
-            self._left_name, self._right_name = mp[0].venue, mp[1].venue
-        else:
-            self._left_name, self._right_name = "aster", "lighter"
+        # Recorded into parquet's `left_venue`/`right_venue` columns —
+        # the actual venue names (e.g. "aster"/"lighter"), pulled from each
+        # driver's `.name`, so analyses can join to venue-side data.
+        self._venue_a = exchanges["leg_a"].name
+        self._venue_b = exchanges["leg_b"].name
 
     async def run(self) -> None:
         ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -88,15 +89,11 @@ class SpreadMonitor(BaseStrategy):
         await self._writer.start()
         _log.info(
             "spread_monitor %s↔%s writing %s",
-            self._left_name, self._right_name, root,
+            self._venue_a, self._venue_b, root,
         )
 
-        self._venue(self._left_name).subscribe_book(
-            self._market(self._left_name), self._on_book
-        )
-        self._venue(self._right_name).subscribe_book(
-            self._market(self._right_name), self._on_book
-        )
+        self._leg_a().subscribe_book(self._leg_a_market(), self._on_book)
+        self._leg_b().subscribe_book(self._leg_b_market(), self._on_book)
 
         try:
             await self._stop.wait()
@@ -109,8 +106,8 @@ class SpreadMonitor(BaseStrategy):
         self._evaluate()
 
     def _evaluate(self) -> None:
-        lx, rx = self._venue(self._left_name), self._venue(self._right_name)
-        lm, rm = self._market(self._left_name), self._market(self._right_name)
+        lx, rx = self._leg_a(), self._leg_b()
+        lm, rm = self._leg_a_market(), self._leg_b_market()
         l_book = lx.order_book(lm)
         r_book = rx.order_book(rm)
         if l_book is None or r_book is None:
@@ -159,7 +156,7 @@ class SpreadMonitor(BaseStrategy):
         if self._writer:
             self._writer.submit({
                 "ts_ms": ts_ms,
-                "left_venue": self._left_name, "right_venue": self._right_name,
+                "left_venue": self._venue_a, "right_venue": self._venue_b,
                 "left_bid": l_q.bid, "left_bid_size": l_q.bid_size,
                 "left_ask": l_q.ask, "left_ask_size": l_q.ask_size,
                 "right_bid": r_q.bid, "right_bid_size": r_q.bid_size,

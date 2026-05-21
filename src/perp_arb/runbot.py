@@ -19,7 +19,7 @@ from .core.config import AppCfg, RunMode, load_app_config, require_live_creds
 from .core.exchange import BaseExchange
 from .core.logging import setup_logging
 from .core.types import MarketInfo
-from .exchanges.factory import build_exchanges, required_venues
+from .exchanges.factory import build_exchanges, required_legs
 from .strategy.base import BaseStrategy
 from .strategy.spread_monitor import SpreadMonitor
 from .strategy.taker_taker import TakerTakerArbitrage
@@ -68,15 +68,15 @@ async def _async_main(cfg: AppCfg) -> int:
     try:
         await asyncio.gather(*(ex.connect() for ex in exchanges.values()))
 
-        needed = required_venues(cfg)  # venue -> native symbol
+        needed = required_legs(cfg)  # leg label -> native symbol
         loaded = await asyncio.gather(
-            *(exchanges[v].load_market(sym) for v, sym in needed.items())
+            *(exchanges[leg].load_market(sym) for leg, sym in needed.items())
         )
         markets = dict(zip(needed.keys(), loaded, strict=True))
-        for v, m in markets.items():
+        for leg, m in markets.items():
             _log.info(
-                "market resolved: %s=%s tick=%s lot=%s",
-                v, m.symbol.raw, m.tick_size, m.lot_size,
+                "market resolved: %s (%s)=%s tick=%s lot=%s",
+                leg, exchanges[leg].name, m.symbol.raw, m.tick_size, m.lot_size,
             )
 
         strategy = _build_strategy(cfg, exchanges, markets)

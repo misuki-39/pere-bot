@@ -1,18 +1,23 @@
 """TakerTakerArbitrage — depth-aware VWAP edge vs EWMA bias on mid-mid.
 
+Generic two-venue strategy: refers to its two venues only as `leg_a` /
+`leg_b`. The actual venues are bound at the config level (PairCfg) and
+the factory wires the `exchanges` / `markets` dicts under those leg
+labels. This file does not name any specific venue.
+
 Layering: this module is the *signal* layer. It produces a `Decision`
 per tick (via `assess_taker_taker`) and hands fired decisions to
 `TwoLegExecutor`, which owns cid generation, the two-leg gather, WS
 fill tracking, partial-failure unwind, and paper-mode synth. The
 strategy only feeds `TradeReport` back into position / risk /
-throttle / heartbeat state — it never sees REST results or WS fills.
+throttle / heartbeat state — it never sees place acks or WS fills.
 
 Modes (passed through to the executor at construction time):
-  * `paper` — synthetic fills from current book VWAP; no REST calls.
+  * `paper` — synthetic fills from current book VWAP; no venue submits.
   * `live`  — real submits on both venues, gathered concurrently.
 
 What it bets on:
-  An EWMA of (mid_aster - mid_lighter) tracks the long-run inter-venue
+  An EWMA of (mid_leg_a - mid_leg_b) tracks the long-run inter-venue
   *bias*. The bias itself can be structurally non-zero (different oracles,
   funding rates, USDT-vs-USDC quote currencies). What matters is that the
   current spread oscillates around the bias. The strategy fires when the
@@ -69,8 +74,8 @@ _log = logging.getLogger(__name__)
 class SyntheticPosition:
     """Bot-side position tracker (signed). For paper + live both."""
 
-    aster: Decimal = Decimal("0")
-    lighter: Decimal = Decimal("0")
+    leg_a: Decimal = Decimal("0")
+    leg_b: Decimal = Decimal("0")
     realised_pnl: Decimal = Decimal("0")
 
 
@@ -168,8 +173,8 @@ class TakerTakerArbitrage(BaseStrategy):
         _log.info("taker_taker mode=%s recording to %s",
                   self.cfg.strategy.mode, self.cfg.runtime.log_dir)
 
-        self._aster().subscribe_book(self._aster_market(), lambda _b: self._schedule_eval())
-        self._lighter().subscribe_book(self._lighter_market(), lambda _b: self._schedule_eval())
+        self._leg_a().subscribe_book(self._leg_a_market(), lambda _b: self._schedule_eval())
+        self._leg_b().subscribe_book(self._leg_b_market(), lambda _b: self._schedule_eval())
 
         try:
             await self._stop.wait()
@@ -192,14 +197,14 @@ class TakerTakerArbitrage(BaseStrategy):
             self._evaluating = False
 
     async def _evaluate(self) -> None:
-        a_book = self._aster().order_book(self._aster_market())
-        l_book = self._lighter().order_book(self._lighter_market())
-        a_q = self._aster().best_quote(self._aster_market())
-        l_q = self._lighter().best_quote(self._lighter_market())
-        if a_book is None or l_book is None or a_q is None or l_q is None:
+        a_book = self._leg_a().order_book(self._leg_a_market())
+        b_book = self._leg_b().order_book(self._leg_b_market())
+        a_q = self._leg_a().best_quote(self._leg_a_market())
+        b_q = self._leg_b().best_quote(self._leg_b_market())
+        if a_book is None or b_book is None or a_q is None or b_q is None:
             return
 
-        d = self._assess(a_book, l_book, a_q, l_q)
+        d = self._assess(a_book, b_book, a_q, b_q)
         if d is None:
             return
         try:
@@ -209,7 +214,7 @@ class TakerTakerArbitrage(BaseStrategy):
             if self._recorder:
                 self._recorder.emit(d)
 
-    def _assess(self, a_book, l_book, a_q, l_q) -> Decision | None:
+    def _assess(self, a_book, b_book, a_q, b_q) -> Decision | None:
         """Thin wrapper around the pure `assess_taker_taker` decision math.
 
         Live-only responsibilities kept here: update the EWMA, run the
@@ -217,7 +222,7 @@ class TakerTakerArbitrage(BaseStrategy):
         PnL — the pure function only checks the structural `max_qty` cap), and
         emit the throttled heartbeat log."""
         now = now_ms()
-        bias = self._spread.update(a_q.mid - l_q.mid, now).center
+        bias = self._spread.update(a_q.mid - b_q.mid, now).center
 
         # Same-side throttle bumps: decay to "now" before reading. Calling
         # `update` with the current value advances the internal timestamp
@@ -232,11 +237,11 @@ class TakerTakerArbitrage(BaseStrategy):
 
         d = assess_taker_taker(self._params, AssessInputs(
             now_ms=now,
-            left_book=a_book, right_book=l_book,
-            left_quote=a_q, right_quote=l_q,
+            left_book=a_book, right_book=b_book,
+            left_quote=a_q, right_quote=b_q,
             bias=bias, is_warm=self._spread.is_warm,
-            position_left=self._position.aster,
-            position_right=self._position.lighter,
+            position_left=self._position.leg_a,
+            position_right=self._position.leg_b,
             bump_a_bps=bump_a,
             bump_b_bps=bump_b,
         ))
@@ -269,10 +274,10 @@ class TakerTakerArbitrage(BaseStrategy):
         if d is not None and d.outcome is Outcome.FIRED:
             d.timeline.mark(Phase.DECISION)
             qty = self.cfg.strategy.qty
-            post_a = self._position.aster + qty * Decimal(left_side(d.direction).sign)
-            post_l = self._position.lighter + qty * Decimal(right_side(d.direction).sign)
+            post_a = self._position.leg_a + qty * Decimal(left_side(d.direction).sign)
+            post_b = self._position.leg_b + qty * Decimal(right_side(d.direction).sign)
             ok, reason = self._risk.can_trade(
-                post_trade_abs_position=max(abs(post_a), abs(post_l)),
+                post_trade_abs_position=max(abs(post_a), abs(post_b)),
             )
             if not ok:
                 if not self._risk_blocked:
@@ -284,7 +289,7 @@ class TakerTakerArbitrage(BaseStrategy):
                 self._risk_blocked = False
                 _log.info("risk block cleared — resuming entries")
 
-        self._maybe_heartbeat(now, a_q.mid, l_q.mid, bias, d)
+        self._maybe_heartbeat(now, a_q.mid, b_q.mid, bias, d)
         return d
 
     def _maybe_heartbeat(
@@ -311,9 +316,9 @@ class TakerTakerArbitrage(BaseStrategy):
         else:
             edge_str = "no-edge"
         _log.info(
-            "tick: mid_left=%.2f mid_right=%.2f bias=%.4f %s pos_a=%s pos_l=%s",
+            "tick: mid_a=%.2f mid_b=%.2f bias=%.4f %s pos_a=%s pos_b=%s",
             mid_left, mid_right, bias, edge_str,
-            self._position.aster, self._position.lighter,
+            self._position.leg_a, self._position.leg_b,
         )
 
     # ---- order firing ----
@@ -328,14 +333,14 @@ class TakerTakerArbitrage(BaseStrategy):
         they feed back into the next `_assess`."""
         assert d.direction is not None
         qty = self.cfg.strategy.qty
-        a_side, l_side = left_side(d.direction), right_side(d.direction)
+        a_side, b_side = left_side(d.direction), right_side(d.direction)
         if d.direction is Direction.A:
-            a_exp, l_exp = d.vwap_left_sell, d.vwap_right_buy
+            a_exp, b_exp = d.vwap_left_sell, d.vwap_right_buy
         else:
-            a_exp, l_exp = d.vwap_left_buy, d.vwap_right_sell
+            a_exp, b_exp = d.vwap_left_buy, d.vwap_right_sell
 
-        _log.info("[%s] FIRE qty=%s aster=%s lighter=%s mode=%s",
-                  d.decision_id, qty, a_side, l_side, self.cfg.strategy.mode)
+        _log.info("[%s] FIRE qty=%s leg_a=%s leg_b=%s mode=%s",
+                  d.decision_id, qty, a_side, b_side, self.cfg.strategy.mode)
 
         if self._inflight_cap > 0:
             self._inflight_dir[d.decision_id] = d.direction
@@ -343,14 +348,8 @@ class TakerTakerArbitrage(BaseStrategy):
             report = await self._executor.execute(
                 trade_id=d.decision_id,
                 legs=(
-                    LegIntent(
-                        venue="aster", side=a_side, expected_price=a_exp,
-                        client_id=f"{d.decision_id}-a",
-                    ),
-                    LegIntent(
-                        venue="lighter", side=l_side, expected_price=l_exp,
-                        client_id=f"{d.decision_id}-l",
-                    ),
+                    LegIntent(venue="leg_a", side=a_side, expected_price=a_exp),
+                    LegIntent(venue="leg_b", side=b_side, expected_price=b_exp),
                 ),
                 qty=qty,
                 timeline=d.timeline,
@@ -359,8 +358,8 @@ class TakerTakerArbitrage(BaseStrategy):
             d.send_ts_ms = report.send_ts_ms
 
             if report.success:
-                self._position.aster += qty * Decimal(a_side.sign)
-                self._position.lighter += qty * Decimal(l_side.sign)
+                self._position.leg_a += qty * Decimal(a_side.sign)
+                self._position.leg_b += qty * Decimal(b_side.sign)
                 self._risk.record_success(leg_latency_ms=report.latency_ms or 0)
 
                 # Seed throttle bump only on confirmed FILLED — a partial /
@@ -370,9 +369,9 @@ class TakerTakerArbitrage(BaseStrategy):
                     target.bump(self._throttle_bump_bps, now_ms())
 
                 _log.info(
-                    "[%s] pos_a=%s pos_l=%s",
+                    "[%s] pos_a=%s pos_b=%s",
                     d.decision_id,
-                    self._position.aster, self._position.lighter,
+                    self._position.leg_a, self._position.leg_b,
                 )
             else:
                 self._risk.record_failure(report.failure_reason or "unknown")

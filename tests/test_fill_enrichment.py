@@ -1,8 +1,8 @@
 """Unit tests for the live fill-enrichment plumbing:
 
   - `_FillAccumulator` aggregates `FillDelta` + `OrderSnapshot` events;
-  - `LegReport.build` merges REST submit-ack with the WS fill aggregate,
-    preferring WS for filled_qty / realized_price / fill_ts_ms;
+  - `LegReport.build` merges the synchronous place-ack with the WS fill
+    aggregate, preferring WS for filled_qty / realized_price / fill_ts_ms;
   - The recorder writes the new `send_ts_ms` + `fill_ts_ms` columns.
 
 These tests do not exercise the asyncio `_await_fill` loop directly — the
@@ -127,10 +127,10 @@ def test_accumulator_delta_terminal_status_propagates() -> None:
 
 # ---- LegReport.build --------------------------------------------------
 
-def _rest_ok(*, avg_price: str = "100.00", exchange_ts: int | None = None) -> OrderResult:
+def _ack_ok(*, avg_price: str = "100.00", exchange_ts: int | None = None) -> OrderResult:
     return OrderResult(
         success=True,
-        order_id="rest-1",
+        order_id="ack-1",
         client_id="x",
         side=Side.BUY,
         requested_qty=Decimal("1.0"),
@@ -142,40 +142,40 @@ def _rest_ok(*, avg_price: str = "100.00", exchange_ts: int | None = None) -> Or
     )
 
 
-def test_build_uses_rest_data_when_no_fill() -> None:
-    """No WS fill (aster timeout / pure REST path): REST is the sole source."""
-    rest = _rest_ok(avg_price="100.00", exchange_ts=1_700_000_000_000)
+def test_build_uses_ack_data_when_no_fill() -> None:
+    """No WS fill (timeout / synchronous-only venue): ack is the sole source."""
+    ack = _ack_ok(avg_price="100.00", exchange_ts=1_700_000_000_000)
     leg = LegReport.build(
         venue="aster", side=Side.BUY, qty=Decimal("1.0"),
-        expected=Decimal("99.95"), rest=rest, latency_ms=50,
+        expected=Decimal("99.95"), ack=ack, latency_ms=50,
     )
     assert leg.realized_price == Decimal("100.00")
     assert leg.filled_qty == Decimal("1.0")
     assert leg.fill_ts_ms == 1_700_000_000_000
 
 
-def test_build_prefers_ws_fill_over_rest_when_both_present() -> None:
+def test_build_prefers_ws_fill_over_ack_when_both_present() -> None:
     """WS fill is the matching-engine's authoritative view — wins on price,
-    qty, and ts. REST stays the source for status / order_id / etc."""
-    rest = _rest_ok(avg_price="100.00", exchange_ts=1_700_000_000_000)
+    qty, and ts. The ack stays the source for status / order_id / etc."""
+    ack = _ack_ok(avg_price="100.00", exchange_ts=1_700_000_000_000)
     acc = _FillAccumulator()
     acc.add(_delta("1.0", "100.05", ts=1_700_000_000_500))
     leg = LegReport.build(
         venue="aster", side=Side.BUY, qty=Decimal("1.0"),
-        expected=Decimal("99.95"), rest=rest, fill=acc, latency_ms=50,
+        expected=Decimal("99.95"), ack=ack, fill=acc, latency_ms=50,
     )
     assert leg.realized_price == Decimal("100.05")
     assert leg.filled_qty == Decimal("1.0")
     assert leg.fill_ts_ms == 1_700_000_000_500
-    assert leg.order_id == "rest-1"    # REST still supplies these
+    assert leg.order_id == "ack-1"    # ack still supplies these
 
 
 def test_build_falls_back_when_accumulator_empty() -> None:
-    """Accumulator with zero fills (timed out) → REST data unchanged."""
-    rest = _rest_ok(avg_price="100.00", exchange_ts=1_700_000_000_000)
+    """Accumulator with zero fills (timed out) → ack data unchanged."""
+    ack = _ack_ok(avg_price="100.00", exchange_ts=1_700_000_000_000)
     leg = LegReport.build(
         venue="aster", side=Side.BUY, qty=Decimal("1.0"),
-        expected=Decimal("99.95"), rest=rest, fill=_FillAccumulator(),
+        expected=Decimal("99.95"), ack=ack, fill=_FillAccumulator(),
         latency_ms=50,
     )
     assert leg.realized_price == Decimal("100.00")
@@ -183,9 +183,10 @@ def test_build_falls_back_when_accumulator_empty() -> None:
 
 
 def test_build_lighter_path_ws_is_only_price_source() -> None:
-    """Lighter REST returns submit-ack only (no avg_price / filled_qty).
-    WS fill is the only realized-data source for that leg."""
-    rest = OrderResult(
+    """Lighter's signed-tx ack carries no avg_price / filled_qty (only the
+    submit was acknowledged; matching happens later). WS fill is the only
+    realized-data source for that leg."""
+    ack = OrderResult(
         success=True, order_id="seq-1", client_id="x", side=Side.SELL,
         requested_qty=Decimal("1.0"), status=OrderStatus.OPEN, latency_ms=200,
     )
@@ -193,19 +194,19 @@ def test_build_lighter_path_ws_is_only_price_source() -> None:
     acc.add(_delta("1.0", "100.20", ts=1_700_000_001_000))
     leg = LegReport.build(
         venue="lighter", side=Side.SELL, qty=Decimal("1.0"),
-        expected=Decimal("100.25"), rest=rest, fill=acc, latency_ms=200,
+        expected=Decimal("100.25"), ack=ack, fill=acc, latency_ms=200,
     )
     assert leg.realized_price == Decimal("100.20")
     assert leg.filled_qty == Decimal("1.0")
     assert leg.fill_ts_ms == 1_700_000_001_000
 
 
-def test_build_propagates_exchange_ts_ms_from_rest() -> None:
-    """Aster's transactTime path: rest.exchange_ts_ms → fill_ts_ms when no WS fill."""
+def test_build_propagates_exchange_ts_ms_from_ack() -> None:
+    """Aster's transactTime path: ack.exchange_ts_ms → fill_ts_ms when no WS fill."""
     leg = LegReport.build(
         venue="aster", side=Side.BUY, qty=Decimal("1.0"),
         expected=Decimal("99.95"),
-        rest=_rest_ok(exchange_ts=1_700_000_000_777), latency_ms=50,
+        ack=_ack_ok(exchange_ts=1_700_000_000_777), latency_ms=50,
     )
     assert leg.fill_ts_ms == 1_700_000_000_777
 

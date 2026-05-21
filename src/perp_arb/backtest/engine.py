@@ -157,7 +157,7 @@ class Engine:
         latency_ms = fill.arrival_ts_ms - intent.sim_ts_ms
         d.legs.append(LegReport.build(
             venue=fill.venue, side=fill.side, qty=fill.requested_qty,
-            expected=intent.expected_price, rest=r,
+            expected=intent.expected_price, ack=r,
             latency_ms=latency_ms, kind=LegKind.ENTRY,
         ))
         if fill.success:

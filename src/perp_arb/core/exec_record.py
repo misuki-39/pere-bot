@@ -38,7 +38,7 @@ class LegKind(StrEnum):
 
 
 class Direction(StrEnum):
-    A = "A"   # sell aster, buy lighter
+    A = "A"   # sell leg_a, buy leg_b
     B = "B"   # reverse
 
 
@@ -109,23 +109,23 @@ class LegReport:
     @classmethod
     def build(
         cls, *, venue: str, side: Side, qty: Decimal,
-        expected: Decimal | None, rest: OrderResult,
+        expected: Decimal | None, ack: OrderResult,
         fill: TerminalFill | None = None,
         latency_ms: int | None, kind: LegKind = LegKind.ENTRY,
     ) -> LegReport:
-        """Single LegReport constructor: merges REST submit-ack with the
-        WS-derived authoritative fill aggregate. When `fill` carries real
-        fills (`filled_qty > 0`), its qty / avg / ts win; otherwise REST
-        is the source. Everything else (order_id, client_id, status,
-        error, latency_ms) always comes from REST."""
+        """Single LegReport constructor: merges the synchronous place-ack
+        with the WS-derived authoritative fill aggregate. When `fill`
+        carries real fills (`filled_qty > 0`), its qty / avg / ts win;
+        otherwise the ack is the source. Everything else (order_id,
+        client_id, status, error, latency_ms) always comes from the ack."""
         if fill is not None and fill.filled_qty > 0:
             filled_qty = fill.filled_qty
             realized_price = fill.weighted_price_sum / fill.filled_qty
-            fill_ts_ms = fill.last_ts_ms or rest.exchange_ts_ms
+            fill_ts_ms = fill.last_ts_ms or ack.exchange_ts_ms
         else:
-            filled_qty = rest.filled_qty
-            realized_price = rest.avg_price
-            fill_ts_ms = rest.exchange_ts_ms
+            filled_qty = ack.filled_qty
+            realized_price = ack.avg_price
+            fill_ts_ms = ack.exchange_ts_ms
         return cls(
             exchange=venue,
             side=side.value,
@@ -133,11 +133,11 @@ class LegReport:
             filled_qty=filled_qty,
             expected_price=expected,
             realized_price=realized_price,
-            status=rest.status.value,
-            success=rest.success,
-            error=rest.error_message,
-            order_id=rest.order_id,
-            client_id=rest.client_id,
+            status=ack.status.value,
+            success=ack.success,
+            error=ack.error_message,
+            order_id=ack.order_id,
+            client_id=ack.client_id,
             fee=None,
             latency_ms=latency_ms,
             fill_ts_ms=fill_ts_ms,

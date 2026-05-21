@@ -12,8 +12,9 @@ client on the same account cannot pollute current waits.
 
 Race-safety invariant: `register(cid)` must happen in the same synchronous
 stretch as the order submit — there is no `await` between them, so a fast
-fill (aster can fill before REST returns) cannot land before its slot
-exists. Callers who break this invariant will silently drop fast fills.
+fill (fills can land before the place ack returns on some venues) cannot
+arrive before its slot exists. Callers who break this invariant will
+silently drop fast fills.
 """
 
 from __future__ import annotations

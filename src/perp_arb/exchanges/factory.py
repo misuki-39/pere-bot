@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from ..core.config import AppCfg, RunMode
+from ..core.config import AppCfg, RunMode, VenueLeg
 from ..core.exchange import BaseExchange
 from .aster.client import AsterClient
 from .aster.signer import AsterSigner
@@ -58,18 +58,26 @@ _BUILDERS: dict[str, Callable[[AppCfg], BaseExchange]] = {
 }
 
 
-def required_venues(cfg: AppCfg) -> dict[str, str]:
-    """Map venue name -> venue-native symbol for the venues this run needs.
-
-    `taker_taker` always needs aster + lighter. `spread_monitor` uses
-    `monitor_pair` if set, else defaults to the same aster/lighter pair.
-    """
+def _bound_legs(cfg: AppCfg) -> tuple[VenueLeg, VenueLeg]:
     s = cfg.strategy
     if s.strategy == "spread_monitor" and s.monitor_pair is not None:
-        left, right = s.monitor_pair
-        return {left.venue: left.symbol, right.venue: right.symbol}
-    return {"aster": s.pair.aster_symbol, "lighter": s.pair.lighter_symbol}
+        return s.monitor_pair
+    return s.pair.leg_a, s.pair.leg_b
+
+
+def required_legs(cfg: AppCfg) -> dict[str, str]:
+    """Map leg label ("leg_a"/"leg_b") -> venue-native symbol to load.
+
+    The strategy refers to its two venues only as leg_a / leg_b; this
+    function and `build_exchanges` are the two boundary points that turn
+    that abstract binding into concrete venue+symbol pairs.
+    """
+    a, b = _bound_legs(cfg)
+    return {"leg_a": a.symbol, "leg_b": b.symbol}
 
 
 def build_exchanges(cfg: AppCfg) -> dict[str, BaseExchange]:
-    return {name: _BUILDERS[name](cfg) for name in required_venues(cfg)}
+    """Build `{leg_a, leg_b} -> BaseExchange`. Each leg is wired to the
+    venue driver named by config (`PairCfg.leg_a.venue` etc)."""
+    a, b = _bound_legs(cfg)
+    return {"leg_a": _BUILDERS[a.venue](cfg), "leg_b": _BUILDERS[b.venue](cfg)}

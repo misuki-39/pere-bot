@@ -135,7 +135,7 @@ class OrderResult:
 
 @dataclass(slots=True)
 class OrderSnapshot:
-    """Cumulative order-state observation: REST poll or per-order WS snapshot
+    """Cumulative order-state observation: poll-style snapshot or per-order WS event
     (lighter `account_market.orders`, aster REST `get_order`).
 
     Semantics: `filled_qty` / `realized_price` are the order's RUNNING TOTALS
@@ -243,10 +243,14 @@ class TerminalFill:
 
 @dataclass(slots=True)
 class OrderOutcome:
-    """Driver-layer return: REST submit result + WS-tracked terminal fill.
+    """Driver-layer return: synchronous place-ack + WS-tracked terminal fill.
 
-    `fill is None` when REST submit failed (no point awaiting) OR the
+    `ack` is whatever `place_market_order` returned — for aster this comes
+    from an HTTP REST POST, for lighter from a signed WS tx ack; both are
+    just "the venue acknowledged the submit" from the caller's POV.
+
+    `fill is None` when the place ack failed (no point awaiting) OR the
     tracker timed out before any event arrived."""
 
-    rest: OrderResult
+    ack: OrderResult
     fill: TerminalFill | None

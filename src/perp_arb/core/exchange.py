@@ -123,16 +123,17 @@ class BaseExchange(ABC):
     #
     # The three operations below are the lower-level primitives behind
     # `submit_and_await`. Callers that need to interleave bookkeeping
-    # between REST ack and WS terminal-fill resolution (e.g. recording
+    # between the place ack and WS terminal-fill resolution (e.g. recording
     # per-leg latency marks the moment the venue acks the submit, even
     # while the WS event hasn't landed yet) use these directly instead
     # of the bundled `submit_and_await`.
 
     def register_fill_slot(self, client_id: str) -> None:
         """Whitelist `client_id` in the per-cid fill tracker BEFORE
-        `place_market_order`. Required to prevent a fast fill (aster can
-        fill before REST returns) from being dropped by the unknown-cid
-        guard inside the WS dispatcher. Idempotent.
+        `place_market_order`. Required to prevent a fast fill (fills can
+        land before the place ack returns on some venues) from being
+        dropped by the unknown-cid guard inside the WS dispatcher.
+        Idempotent.
 
         Race-safety: `register_fill_slot` must run in the same
         synchronous stretch as the `place_market_order` call — no
@@ -173,19 +174,19 @@ class BaseExchange(ABC):
         """One-shot wrapper: register + submit + await + release.
 
         Use this when you don't need to interleave anything between
-        REST ack and WS terminal fill. Most callers should use this.
-        For finer-grained control (e.g. timeline marks between REST
-        and fill), use the three primitives above.
+        the place ack and WS terminal fill. Most callers should use
+        this. For finer-grained control (e.g. timeline marks between
+        ack and fill), use the three primitives above.
         """
         self.register_fill_slot(client_id)
         try:
-            rest = await self.place_market_order(
+            ack = await self.place_market_order(
                 market, side, qty,
                 reduce_only=reduce_only, client_id=client_id,
             )
-            if not rest.success:
-                return OrderOutcome(rest=rest, fill=None)
+            if not ack.success:
+                return OrderOutcome(ack=ack, fill=None)
             fill = await self.await_fill(client_id, qty, timeout_s)
-            return OrderOutcome(rest=rest, fill=fill)
+            return OrderOutcome(ack=ack, fill=fill)
         finally:
             self.release_fill_slot(client_id)

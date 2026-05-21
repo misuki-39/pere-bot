@@ -34,12 +34,16 @@ from perp_arb.core.types import (
 
 _SYM_A = Symbol(exchange="aster", raw="ETHUSDT", base="ETH", quote="USDT")
 _SYM_L = Symbol(exchange="lighter", raw="ETH", base="ETH", quote="USD")
+# Stub fixture binds leg_a -> aster, leg_b -> lighter. Strategy-layer code
+# only sees the leg labels; the actual venue identity ("aster"/"lighter")
+# is what each stub instance reports via its `.name` field and what the
+# executor stamps into LegReport.exchange.
 _MARKETS = {
-    "aster": MarketInfo(
+    "leg_a": MarketInfo(
         symbol=_SYM_A, tick_size=Decimal("0.01"), lot_size=Decimal("0.001"),
         contract_id="ETHUSDT",
     ),
-    "lighter": MarketInfo(
+    "leg_b": MarketInfo(
         symbol=_SYM_L, tick_size=Decimal("0.01"), lot_size=Decimal("0.001"),
         contract_id=0,
     ),
@@ -61,25 +65,25 @@ class _StubExchange:
     executor actually calls."""
 
     name: str
-    rest_result: OrderResult | None = None
-    rest_raises: Exception | None = None
+    submit_result: OrderResult | None = None
+    submit_raises: Exception | None = None
     fill_result: TerminalFill | None = None
     book_a: OrderBook = field(default_factory=lambda: _book(_SYM_A))
     book_l: OrderBook = field(default_factory=lambda: _book(_SYM_L))
-    rest_calls: list[dict[str, Any]] = field(default_factory=list)
+    submit_calls: list[dict[str, Any]] = field(default_factory=list)
 
     async def place_market_order(
         self, market: MarketInfo, side: Side, qty: Decimal,
         *, reduce_only: bool = False, client_id: str | None = None,
     ) -> OrderResult:
-        self.rest_calls.append({
+        self.submit_calls.append({
             "side": side, "qty": qty, "reduce_only": reduce_only,
             "client_id": client_id,
         })
-        if self.rest_raises is not None:
-            raise self.rest_raises
-        assert self.rest_result is not None
-        return self.rest_result
+        if self.submit_raises is not None:
+            raise self.submit_raises
+        assert self.submit_result is not None
+        return self.submit_result
 
     def register_fill_slot(self, client_id: str) -> None:
         pass
@@ -118,30 +122,25 @@ def _bad(*, side: Side, qty: Decimal, msg: str) -> OrderResult:
 
 def _legs(
     *,
-    aster_side: Side = Side.SELL, aster_exp: str = "100.00",
-    lighter_side: Side = Side.BUY, lighter_exp: str = "100.02",
-    trade_id: str = "t-1",
+    a_side: Side = Side.SELL, a_exp: str = "100.00",
+    b_side: Side = Side.BUY, b_exp: str = "100.02",
 ) -> tuple[LegIntent, LegIntent]:
     return (
-        LegIntent(
-            venue="aster", side=aster_side,
-            expected_price=Decimal(aster_exp),
-            client_id=f"{trade_id}-a",
-        ),
-        LegIntent(
-            venue="lighter", side=lighter_side,
-            expected_price=Decimal(lighter_exp),
-            client_id=f"{trade_id}-l",
-        ),
+        LegIntent(venue="leg_a", side=a_side, expected_price=Decimal(a_exp)),
+        LegIntent(venue="leg_b", side=b_side, expected_price=Decimal(b_exp)),
     )
+
+
+_TEST_CID_SEED = 1_000  # deterministic so tests can assert on the cid string
 
 
 def _executor(
     aster: _StubExchange, lighter: _StubExchange, *, is_paper: bool = False,
 ) -> TwoLegExecutor:
+    # Stub fixture binds leg_a -> aster, leg_b -> lighter.
     return TwoLegExecutor(
-        {"aster": aster, "lighter": lighter}, _MARKETS,
-        is_paper=is_paper, max_levels=3,
+        {"leg_a": aster, "leg_b": lighter}, _MARKETS,
+        is_paper=is_paper, max_levels=3, cid_seed=_TEST_CID_SEED,
     )
 
 
@@ -152,11 +151,11 @@ async def test_both_legs_succeed_no_unwind() -> None:
     qty = Decimal("1.0")
     aster = _StubExchange(
         name="aster",
-        rest_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.05"),
+        submit_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.05"),
     )
     lighter = _StubExchange(
         name="lighter",
-        rest_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.07"),
+        submit_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.07"),
     )
     ex = _executor(aster, lighter)
     timeline = Timeline()
@@ -168,9 +167,10 @@ async def test_both_legs_succeed_no_unwind() -> None:
     assert report.failure_reason is None
     assert [leg.kind for leg in report.legs] == [LegKind.ENTRY, LegKind.ENTRY]
     assert [leg.exchange for leg in report.legs] == ["aster", "lighter"]
-    # cid pass-through: whatever the caller put in LegIntent
-    assert aster.rest_calls[0]["client_id"] == "t-1-a"
-    assert lighter.rest_calls[0]["client_id"] == "t-1-l"
+    # executor allocates one cid per trade, shared across both legs
+    # (per-driver fill tracker scopes the namespace)
+    assert aster.submit_calls[0]["client_id"] == str(_TEST_CID_SEED)
+    assert lighter.submit_calls[0]["client_id"] == str(_TEST_CID_SEED)
     # send_ts_ms populated on report so the caller can stamp its own record
     assert report.send_ts_ms > 0
 
@@ -182,11 +182,11 @@ async def test_aster_ok_lighter_fail_unwinds_aster() -> None:
     qty = Decimal("1.0")
     aster = _StubExchange(
         name="aster",
-        rest_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.05"),
+        submit_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.05"),
     )
     lighter = _StubExchange(
         name="lighter",
-        rest_result=_bad(side=Side.BUY, qty=qty, msg="sequencer rejected"),
+        submit_result=_bad(side=Side.BUY, qty=qty, msg="sequencer rejected"),
     )
     ex = _executor(aster, lighter)
     report = await ex.execute(
@@ -201,8 +201,8 @@ async def test_aster_ok_lighter_fail_unwinds_aster() -> None:
     assert report.legs[2].kind is LegKind.UNWIND
     assert report.legs[2].exchange == "aster"
     # Second aster call is the unwind: opposite side + reduce_only
-    assert len(aster.rest_calls) == 2
-    unwind_call = aster.rest_calls[1]
+    assert len(aster.submit_calls) == 2
+    unwind_call = aster.submit_calls[1]
     assert unwind_call["reduce_only"] is True
     assert unwind_call["side"] is Side.BUY  # opposite of SELL entry
 
@@ -212,11 +212,11 @@ async def test_lighter_ok_aster_fail_unwinds_lighter() -> None:
     qty = Decimal("1.0")
     aster = _StubExchange(
         name="aster",
-        rest_result=_bad(side=Side.SELL, qty=qty, msg="aster timeout"),
+        submit_result=_bad(side=Side.SELL, qty=qty, msg="aster timeout"),
     )
     lighter = _StubExchange(
         name="lighter",
-        rest_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.07"),
+        submit_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.07"),
     )
     ex = _executor(aster, lighter)
     report = await ex.execute(
@@ -228,7 +228,7 @@ async def test_lighter_ok_aster_fail_unwinds_lighter() -> None:
     assert len(report.legs) == 3
     assert report.legs[2].kind is LegKind.UNWIND
     assert report.legs[2].exchange == "lighter"
-    unwind_call = lighter.rest_calls[1]
+    unwind_call = lighter.submit_calls[1]
     assert unwind_call["reduce_only"] is True
     assert unwind_call["side"] is Side.SELL  # opposite of BUY entry
 
@@ -237,10 +237,10 @@ async def test_lighter_ok_aster_fail_unwinds_lighter() -> None:
 async def test_both_legs_fail_no_unwind() -> None:
     qty = Decimal("1.0")
     aster = _StubExchange(
-        name="aster", rest_result=_bad(side=Side.SELL, qty=qty, msg="A down"),
+        name="aster", submit_result=_bad(side=Side.SELL, qty=qty, msg="A down"),
     )
     lighter = _StubExchange(
-        name="lighter", rest_result=_bad(side=Side.BUY, qty=qty, msg="L down"),
+        name="lighter", submit_result=_bad(side=Side.BUY, qty=qty, msg="L down"),
     )
     ex = _executor(aster, lighter)
     report = await ex.execute(
@@ -262,7 +262,7 @@ async def test_ws_fill_overrides_rest_price() -> None:
     qty = Decimal("1.0")
     aster = _StubExchange(
         name="aster",
-        rest_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.00"),
+        submit_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.00"),
         fill_result=TerminalFill(
             filled_qty=Decimal("1.0"),
             weighted_price_sum=Decimal("100.10"),
@@ -272,7 +272,7 @@ async def test_ws_fill_overrides_rest_price() -> None:
     )
     lighter = _StubExchange(
         name="lighter",
-        rest_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.00"),
+        submit_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.00"),
     )
     ex = _executor(aster, lighter)
     report = await ex.execute(
@@ -291,12 +291,12 @@ async def test_ws_fill_timeout_falls_back_to_rest() -> None:
     qty = Decimal("1.0")
     aster = _StubExchange(
         name="aster",
-        rest_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.05"),
+        submit_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.05"),
         fill_result=None,
     )
     lighter = _StubExchange(
         name="lighter",
-        rest_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.07"),
+        submit_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.07"),
         fill_result=TerminalFill(),  # empty: registered, no events
     )
     ex = _executor(aster, lighter)
@@ -327,7 +327,7 @@ async def test_paper_synth_uses_book_vwap() -> None:
     assert report.legs[0].realized_price == Decimal("100.00")  # aster bid (SELL)
     assert report.legs[1].realized_price == Decimal("100.06")  # lighter ask (BUY)
     # No REST calls — paper short-circuits
-    assert aster.rest_calls == [] and lighter.rest_calls == []
+    assert aster.submit_calls == [] and lighter.submit_calls == []
 
 
 @pytest.mark.asyncio
@@ -353,22 +353,22 @@ async def test_legs_with_opposite_sides() -> None:
     qty = Decimal("1.0")
     aster = _StubExchange(
         name="aster",
-        rest_result=_ok(venue="aster", side=Side.BUY, qty=qty, avg="100.02"),
+        submit_result=_ok(venue="aster", side=Side.BUY, qty=qty, avg="100.02"),
     )
     lighter = _StubExchange(
         name="lighter",
-        rest_result=_ok(venue="lighter", side=Side.SELL, qty=qty, avg="100.04"),
+        submit_result=_ok(venue="lighter", side=Side.SELL, qty=qty, avg="100.04"),
     )
     ex = _executor(aster, lighter)
     report = await ex.execute(
         trade_id="t-1",
-        legs=_legs(aster_side=Side.BUY, lighter_side=Side.SELL),
+        legs=_legs(a_side=Side.BUY, b_side=Side.SELL),
         qty=qty, timeline=Timeline(),
     )
 
     assert report.success is True
-    assert aster.rest_calls[0]["side"] is Side.BUY
-    assert lighter.rest_calls[0]["side"] is Side.SELL
+    assert aster.submit_calls[0]["side"] is Side.BUY
+    assert lighter.submit_calls[0]["side"] is Side.SELL
 
 
 # ---- timeline marks survive ---------------------------------------------
@@ -384,11 +384,11 @@ async def test_timeline_marks_set_send_and_per_leg_result() -> None:
 
     aster = _StubExchange(
         name="aster",
-        rest_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.05"),
+        submit_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.05"),
     )
     lighter = _SlowLighter(
         name="lighter",
-        rest_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.07"),
+        submit_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.07"),
     )
     ex = _executor(aster, lighter)
     timeline = Timeline()
@@ -397,8 +397,8 @@ async def test_timeline_marks_set_send_and_per_leg_result() -> None:
     )
 
     assert timeline.get(Phase.SEND) is not None
-    assert timeline.get("result_aster") is not None
-    assert timeline.get("result_lighter") is not None
+    assert timeline.get("result_leg_a") is not None
+    assert timeline.get("result_leg_b") is not None
     assert timeline.get(Phase.RESULT) is not None
     # Per-leg marks reflect REST completion order, not gather completion
-    assert timeline.get("result_lighter") > timeline.get("result_aster")  # type: ignore[operator]
+    assert timeline.get("result_leg_b") > timeline.get("result_leg_a")  # type: ignore[operator]

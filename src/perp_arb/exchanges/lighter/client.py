@@ -12,7 +12,6 @@ import asyncio
 import contextlib
 import logging
 import time
-import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal
@@ -223,8 +222,18 @@ class LighterClient(BaseExchange):
         worst_price = _worst_acceptable_price(self.best_quote(market), is_ask)
         avg_price_int = int(worst_price * meta.price_multiplier)
         base_amount = int(qty * meta.base_multiplier)
-        coi = int(time.time_ns() // 1_000) % 1_000_000_000
-        client_id_str = client_id or f"lighter-{uuid.uuid4().hex[:12]}"
+        # Lighter's `client_order_index` is the on-wire cid; the WS user
+        # stream echoes this exact integer as `client_order_id`, so the
+        # tracker key MUST be `str(coi)` for `_fill_tracker.on_event` to
+        # match the slot we registered. Caller supplies it as a numeric
+        # string; fallback only fires for in-driver flows (unwind) that
+        # don't fill-track. Max is Lighter's `2^48 - 10`.
+        if client_id is not None:
+            coi = int(client_id)
+            client_id_str = client_id
+        else:
+            coi = int(time.time()) % (1 << 48)
+            client_id_str = str(coi)
 
         tx_type, tx_info, _tx_hash, err = self._signer.sign_create_order(
             market_index=meta.market_index,

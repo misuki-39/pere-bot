@@ -21,8 +21,8 @@ strategy: taker_taker
 mode: paper
 pair:
   base: ETH
-  aster_symbol: ETHUSDT
-  lighter_symbol: ETH
+  leg_a: { venue: aster,   symbol: ETHUSDT }
+  leg_b: { venue: lighter, symbol: ETH }
 qty: 0.05
 max_qty: 0.5
 fees_bps: 6
@@ -168,7 +168,10 @@ def test_spread_monitor_config_still_validates_without_optimisations() -> None:
     sm_yaml = """
 strategy: spread_monitor
 mode: paper
-pair: { base: WTI, aster_symbol: CLUSDT, lighter_symbol: WTI }
+pair:
+  base: WTI
+  leg_a: { venue: aster,   symbol: CLUSDT }
+  leg_b: { venue: lighter, symbol: WTI }
 monitor_pair:
   - { venue: lighter, symbol: WTI }
   - { venue: aster,   symbol: CLUSDT }

@@ -50,17 +50,17 @@ class BaseStrategy(ABC):
     def _market(self, name: str) -> MarketInfo:
         return self.markets[name]
 
-    def _aster(self) -> BaseExchange:
-        return self.exchanges["aster"]
+    def _leg_a(self) -> BaseExchange:
+        return self.exchanges["leg_a"]
 
-    def _lighter(self) -> BaseExchange:
-        return self.exchanges["lighter"]
+    def _leg_b(self) -> BaseExchange:
+        return self.exchanges["leg_b"]
 
-    def _aster_market(self) -> MarketInfo:
-        return self.markets["aster"]
+    def _leg_a_market(self) -> MarketInfo:
+        return self.markets["leg_a"]
 
-    def _lighter_market(self) -> MarketInfo:
-        return self.markets["lighter"]
+    def _leg_b_market(self) -> MarketInfo:
+        return self.markets["leg_b"]
 
 
 class TimeEwma:
