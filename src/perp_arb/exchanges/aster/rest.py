@@ -146,12 +146,6 @@ class AsterRest:
             params["newClientOrderId"] = new_client_order_id
         return await self._signed("POST", "/fapi/v3/order", params)
 
-    async def cancel_order(self, symbol: str, order_id: str) -> dict[str, Any]:
-        return await self._signed("DELETE", "/fapi/v3/order", {"symbol": symbol, "orderId": order_id})
-
-    async def get_order(self, symbol: str, order_id: str) -> dict[str, Any]:
-        return await self._signed("GET", "/fapi/v3/order", {"symbol": symbol, "orderId": order_id})
-
     async def get_position_risk(self, symbol: str) -> list[dict[str, Any]]:
         # /fapi/v3/positionRisk returns a JSON array.
         return await self._signed("GET", "/fapi/v3/positionRisk", {"symbol": symbol})

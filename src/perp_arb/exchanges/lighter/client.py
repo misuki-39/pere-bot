@@ -271,61 +271,12 @@ class LighterClient(BaseExchange):
             )
         return OrderResult(
             success=True,
-            order_id=str(coi),
             client_id=client_id_str,
             side=side,
             requested_qty=qty,
             status=OrderStatus.OPEN,    # final fill state arrives via account WS
             latency_ms=int((time.monotonic() - t0) * 1000),
         )
-
-    async def cancel_order(self, market: MarketInfo, order_id: str) -> OrderResult:
-        if self.public_only or self._signer is None or self._user_ws is None:
-            raise RuntimeError("lighter is in public_only mode — cannot cancel")
-        meta = self._meta_by_symbol.get(market.symbol.raw)
-        if meta is None:
-            raise RuntimeError("call load_market() before cancelling on lighter")
-        tx_type, tx_info, _tx_hash, err = self._signer.sign_cancel_order(
-            market_index=meta.market_index,
-            order_index=int(order_id),
-            api_key_index=self.api_key_index,
-        )
-        if err is not None:
-            return OrderResult(success=False, order_id=order_id, error_message=f"sign: {err}")
-        try:
-            reply = await self._user_ws.send_tx(tx_type, tx_info)
-        except (TimeoutError, TxSubmitError) as e:
-            return OrderResult(success=False, order_id=order_id, error_message=str(e))
-        ok, err_msg = _sendtx_outcome(reply)
-        if not ok:
-            return OrderResult(success=False, order_id=order_id, error_message=err_msg)
-        return OrderResult(success=True, order_id=order_id, status=OrderStatus.CANCELED)
-
-    async def get_order(self, market: MarketInfo, order_id: str) -> OrderSnapshot | None:
-        if self._signer is None:
-            raise RuntimeError("lighter is in public_only mode — cannot get_order")
-        meta = self._meta_by_symbol[market.symbol.raw]
-        api = await self._ensure_api()
-        order_api = lighter.OrderApi(api)
-        resp = await order_api.account_active_orders(
-            account_index=self.account_index,
-            market_id=meta.market_index,
-            auth=self._make_auth_token(),
-        )
-        for o in resp.orders:
-            if str(o.order_index) == str(order_id):
-                return OrderSnapshot(
-                    order_id=str(o.order_index),
-                    client_id=None,
-                    symbol=market.symbol,
-                    side=Side.SELL if o.is_ask else Side.BUY,
-                    size=Decimal(str(o.initial_base_amount)),
-                    price=Decimal(str(o.price)),
-                    status=_LIGHTER_REST_STATUS.get(o.status.upper(), OrderStatus.UNKNOWN),
-                    filled_qty=Decimal(str(o.filled_base_amount)),
-                    realized_price=None,
-                )
-        return None
 
     async def get_position(self, market: MarketInfo) -> Position:
         api = await self._ensure_api()
@@ -434,20 +385,6 @@ def _sendtx_outcome(reply: dict[str, Any]) -> tuple[bool, str]:
     return True, ""
 
 
-# Lighter has two distinct status vocabularies — same concept, two
-# wire forms. REST `account_active_orders.status` returns UPPERCASE no
-# variants. WS `account_market.orders.status` returns lowercase + a few
-# enumerated `canceled-*` suffixes per apidocs. Aster has only one
-# vocabulary so it gets one map (`_ASTER_STATUS_MAP`); lighter needs two.
-_LIGHTER_REST_STATUS = {
-    "OPEN": OrderStatus.OPEN,
-    "FILLED": OrderStatus.FILLED,
-    "CANCELED": OrderStatus.CANCELED,
-    "PARTIALLY_FILLED": OrderStatus.PARTIALLY_FILLED,
-    "REJECTED": OrderStatus.REJECTED,
-    "EXPIRED": OrderStatus.EXPIRED,
-}
-
 _LIGHTER_WS_STATUS = {
     "pending": OrderStatus.PENDING,
     "open": OrderStatus.OPEN,
@@ -467,7 +404,6 @@ def _order_to_snapshot(o: dict[str, Any], symbol: Symbol) -> OrderSnapshot:
     filled_quote = Decimal(o["filled_quote_amount"])
     avg_price = (filled_quote / filled_base) if filled_base > 0 else None
     return OrderSnapshot(
-        order_id=str(o.get("order_id") or o["order_index"]),
         client_id=str(o["client_order_id"]),
         symbol=symbol,
         side=Side.SELL if o["is_ask"] else Side.BUY,

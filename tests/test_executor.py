@@ -103,7 +103,6 @@ class _StubExchange:
 def _ok(*, venue: str, side: Side, qty: Decimal, avg: str | None = "100.00") -> OrderResult:
     return OrderResult(
         success=True,
-        order_id=f"{venue}-ok-1",
         client_id="cid",
         side=side,
         requested_qty=qty,

@@ -97,7 +97,6 @@ class LegReport:
     status: str
     success: bool
     error: str | None = None
-    order_id: str | None = None
     client_id: str | None = None
     fee: Decimal | None = None
     latency_ms: int | None = None    # send → THIS leg's result (inter-leg skew)
@@ -116,8 +115,8 @@ class LegReport:
         """Single LegReport constructor: merges the synchronous place-ack
         with the WS-derived authoritative fill aggregate. When `fill`
         carries real fills (`filled_qty > 0`), its qty / avg / ts win;
-        otherwise the ack is the source. Everything else (order_id,
-        client_id, status, error, latency_ms) always comes from the ack."""
+        otherwise the ack is the source. Everything else (client_id,
+        status, error, latency_ms) always comes from the ack."""
         if fill is not None and fill.filled_qty > 0:
             filled_qty = fill.filled_qty
             realized_price = fill.weighted_price_sum / fill.filled_qty
@@ -136,7 +135,6 @@ class LegReport:
             status=ack.status.value,
             success=ack.success,
             error=ack.error_message,
-            order_id=ack.order_id,
             client_id=ack.client_id,
             fee=None,
             latency_ms=latency_ms,

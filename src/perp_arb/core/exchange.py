@@ -22,8 +22,8 @@ from .types import (
 
 QuoteCallback = Callable[[Quote], None]
 OrderBookCallback = Callable[[OrderBook], None]
-# Either a cumulative-state snapshot (lighter account_market.orders,
-# aster REST get_order) or a per-fill delta (aster ORDER_TRADE_UPDATE).
+# Either a cumulative-state snapshot (lighter `account_market.orders`)
+# or a per-fill delta (aster `ORDER_TRADE_UPDATE`).
 OrderUpdateCallback = Callable[[OrderSnapshot | FillDelta], None]
 PositionCallback = Callable[[Position], None]
 
@@ -69,13 +69,7 @@ class BaseExchange(ABC):
     ) -> OrderResult: ...
 
     @abstractmethod
-    async def cancel_order(self, market: MarketInfo, order_id: str) -> OrderResult: ...
-
-    @abstractmethod
     async def get_position(self, market: MarketInfo) -> Position: ...
-
-    @abstractmethod
-    async def get_order(self, market: MarketInfo, order_id: str) -> OrderSnapshot | None: ...
 
     @abstractmethod
     def subscribe_quotes(self, market: MarketInfo, cb: QuoteCallback) -> None:

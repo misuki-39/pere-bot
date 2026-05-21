@@ -116,10 +116,9 @@ class Quote:
 
 @dataclass(slots=True)
 class OrderResult:
-    """Return value of place_market_order / cancel_order."""
+    """Return value of place_market_order — the synchronous place ack."""
 
     success: bool
-    order_id: str | None = None
     client_id: str | None = None
     side: Side | None = None
     requested_qty: Decimal | None = None
@@ -136,12 +135,11 @@ class OrderResult:
 @dataclass(slots=True)
 class OrderSnapshot:
     """Cumulative order-state observation: poll-style snapshot or per-order WS event
-    (lighter `account_market.orders`, aster REST `get_order`).
+    (lighter `account_market.orders`).
 
     Semantics: `filled_qty` / `realized_price` are the order's RUNNING TOTALS
     at this instant. Consumer overwrites, never accumulates."""
 
-    order_id: str
     client_id: str | None
     symbol: Symbol
     side: Side
@@ -166,7 +164,6 @@ class FillDelta:
     ts_ms: int
     side: Side | None = None
     client_id: str | None = None
-    order_id: str | None = None
     # Carried so the accumulator can short-circuit waits when the venue
     # confirms the parent order is settled (FILLED / CANCELED / REJECTED /
     # EXPIRED). None when this delta isn't terminal.

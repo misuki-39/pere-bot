@@ -53,7 +53,7 @@ def _delta(qty: str, price: str, ts: int, *, client_id: str = "x",
 def _snapshot(*, filled: str, avg: str, status: OrderStatus, ts: int = 0,
               client_id: str = "x") -> OrderSnapshot:
     return OrderSnapshot(
-        order_id="o-1", client_id=client_id, symbol=_SYM, side=Side.BUY,
+        client_id=client_id, symbol=_SYM, side=Side.BUY,
         size=Decimal("1.0"), price=Decimal("100"),
         status=status,
         filled_qty=Decimal(filled),
@@ -130,7 +130,6 @@ def test_accumulator_delta_terminal_status_propagates() -> None:
 def _ack_ok(*, avg_price: str = "100.00", exchange_ts: int | None = None) -> OrderResult:
     return OrderResult(
         success=True,
-        order_id="ack-1",
         client_id="x",
         side=Side.BUY,
         requested_qty=Decimal("1.0"),
@@ -156,7 +155,7 @@ def test_build_uses_ack_data_when_no_fill() -> None:
 
 def test_build_prefers_ws_fill_over_ack_when_both_present() -> None:
     """WS fill is the matching-engine's authoritative view — wins on price,
-    qty, and ts. The ack stays the source for status / order_id / etc."""
+    qty, and ts. The ack stays the source for status / client_id / etc."""
     ack = _ack_ok(avg_price="100.00", exchange_ts=1_700_000_000_000)
     acc = _FillAccumulator()
     acc.add(_delta("1.0", "100.05", ts=1_700_000_000_500))
@@ -167,7 +166,7 @@ def test_build_prefers_ws_fill_over_ack_when_both_present() -> None:
     assert leg.realized_price == Decimal("100.05")
     assert leg.filled_qty == Decimal("1.0")
     assert leg.fill_ts_ms == 1_700_000_000_500
-    assert leg.order_id == "ack-1"    # ack still supplies these
+    assert leg.client_id == "x"    # ack still supplies these
 
 
 def test_build_falls_back_when_accumulator_empty() -> None:
@@ -187,7 +186,7 @@ def test_build_lighter_path_ws_is_only_price_source() -> None:
     submit was acknowledged; matching happens later). WS fill is the only
     realized-data source for that leg."""
     ack = OrderResult(
-        success=True, order_id="seq-1", client_id="x", side=Side.SELL,
+        success=True, client_id="x", side=Side.SELL,
         requested_qty=Decimal("1.0"), status=OrderStatus.OPEN, latency_ms=200,
     )
     acc = _FillAccumulator()

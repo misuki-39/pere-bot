@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 
@@ -160,10 +159,8 @@ class TwoLegExecutor:
 
         if ack_a.success and ack_b.success:
             report.success = True
-            _log.info("[%s] FILLED %s=%s %s=%s latency=%sms",
-                      trade_id,
-                      self.exchanges[a_intent.venue].name, ack_a.order_id,
-                      self.exchanges[b_intent.venue].name, ack_b.order_id, latency)
+            _log.info("[%s] FILLED cid=%s latency=%sms",
+                      trade_id, cid, latency)
             return report
 
         await self._handle_partial_failure(
@@ -295,7 +292,6 @@ class TwoLegExecutor:
         assert vwap is not None
         return OrderResult(
             success=True,
-            order_id="paper-" + uuid.uuid4().hex[:8],
             client_id=cid,
             side=leg.side,
             requested_qty=qty,

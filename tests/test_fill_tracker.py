@@ -34,7 +34,7 @@ def _delta(qty: str, price: str, *, cid: str = "cid-1", ts: int = 1000,
 def _snap(filled: str, *, cid: str = "cid-1", status: OrderStatus,
           avg: str = "100", ts: int = 1000) -> OrderSnapshot:
     return OrderSnapshot(
-        order_id="o-1", client_id=cid, symbol=_SYM, side=Side.BUY,
+        client_id=cid, symbol=_SYM, side=Side.BUY,
         size=Decimal("1.0"), price=Decimal("100"), status=status,
         filled_qty=Decimal(filled), realized_price=Decimal(avg), ts_ms=ts,
     )

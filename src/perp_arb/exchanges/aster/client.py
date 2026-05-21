@@ -21,7 +21,6 @@ from ...core.types import (
     MarketInfo,
     OrderBook,
     OrderResult,
-    OrderSnapshot,
     OrderStatus,
     Position,
     Quote,
@@ -178,7 +177,6 @@ class AsterClient(BaseExchange):
         # alongside our client-observed latency.
         return OrderResult(
             success=True,
-            order_id=str(resp["orderId"]),
             client_id=client_id,
             side=side,
             requested_qty=qty,
@@ -187,29 +185,6 @@ class AsterClient(BaseExchange):
             status=_ASTER_STATUS_MAP.get(resp["status"], OrderStatus.UNKNOWN),
             latency_ms=int((time.monotonic() - t0) * 1000),
             exchange_ts_ms=int(resp["transactTime"]) if resp.get("transactTime") else None,
-        )
-
-    async def cancel_order(self, market: MarketInfo, order_id: str) -> OrderResult:
-        r = await self.rest.cancel_order(str(market.contract_id), order_id)
-        return OrderResult(
-            success=True,
-            order_id=str(r["orderId"]),
-            status=_ASTER_STATUS_MAP.get(r["status"], OrderStatus.CANCELED),
-        )
-
-    async def get_order(self, market: MarketInfo, order_id: str) -> OrderSnapshot:
-        r = await self.rest.get_order(str(market.contract_id), order_id)
-        return OrderSnapshot(
-            order_id=str(r["orderId"]),
-            client_id=r.get("clientOrderId"),
-            symbol=market.symbol,
-            side=Side.BUY if r["side"] == "BUY" else Side.SELL,
-            size=Decimal(r["origQty"]),
-            price=Decimal(r["price"]),
-            status=_ASTER_STATUS_MAP.get(r["status"], OrderStatus.UNKNOWN),
-            filled_qty=Decimal(r["executedQty"]),
-            realized_price=_dec(r.get("avgPrice")),
-            ts_ms=int(r["updateTime"]),
         )
 
     async def get_position(self, market: MarketInfo) -> Position:
@@ -259,7 +234,6 @@ class AsterClient(BaseExchange):
             ts_ms=int(data.get("T") or data["E"]),
             side=Side.BUY if o["S"] == "BUY" else Side.SELL,
             client_id=o.get("c"),
-            order_id=str(o["i"]),
             terminal_status=status if status.terminal else None,
         )
         # Internal: feed the per-cid tracker (submit_and_await's awaitable).

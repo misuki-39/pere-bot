@@ -143,7 +143,6 @@ class Engine:
         d = self.in_flight[fill.decision_id]
         r = OrderResult(
             success=fill.success,
-            order_id=f"bt-{fill.decision_id[:6]}-{fill.venue[:3]}",
             side=fill.side,
             requested_qty=fill.requested_qty,
             filled_qty=fill.filled_qty,

@@ -25,7 +25,6 @@ from ...core.types import (
     MarketInfo,
     OrderBook,
     OrderResult,
-    OrderSnapshot,
     Position,
     Quote,
     Side,
@@ -148,12 +147,6 @@ class KatanaClient(BaseExchange):
         reduce_only: bool = False,
         client_id: str | None = None,
     ) -> OrderResult:
-        raise RuntimeError(_PUBLIC_ONLY)
-
-    async def cancel_order(self, market: MarketInfo, order_id: str) -> OrderResult:
-        raise RuntimeError(_PUBLIC_ONLY)
-
-    async def get_order(self, market: MarketInfo, order_id: str) -> OrderSnapshot | None:
         raise RuntimeError(_PUBLIC_ONLY)
 
     async def get_position(self, market: MarketInfo) -> Position:
