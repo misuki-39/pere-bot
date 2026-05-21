@@ -127,7 +127,7 @@ class LegReport:
             realized_price = fill.weighted_price_sum / fill.filled_qty
             fill_ts_ms = fill.last_ts_ms or rest.exchange_ts_ms
         else:
-            filled_qty = rest.filled_size
+            filled_qty = rest.filled_qty
             realized_price = rest.avg_price
             fill_ts_ms = rest.exchange_ts_ms
         return cls(

@@ -1,10 +1,8 @@
 """Unit tests for the live fill-enrichment plumbing:
 
-  - `_FillAccumulator` aggregates partial trade events into a single
-    size-weighted avg price + last-ts;
-  - `_leg_report_with_fill` prefers WS fill data over REST when present;
-  - `LegReport.from_result` propagates `OrderResult.exchange_ts_ms` to
-    `LegReport.fill_ts_ms` (the aster transactTime path);
+  - `_FillAccumulator` aggregates `FillDelta` + `OrderSnapshot` events;
+  - `LegReport.build` merges REST submit-ack with the WS fill aggregate,
+    preferring WS for filled_qty / realized_price / fill_ts_ms;
   - The recorder writes the new `send_ts_ms` + `fill_ts_ms` columns.
 
 These tests do not exercise the asyncio `_await_fill` loop directly — the
@@ -56,8 +54,8 @@ def _snapshot(*, filled: str, avg: str, status: OrderStatus, ts: int = 0,
         order_id="o-1", client_id=client_id, symbol=_SYM, side=Side.BUY,
         size=Decimal("1.0"), price=Decimal("100"),
         status=status,
-        filled_size=Decimal(filled),
-        avg_fill_price=Decimal(avg) if avg else None,
+        filled_qty=Decimal(filled),
+        realized_price=Decimal(avg) if avg else None,
         ts_ms=ts,
     )
 
@@ -125,7 +123,7 @@ def test_accumulator_delta_terminal_status_propagates() -> None:
     assert acc.is_complete(Decimal("2.0"))   # filled < requested but status terminal
 
 
-# ---- _leg_report_with_fill --------------------------------------------
+# ---- LegReport.build --------------------------------------------------
 
 def _rest_ok(*, avg_price: str = "100.00", exchange_ts: int | None = None) -> OrderResult:
     return OrderResult(
@@ -133,8 +131,8 @@ def _rest_ok(*, avg_price: str = "100.00", exchange_ts: int | None = None) -> Or
         order_id="rest-1",
         client_id="x",
         side=Side.BUY,
-        requested_size=Decimal("1.0"),
-        filled_size=Decimal("1.0"),
+        requested_qty=Decimal("1.0"),
+        filled_qty=Decimal("1.0"),
         avg_price=Decimal(avg_price),
         status=OrderStatus.FILLED,
         latency_ms=50,
@@ -183,11 +181,11 @@ def test_build_falls_back_when_accumulator_empty() -> None:
 
 
 def test_build_lighter_path_ws_is_only_price_source() -> None:
-    """Lighter REST returns submit-ack only (no avg_price / filled_size).
+    """Lighter REST returns submit-ack only (no avg_price / filled_qty).
     WS fill is the only realized-data source for that leg."""
     rest = OrderResult(
         success=True, order_id="seq-1", client_id="x", side=Side.SELL,
-        requested_size=Decimal("1.0"), status=OrderStatus.OPEN, latency_ms=200,
+        requested_qty=Decimal("1.0"), status=OrderStatus.OPEN, latency_ms=200,
     )
     acc = _FillAccumulator()
     acc.add(_delta("1.0", "100.20", ts=1_700_000_001_000))

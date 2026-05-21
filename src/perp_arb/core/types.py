@@ -122,8 +122,8 @@ class OrderResult:
     order_id: str | None = None
     client_id: str | None = None
     side: Side | None = None
-    requested_size: Decimal | None = None
-    filled_size: Decimal | None = None
+    requested_qty: Decimal | None = None
+    filled_qty: Decimal | None = None
     avg_price: Decimal | None = None
     status: OrderStatus = OrderStatus.UNKNOWN
     error_message: str | None = None
@@ -138,7 +138,7 @@ class OrderSnapshot:
     """Cumulative order-state observation: REST poll or per-order WS snapshot
     (lighter `account_market.orders`, aster REST `get_order`).
 
-    Semantics: `filled_size` / `avg_fill_price` are the order's RUNNING TOTALS
+    Semantics: `filled_qty` / `realized_price` are the order's RUNNING TOTALS
     at this instant. Consumer overwrites, never accumulates."""
 
     order_id: str
@@ -148,8 +148,8 @@ class OrderSnapshot:
     size: Decimal
     price: Decimal
     status: OrderStatus
-    filled_size: Decimal = Decimal("0")
-    avg_fill_price: Decimal | None = None
+    filled_qty: Decimal = Decimal("0")
+    realized_price: Decimal | None = None
     ts_ms: int = 0
 
 

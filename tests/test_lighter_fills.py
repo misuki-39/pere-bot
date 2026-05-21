@@ -89,14 +89,14 @@ def test_order_open_dispatches_orderinfo_with_open_status() -> None:
     assert info.client_id == "551535175282"
     assert info.side is Side.BUY                # is_ask=False
     assert info.status is OrderStatus.OPEN
-    assert info.filled_size == Decimal("0.000")
-    assert info.avg_fill_price is None          # nothing filled yet
+    assert info.filled_qty == Decimal("0.000")
+    assert info.realized_price is None          # nothing filled yet
     # transaction_time microseconds → ms
     assert info.ts_ms == 1779361394966
 
 
 def test_order_filled_dispatches_with_cumulative_avg_price() -> None:
-    """avg_fill_price = filled_quote / filled_base (cumulative semantics)."""
+    """realized_price = filled_quote / filled_base (cumulative semantics)."""
     c = _client()
     received: list[OrderSnapshot] = []
     c._fill_cbs["WTI"].append(received.append)
@@ -105,8 +105,8 @@ def test_order_filled_dispatches_with_cumulative_avg_price() -> None:
 
     info = received[0]
     assert info.status is OrderStatus.FILLED
-    assert info.filled_size == Decimal("0.100")
-    assert info.avg_fill_price == Decimal("100.712")    # 10.0712 / 0.1
+    assert info.filled_qty == Decimal("0.100")
+    assert info.realized_price == Decimal("100.712")    # 10.0712 / 0.1
 
 
 def test_order_with_unknown_market_index_drops() -> None:

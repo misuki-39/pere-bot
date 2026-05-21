@@ -240,7 +240,7 @@ class LighterClient(BaseExchange):
         if err is not None:
             return OrderResult(
                 success=False, client_id=client_id_str, side=side,
-                requested_size=qty, error_message=f"sign: {err}",
+                requested_qty=qty, error_message=f"sign: {err}",
             )
 
         t0 = time.monotonic()
@@ -249,14 +249,14 @@ class LighterClient(BaseExchange):
         except (TimeoutError, TxSubmitError) as e:
             return OrderResult(
                 success=False, client_id=client_id_str, side=side,
-                requested_size=qty, error_message=str(e),
+                requested_qty=qty, error_message=str(e),
                 latency_ms=int((time.monotonic() - t0) * 1000),
             )
         ok, err_msg = _sendtx_outcome(reply)
         if not ok:
             return OrderResult(
                 success=False, client_id=client_id_str, side=side,
-                requested_size=qty, error_message=err_msg,
+                requested_qty=qty, error_message=err_msg,
                 latency_ms=int((time.monotonic() - t0) * 1000),
             )
         return OrderResult(
@@ -264,7 +264,7 @@ class LighterClient(BaseExchange):
             order_id=str(coi),
             client_id=client_id_str,
             side=side,
-            requested_size=qty,
+            requested_qty=qty,
             status=OrderStatus.OPEN,    # final fill state arrives via account WS
             latency_ms=int((time.monotonic() - t0) * 1000),
         )
@@ -312,8 +312,8 @@ class LighterClient(BaseExchange):
                     size=Decimal(str(o.initial_base_amount)),
                     price=Decimal(str(o.price)),
                     status=_status_from_str(o.status),
-                    filled_size=Decimal(str(o.filled_base_amount)),
-                    avg_fill_price=None,
+                    filled_qty=Decimal(str(o.filled_base_amount)),
+                    realized_price=None,
                 )
         return None
 
@@ -469,7 +469,7 @@ def _order_to_snapshot(o: dict[str, Any], symbol: Symbol) -> OrderSnapshot:
         size=Decimal(o["initial_base_amount"]),
         price=Decimal(o["price"]),
         status=_account_orders_status(o["status"]),
-        filled_size=filled_base,
-        avg_fill_price=avg_price,
+        filled_qty=filled_base,
+        realized_price=avg_price,
         ts_ms=int(o["transaction_time"]) // 1000,
     )

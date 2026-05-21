@@ -167,7 +167,7 @@ class AsterClient(BaseExchange):
                 success=False,
                 client_id=client_id,
                 side=side,
-                requested_size=qty,
+                requested_qty=qty,
                 error_message=str(e),
                 latency_ms=int((time.monotonic() - t0) * 1000),
             )
@@ -180,8 +180,8 @@ class AsterClient(BaseExchange):
             order_id=str(resp["orderId"]),
             client_id=client_id,
             side=side,
-            requested_size=qty,
-            filled_size=_dec(resp.get("executedQty")),
+            requested_qty=qty,
+            filled_qty=_dec(resp.get("executedQty")),
             avg_price=_dec(resp.get("avgPrice")),
             status=_ASTER_STATUS_MAP.get(resp["status"], OrderStatus.UNKNOWN),
             latency_ms=int((time.monotonic() - t0) * 1000),
@@ -206,8 +206,8 @@ class AsterClient(BaseExchange):
             size=Decimal(r["origQty"]),
             price=Decimal(r["price"]),
             status=_ASTER_STATUS_MAP.get(r["status"], OrderStatus.UNKNOWN),
-            filled_size=Decimal(r["executedQty"]),
-            avg_fill_price=_dec(r.get("avgPrice")),
+            filled_qty=Decimal(r["executedQty"]),
+            realized_price=_dec(r.get("avgPrice")),
             ts_ms=int(r["updateTime"]),
         )
 

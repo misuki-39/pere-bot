@@ -96,10 +96,10 @@ class _FillAccumulator:
             case OrderSnapshot():
                 if event.status.terminal:
                     self.last_status = event.status
-                if event.filled_size > 0:
-                    self.filled_qty = event.filled_size
-                    if event.avg_fill_price is not None:
-                        self.weighted_price_sum = event.filled_size * event.avg_fill_price
+                if event.filled_qty > 0:
+                    self.filled_qty = event.filled_qty
+                    if event.realized_price is not None:
+                        self.weighted_price_sum = event.filled_qty * event.realized_price
             case FillDelta():
                 if event.terminal_status is not None:
                     self.last_status = event.terminal_status
@@ -541,7 +541,7 @@ class TakerTakerArbitrage(BaseStrategy):
                 _log.error("unwind on %s FAILED: %s", venue, r.error_message)
         except Exception as e:  # noqa: BLE001
             _log.exception("unwind on %s raised: %s", venue, e)
-            r = OrderResult(success=False, side=side, requested_size=qty,
+            r = OrderResult(success=False, side=side, requested_qty=qty,
                              error_message=f"unwind raised: {e}")
         d.timeline.mark("unwind_result")
         d.legs.append(LegReport.build(
@@ -572,16 +572,16 @@ class TakerTakerArbitrage(BaseStrategy):
                 success=True,
                 order_id="paper-" + uuid.uuid4().hex[:8],
                 side=aster_side,
-                requested_size=qty,
-                filled_size=qty,
+                requested_qty=qty,
+                filled_qty=qty,
                 avg_price=vwap_a,
             ),
             OrderResult(
                 success=True,
                 order_id="paper-" + uuid.uuid4().hex[:8],
                 side=lighter_side,
-                requested_size=qty,
-                filled_size=qty,
+                requested_qty=qty,
+                filled_qty=qty,
                 avg_price=vwap_l,
             ),
         )
