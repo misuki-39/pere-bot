@@ -45,7 +45,7 @@ from ..core.exec_record import (
     Outcome,
     Phase,
 )
-from ..core.types import OrderInfo, OrderResult, OrderStatus, Side
+from ..core.types import FillDelta, OrderResult, OrderSnapshot, OrderStatus, Side
 from ..risk.manager import RiskManager
 from ..utils.precision import vwap_fill
 from ..utils.time import now_ms
@@ -73,40 +73,39 @@ class SyntheticPosition:
 
 @dataclass(slots=True)
 class _FillAccumulator:
-    """Per-`client_id` aggregate combining two event sources:
+    """Per-`client_id` aggregate of two event types:
 
-      * DELTA events (`info.cumulative=False`): aster `l`/`L`, lighter
-        `account_all.trades`. Each carries a single partial's qty+price;
-        accumulator does `+=`.
-      * CUMULATIVE events (`info.cumulative=True`): lighter `account_orders`.
-        Each carries the order's running totals; accumulator OVERWRITES.
+      * `OrderSnapshot` — cumulative running totals (lighter
+        `account_market.orders`); accumulator OVERWRITES filled_qty + price.
+      * `FillDelta` — per-fill event (aster `l`/`L`); accumulator
+        ACCUMULATES qty * price.
 
-    `last_status` is taken from any terminal-status event (FILLED / CANCELED /
-    REJECTED / EXPIRED) so `is_complete` can short-circuit the wait the
-    moment the venue confirms the order is settled, regardless of whether
-    we've summed every individual trade event."""
+    `last_status` is taken from any terminal-status signal so `is_complete`
+    can short-circuit the wait the moment the venue confirms the parent
+    order is settled (FILLED / CANCELED / REJECTED / EXPIRED)."""
 
     filled_qty: Decimal = Decimal("0")
     weighted_price_sum: Decimal = Decimal("0")
     last_ts_ms: int = 0
     last_status: OrderStatus | None = None
 
-    def add(self, info: OrderInfo) -> None:
-        if info.ts_ms:
-            self.last_ts_ms = max(self.last_ts_ms, info.ts_ms)
-        if info.status is not None and info.status.terminal:
-            self.last_status = info.status
-        if info.cumulative:
-            if info.filled_size is not None and info.filled_size > 0:
-                self.filled_qty = info.filled_size
-                if info.avg_fill_price is not None and info.avg_fill_price > 0:
-                    self.weighted_price_sum = self.filled_qty * info.avg_fill_price
-        else:
-            size = info.filled_size or Decimal("0")
-            price = info.avg_fill_price or Decimal("0")
-            if size > 0 and price > 0:
-                self.filled_qty += size
-                self.weighted_price_sum += size * price
+    def add(self, event: OrderSnapshot | FillDelta) -> None:
+        if event.ts_ms:
+            self.last_ts_ms = max(self.last_ts_ms, event.ts_ms)
+        match event:
+            case OrderSnapshot():
+                if event.status.terminal:
+                    self.last_status = event.status
+                if event.filled_size > 0:
+                    self.filled_qty = event.filled_size
+                    if event.avg_fill_price is not None:
+                        self.weighted_price_sum = event.filled_size * event.avg_fill_price
+            case FillDelta():
+                if event.terminal_status is not None:
+                    self.last_status = event.terminal_status
+                # FillDelta adapter invariant: qty > 0 (non-fills dropped at source).
+                self.filled_qty += event.qty
+                self.weighted_price_sum += event.qty * event.price
 
     def is_complete(self, requested_qty: Decimal) -> bool:
         # Terminal status = no more fills coming (filled / canceled /
@@ -252,13 +251,13 @@ class TakerTakerArbitrage(BaseStrategy):
 
     # ---- fill event handling ----
 
-    def _on_fill(self, info: OrderInfo) -> None:
+    def _on_fill(self, event: OrderSnapshot | FillDelta) -> None:
         # Drop fills for cids we didn't pre-register (stale orders, other
         # sessions on the same account).
-        cid = info.client_id
+        cid = event.client_id
         if not cid or cid not in self._fill_events:
             return
-        self._fill_acc.setdefault(cid, _FillAccumulator()).add(info)
+        self._fill_acc.setdefault(cid, _FillAccumulator()).add(event)
         self._fill_events[cid].set()
 
     async def _await_fill(

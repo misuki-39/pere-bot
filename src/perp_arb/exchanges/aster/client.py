@@ -17,10 +17,11 @@ from ...core.exchange import (
     QuoteCallback,
 )
 from ...core.types import (
+    FillDelta,
     MarketInfo,
     OrderBook,
-    OrderInfo,
     OrderResult,
+    OrderSnapshot,
     OrderStatus,
     Position,
     Quote,
@@ -195,9 +196,9 @@ class AsterClient(BaseExchange):
             status=_ASTER_STATUS_MAP.get(r["status"], OrderStatus.CANCELED),
         )
 
-    async def get_order(self, market: MarketInfo, order_id: str) -> OrderInfo:
+    async def get_order(self, market: MarketInfo, order_id: str) -> OrderSnapshot:
         r = await self.rest.get_order(str(market.contract_id), order_id)
-        return OrderInfo(
+        return OrderSnapshot(
             order_id=str(r["orderId"]),
             client_id=r.get("clientOrderId"),
             symbol=market.symbol,
@@ -245,29 +246,26 @@ class AsterClient(BaseExchange):
         cbs = self._fill_cbs.get(raw_symbol)
         if not cbs:
             return
-        # `l` / `L` = THIS event's fill delta + price (Binance-fork
-        # convention). The accumulator does `+=`, so we feed deltas, not
-        # the cumulative `z` / `ap` (which would double-count multi-event
-        # orders). Non-fill events (NEW status) carry l=0 and are filtered
-        # by the accumulator's size>0 guard.
+        # `l` / `L` = THIS event's per-fill delta (Binance-fork convention).
+        # Non-fill events (NEW / pure-CANCELED) carry l=0 and are dropped at
+        # the source — the accumulator only sees real fills, so its
+        # `+=` semantics need no defensive size>0 guard.
         last_qty = Decimal(o["l"]) if o.get("l") else Decimal("0")
-        last_price = Decimal(o["L"]) if o.get("L") else None
-        info = OrderInfo(
-            order_id=str(o["i"]),
-            client_id=o.get("c"),
-            symbol=market.symbol,
+        if last_qty <= 0:
+            return
+        status = _ASTER_STATUS_MAP.get(o["X"], OrderStatus.UNKNOWN)
+        delta = FillDelta(
+            qty=last_qty,
+            price=Decimal(o["L"]),
+            # `T` is the trade time on fills; `E` is event time (fallback).
+            ts_ms=int(data.get("T") or data["E"]),
             side=Side.BUY if o["S"] == "BUY" else Side.SELL,
-            size=Decimal(o["q"]),
-            price=Decimal(o["p"]),
-            status=_ASTER_STATUS_MAP.get(o["X"], OrderStatus.UNKNOWN),
-            filled_size=last_qty,
-            avg_fill_price=last_price,
-            # `T` is the trade time (set on fills); `E` is event time
-            # (always present). Prefer T for fill provenance.
-            ts_ms=int(data.get("T") or data.get("E") or 0),
+            client_id=o.get("c"),
+            order_id=str(o["i"]),
+            terminal_status=status if status.terminal else None,
         )
         for cb in cbs:
-            cb(info)
+            cb(delta)
 
     def _handle_account_update(self, data: dict) -> None:
         # Cache + fan-out one Position per known symbol in `a.P[]`. Schema:

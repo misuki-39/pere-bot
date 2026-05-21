@@ -30,8 +30,8 @@ from ...core.exchange import (
 from ...core.types import (
     MarketInfo,
     OrderBook,
-    OrderInfo,
     OrderResult,
+    OrderSnapshot,
     OrderStatus,
     Position,
     Quote,
@@ -291,7 +291,7 @@ class LighterClient(BaseExchange):
             return OrderResult(success=False, order_id=order_id, error_message=err_msg)
         return OrderResult(success=True, order_id=order_id, status=OrderStatus.CANCELED)
 
-    async def get_order(self, market: MarketInfo, order_id: str) -> OrderInfo | None:
+    async def get_order(self, market: MarketInfo, order_id: str) -> OrderSnapshot | None:
         if self._signer is None:
             raise RuntimeError("lighter is in public_only mode — cannot get_order")
         meta = self._meta_by_symbol[market.symbol.raw]
@@ -304,7 +304,7 @@ class LighterClient(BaseExchange):
         )
         for o in resp.orders:
             if str(o.order_index) == str(order_id):
-                return OrderInfo(
+                return OrderSnapshot(
                     order_id=str(o.order_index),
                     client_id=None,
                     symbol=market.symbol,
@@ -381,23 +381,15 @@ class LighterClient(BaseExchange):
             cb(pos)
 
     def _handle_order_update(self, o: dict[str, Any]) -> None:
-        market_index = o.get("market_index")
-        if market_index is None:
-            return
-        raw_symbol = self._symbol_by_market_index.get(int(market_index))
+        raw_symbol = self._symbol_by_market_index.get(int(o["market_index"]))
         if raw_symbol is None:
             return
         cbs = self._fill_cbs.get(raw_symbol)
         if not cbs:
             return
-        meta = self._meta_by_symbol[raw_symbol]
-        try:
-            info = _order_to_orderinfo(o, meta.symbol)
-        except (KeyError, ValueError, ArithmeticError) as e:
-            _log.warning("lighter order parse failed (%s): %s", e, o)
-            return
+        snap = _order_to_snapshot(o, self._meta_by_symbol[raw_symbol].symbol)
         for cb in cbs:
-            cb(info)
+            cb(snap)
 
 
 def _worst_acceptable_price(q: Quote | None, is_ask: bool) -> Decimal:
@@ -462,27 +454,22 @@ def _account_orders_status(s: str) -> OrderStatus:
     return OrderStatus.UNKNOWN
 
 
-def _order_to_orderinfo(o: dict[str, Any], symbol: Symbol) -> OrderInfo:
+def _order_to_snapshot(o: dict[str, Any], symbol: Symbol) -> OrderSnapshot:
     """Parse one entry of an `account_market.orders` array. `filled_base`
-    and `filled_quote` are cumulative across the order's lifetime; derive
-    avg fill price as quote/base when filled_base > 0. `transaction_time`
-    is the matching-engine timestamp in MICROSECONDS — divide by 1000 for
-    epoch ms to match other venues' fill_ts_ms semantics."""
-    filled_base = Decimal(str(o.get("filled_base_amount", "0") or "0"))
-    filled_quote = Decimal(str(o.get("filled_quote_amount", "0") or "0"))
+    and `filled_quote` are cumulative; avg = quote / base when base > 0.
+    `transaction_time` is microseconds (lighter convention) → /1000 for ms."""
+    filled_base = Decimal(o["filled_base_amount"])
+    filled_quote = Decimal(o["filled_quote_amount"])
     avg_price = (filled_quote / filled_base) if filled_base > 0 else None
-    txn_time_us = o.get("transaction_time")
-    ts_ms = int(int(txn_time_us) // 1000) if txn_time_us else 0
-    return OrderInfo(
-        order_id=str(o.get("order_id") or o.get("order_index") or ""),
+    return OrderSnapshot(
+        order_id=str(o.get("order_id") or o["order_index"]),
         client_id=str(o["client_order_id"]),
         symbol=symbol,
-        side=Side.SELL if o.get("is_ask") else Side.BUY,
-        size=Decimal(str(o.get("initial_base_amount", "0") or "0")),
-        price=Decimal(str(o.get("price", "0") or "0")),
-        status=_account_orders_status(o.get("status", "")),
+        side=Side.SELL if o["is_ask"] else Side.BUY,
+        size=Decimal(o["initial_base_amount"]),
+        price=Decimal(o["price"]),
+        status=_account_orders_status(o["status"]),
         filled_size=filled_base,
         avg_fill_price=avg_price,
-        ts_ms=ts_ms,
-        cumulative=True,
+        ts_ms=int(o["transaction_time"]) // 1000,
     )

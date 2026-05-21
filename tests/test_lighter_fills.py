@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from perp_arb.core.types import OrderInfo, OrderStatus, Position, Side, Symbol
+from perp_arb.core.types import OrderSnapshot, OrderStatus, Position, Side, Symbol
 from perp_arb.exchanges.lighter.client import LighterClient, _MarketMeta
 
 
@@ -79,7 +79,7 @@ def _position() -> dict:
 
 def test_order_open_dispatches_orderinfo_with_open_status() -> None:
     c = _client()
-    received: list[OrderInfo] = []
+    received: list[OrderSnapshot] = []
     c._fill_cbs["WTI"].append(received.append)
 
     c._on_market_event({"orders": [_order_open()], "position": None})
@@ -98,7 +98,7 @@ def test_order_open_dispatches_orderinfo_with_open_status() -> None:
 def test_order_filled_dispatches_with_cumulative_avg_price() -> None:
     """avg_fill_price = filled_quote / filled_base (cumulative semantics)."""
     c = _client()
-    received: list[OrderInfo] = []
+    received: list[OrderSnapshot] = []
     c._fill_cbs["WTI"].append(received.append)
 
     c._on_market_event({"orders": [_order_filled()], "position": None})
@@ -107,12 +107,11 @@ def test_order_filled_dispatches_with_cumulative_avg_price() -> None:
     assert info.status is OrderStatus.FILLED
     assert info.filled_size == Decimal("0.100")
     assert info.avg_fill_price == Decimal("100.712")    # 10.0712 / 0.1
-    assert info.cumulative is True
 
 
 def test_order_with_unknown_market_index_drops() -> None:
     c = _client()
-    received: list[OrderInfo] = []
+    received: list[OrderSnapshot] = []
     c._fill_cbs["WTI"].append(received.append)
 
     o = _order_open()
@@ -125,7 +124,7 @@ def test_order_with_unknown_market_index_drops() -> None:
 def test_canceled_expired_maps_to_expired_status() -> None:
     """`canceled-expired` is semantically EXPIRED, not CANCELED."""
     c = _client()
-    received: list[OrderInfo] = []
+    received: list[OrderSnapshot] = []
     c._fill_cbs["WTI"].append(received.append)
 
     o = _order_open()
@@ -138,7 +137,7 @@ def test_canceled_expired_maps_to_expired_status() -> None:
 def test_canceled_variants_collapse_to_canceled() -> None:
     """`canceled-post-only` / `canceled-reduce-only` → CANCELED."""
     c = _client()
-    received: list[OrderInfo] = []
+    received: list[OrderSnapshot] = []
     c._fill_cbs["WTI"].append(received.append)
 
     for variant in ("canceled", "canceled-post-only", "canceled-reduce-only"):
@@ -178,7 +177,7 @@ def test_position_null_does_not_route() -> None:
 def test_orders_and_position_in_one_frame_both_route() -> None:
     """Snapshot frame can carry both; each goes to its own cb list."""
     c = _client()
-    orders: list[OrderInfo] = []
+    orders: list[OrderSnapshot] = []
     positions: list[Position] = []
     c._fill_cbs["WTI"].append(orders.append)
     c._position_cbs["WTI"].append(positions.append)

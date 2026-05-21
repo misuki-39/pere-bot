@@ -7,10 +7,11 @@ from collections.abc import Callable
 from decimal import Decimal
 
 from .types import (
+    FillDelta,
     MarketInfo,
     OrderBook,
-    OrderInfo,
     OrderResult,
+    OrderSnapshot,
     Position,
     Quote,
     Side,
@@ -18,7 +19,9 @@ from .types import (
 
 QuoteCallback = Callable[[Quote], None]
 OrderBookCallback = Callable[[OrderBook], None]
-OrderUpdateCallback = Callable[[OrderInfo], None]
+# Either a cumulative-state snapshot (lighter account_market.orders,
+# aster REST get_order) or a per-fill delta (aster ORDER_TRADE_UPDATE).
+OrderUpdateCallback = Callable[[OrderSnapshot | FillDelta], None]
 PositionCallback = Callable[[Position], None]
 
 
@@ -60,7 +63,7 @@ class BaseExchange(ABC):
     async def get_position(self, market: MarketInfo) -> Position: ...
 
     @abstractmethod
-    async def get_order(self, market: MarketInfo, order_id: str) -> OrderInfo | None: ...
+    async def get_order(self, market: MarketInfo, order_id: str) -> OrderSnapshot | None: ...
 
     @abstractmethod
     def subscribe_quotes(self, market: MarketInfo, cb: QuoteCallback) -> None:

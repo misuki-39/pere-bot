@@ -134,8 +134,12 @@ class OrderResult:
 
 
 @dataclass(slots=True)
-class OrderInfo:
-    """Live order state as observed via REST poll or WS stream."""
+class OrderSnapshot:
+    """Cumulative order-state observation: REST poll or per-order WS snapshot
+    (lighter `account_market.orders`, aster REST `get_order`).
+
+    Semantics: `filled_size` / `avg_fill_price` are the order's RUNNING TOTALS
+    at this instant. Consumer overwrites, never accumulates."""
 
     order_id: str
     client_id: str | None
@@ -147,12 +151,26 @@ class OrderInfo:
     filled_size: Decimal = Decimal("0")
     avg_fill_price: Decimal | None = None
     ts_ms: int = 0
-    # True when `filled_size` / `avg_fill_price` are cumulative ORDER totals
-    # (lighter `account_orders.filled_base_amount`); False when they are
-    # PER-FILL deltas (aster `l`/`L`, lighter `account_all.trades`). The
-    # `_FillAccumulator` overwrites on cumulative events, accumulates on
-    # deltas — feeding cumulative values to the delta path double-counts.
-    cumulative: bool = False
+
+
+@dataclass(slots=True)
+class FillDelta:
+    """Per-fill execution event: aster `ORDER_TRADE_UPDATE` `l`/`L` field.
+
+    Each `FillDelta` represents ONE individual fill. Consumer sums them.
+    Adapters MUST only construct this when `qty > 0` — empty events
+    (NEW status, etc.) are non-emissions, not zero-qty deltas."""
+
+    qty: Decimal
+    price: Decimal
+    ts_ms: int
+    side: Side | None = None
+    client_id: str | None = None
+    order_id: str | None = None
+    # Carried so the accumulator can short-circuit waits when the venue
+    # confirms the parent order is settled (FILLED / CANCELED / REJECTED /
+    # EXPIRED). None when this delta isn't terminal.
+    terminal_status: OrderStatus | None = None
 
 
 @dataclass(slots=True)

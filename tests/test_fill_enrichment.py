@@ -26,7 +26,14 @@ from perp_arb.core.exec_record import (
     _decision_header,
     _leg_header,
 )
-from perp_arb.core.types import OrderInfo, OrderResult, OrderStatus, Side, Symbol
+from perp_arb.core.types import (
+    FillDelta,
+    OrderResult,
+    OrderSnapshot,
+    OrderStatus,
+    Side,
+    Symbol,
+)
 from perp_arb.strategy.taker_taker import _FillAccumulator, _leg_report_with_fill
 
 _SYM = Symbol(exchange="aster", raw="CLUSDT", base="WTI", quote="USDT")
@@ -34,104 +41,88 @@ _SYM = Symbol(exchange="aster", raw="CLUSDT", base="WTI", quote="USDT")
 
 # ---- _FillAccumulator --------------------------------------------------
 
-def _fill_info(size: str, price: str, ts: int, *, client_id: str = "x") -> OrderInfo:
-    """A trade-stream OrderInfo: per-fill delta, status UNKNOWN (a single
-    trade doesn't mean the whole order is filled)."""
-    return OrderInfo(
-        order_id="t-1",
-        client_id=client_id,
-        symbol=_SYM,
-        side=Side.BUY,
-        size=Decimal(size),
-        price=Decimal(price),
-        status=OrderStatus.UNKNOWN,
-        filled_size=Decimal(size),
-        avg_fill_price=Decimal(price),
-        ts_ms=ts,
-        cumulative=False,
+def _delta(qty: str, price: str, ts: int, *, client_id: str = "x",
+           terminal: OrderStatus | None = None) -> FillDelta:
+    return FillDelta(
+        qty=Decimal(qty), price=Decimal(price), ts_ms=ts,
+        side=Side.BUY, client_id=client_id,
+        terminal_status=terminal,
     )
 
 
-def _order_info(
-    *, filled: str, avg: str, status: OrderStatus, ts: int = 0,
-    client_id: str = "x",
-) -> OrderInfo:
-    """An account_orders OrderInfo: cumulative qty + price, authoritative status."""
-    return OrderInfo(
-        order_id="o-1",
-        client_id=client_id,
-        symbol=_SYM,
-        side=Side.BUY,
-        size=Decimal("0"),
-        price=Decimal("0"),
+def _snapshot(*, filled: str, avg: str, status: OrderStatus, ts: int = 0,
+              client_id: str = "x") -> OrderSnapshot:
+    return OrderSnapshot(
+        order_id="o-1", client_id=client_id, symbol=_SYM, side=Side.BUY,
+        size=Decimal("1.0"), price=Decimal("100"),
         status=status,
         filled_size=Decimal(filled),
         avg_fill_price=Decimal(avg) if avg else None,
         ts_ms=ts,
-        cumulative=True,
     )
 
 
-def test_accumulator_single_fill() -> None:
+def test_accumulator_single_delta() -> None:
     acc = _FillAccumulator()
-    acc.add(_fill_info("1.0", "100.00", ts=1000))
+    acc.add(_delta("1.0", "100.00", ts=1000))
     assert acc.filled_qty == Decimal("1.0")
-    assert acc.avg_price == Decimal("100.00")
+    assert acc.weighted_price_sum / acc.filled_qty == Decimal("100.00")
     assert acc.last_ts_ms == 1000
 
 
-def test_accumulator_aggregates_partials_size_weighted() -> None:
+def test_accumulator_aggregates_partial_deltas() -> None:
     """Two partial fills at different prices → size-weighted avg, latest ts."""
     acc = _FillAccumulator()
-    acc.add(_fill_info("0.4", "100.00", ts=1000))
-    acc.add(_fill_info("0.6", "100.10", ts=1050))
+    acc.add(_delta("0.4", "100.00", ts=1000))
+    acc.add(_delta("0.6", "100.10", ts=1050))
     assert acc.filled_qty == Decimal("1.0")
     # (0.4 * 100.00 + 0.6 * 100.10) / 1.0 = 100.06
-    assert acc.avg_price == Decimal("100.06")
-    assert acc.last_ts_ms == 1050  # "fill complete" = last partial
-
-
-def test_accumulator_ignores_zero_or_negative_size() -> None:
-    """Defensive: malformed WS event shouldn't poison the accumulator."""
-    acc = _FillAccumulator()
-    acc.add(_fill_info("0", "100.00", ts=1000))
-    assert acc.filled_qty == Decimal("0")
+    assert acc.weighted_price_sum / acc.filled_qty == Decimal("100.06")
+    assert acc.last_ts_ms == 1050
 
 
 def test_accumulator_complete_via_terminal_status() -> None:
     """FILLED status from account_orders short-circuits the qty check."""
     acc = _FillAccumulator()
-    acc.add(_order_info(filled="0.4", avg="100.00", status=OrderStatus.OPEN))
+    acc.add(_snapshot(filled="0.4", avg="100.00", status=OrderStatus.OPEN))
     assert not acc.is_complete(Decimal("1.0"))
-    acc.add(_order_info(filled="1.0", avg="100.05", status=OrderStatus.FILLED))
+    acc.add(_snapshot(filled="1.0", avg="100.05", status=OrderStatus.FILLED))
     assert acc.is_complete(Decimal("1.0"))
 
 
-def test_accumulator_complete_on_cancel_too() -> None:
-    """Cancel means no more fills — caller stops waiting promptly."""
+def test_accumulator_complete_on_cancel_with_partial_fill() -> None:
+    """Cancel after a partial fill — terminal status short-circuits the wait."""
     acc = _FillAccumulator()
-    acc.add(_order_info(filled="0", avg="", status=OrderStatus.CANCELED))
-    assert acc.is_complete(Decimal("1.0"))   # terminal, even though 0 filled
-    assert acc.filled_qty == Decimal("0")
+    acc.add(_snapshot(filled="0.3", avg="100.00", status=OrderStatus.CANCELED))
+    assert acc.is_complete(Decimal("1.0"))
+    assert acc.filled_qty == Decimal("0.3")
 
 
 def test_accumulator_qty_fallback_when_status_absent() -> None:
-    """Trade-only path (no orders stream): qty comparison must be exact."""
+    """Trade-delta only path (no snapshot stream): exact qty comparison."""
     acc = _FillAccumulator()
-    acc.add(_fill_info("0.9995", "100", ts=1))
-    assert not acc.is_complete(Decimal("1.0"))   # no slack anymore
-    acc.add(_fill_info("0.0005", "100", ts=2))
+    acc.add(_delta("0.9995", "100", ts=1))
+    assert not acc.is_complete(Decimal("1.0"))
+    acc.add(_delta("0.0005", "100", ts=2))
     assert acc.is_complete(Decimal("1.0"))
 
 
-def test_accumulator_cumulative_overwrites_delta() -> None:
-    """Trade delta arrives first; orders cumulative arrives second and wins."""
+def test_accumulator_snapshot_overwrites_delta() -> None:
+    """Trade delta arrives first; snapshot arrives second and wins on qty/price.
+    ts is taken from whichever event carries it (delta does, snapshot may not)."""
     acc = _FillAccumulator()
-    acc.add(_fill_info("0.4", "100.00", ts=1000))     # delta
-    acc.add(_order_info(filled="1.0", avg="100.06", status=OrderStatus.FILLED))
+    acc.add(_delta("0.4", "100.00", ts=1000))
+    acc.add(_snapshot(filled="1.0", avg="100.06", status=OrderStatus.FILLED))
     assert acc.filled_qty == Decimal("1.0")
-    assert acc.avg_price == Decimal("100.06")
-    assert acc.last_ts_ms == 1000   # ts preserved from trade event
+    assert acc.weighted_price_sum / acc.filled_qty == Decimal("100.06")
+    assert acc.last_ts_ms == 1000
+
+
+def test_accumulator_delta_terminal_status_propagates() -> None:
+    """Aster's final FILLED delta carries terminal_status → is_complete True."""
+    acc = _FillAccumulator()
+    acc.add(_delta("1.0", "100.00", ts=1, terminal=OrderStatus.FILLED))
+    assert acc.is_complete(Decimal("2.0"))   # filled < requested but status terminal
 
 
 # ---- _leg_report_with_fill --------------------------------------------
@@ -168,7 +159,7 @@ def test_leg_report_prefers_ws_fill_over_rest_when_both_present() -> None:
     qty, and ts. (REST values may be stale or partial.)"""
     rest = _rest_ok(avg_price="100.00", exchange_ts=1_700_000_000_000)
     acc = _FillAccumulator()
-    acc.add(_fill_info("1.0", "100.05", ts=1_700_000_000_500))
+    acc.add(_delta("1.0", "100.05", ts=1_700_000_000_500))
     leg = _leg_report_with_fill(
         venue="aster", side=Side.BUY, qty=Decimal("1.0"),
         expected=Decimal("99.95"), rest=rest, latency_ms=50, fill=acc,
@@ -202,7 +193,7 @@ def test_leg_report_lighter_path_only_ws_data_available() -> None:
         exchange_ts_ms=None,
     )
     acc = _FillAccumulator()
-    acc.add(_fill_info("1.0", "100.20", ts=1_700_000_001_000))
+    acc.add(_delta("1.0", "100.20", ts=1_700_000_001_000))
     leg = _leg_report_with_fill(
         venue="lighter", side=Side.SELL, qty=Decimal("1.0"),
         expected=Decimal("100.25"), rest=rest, latency_ms=200, fill=acc,
