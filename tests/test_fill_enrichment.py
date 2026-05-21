@@ -55,7 +55,6 @@ def test_accumulator_single_fill() -> None:
     assert acc.filled_qty == Decimal("1.0")
     assert acc.avg_price == Decimal("100.00")
     assert acc.last_ts_ms == 1000
-    assert acc.fills_count == 1
 
 
 def test_accumulator_aggregates_partials_size_weighted() -> None:
@@ -67,14 +66,12 @@ def test_accumulator_aggregates_partials_size_weighted() -> None:
     # (0.4 * 100.00 + 0.6 * 100.10) / 1.0 = 100.06
     assert acc.avg_price == Decimal("100.06")
     assert acc.last_ts_ms == 1050  # "fill complete" = last partial
-    assert acc.fills_count == 2
 
 
 def test_accumulator_ignores_zero_or_negative_size() -> None:
     """Defensive: malformed WS event shouldn't poison the accumulator."""
     acc = _FillAccumulator()
     acc.add(_fill_info("0", "100.00", ts=1000))
-    assert acc.fills_count == 0
     assert acc.filled_qty == Decimal("0")
 
 

@@ -127,12 +127,7 @@ class TakerTakerBT(BacktestStrategy):
         # decay over `throttle_halflife_s` (handled at top-of-tick).
         if self._throttle_enabled:
             target = self._bump_a if d.direction is Direction.A else self._bump_b
-            current = target.value if target.value is not None else Decimal(0)
-            # Seed the EWMA so it actually carries non-zero state forward; we
-            # bypass the standard update (which would average toward current)
-            # because we want a hard "set" semantic.
-            target.value = current + self._throttle_bump_bps
-            target._last_ts_ms = snap.ts_ms
+            target.bump(self._throttle_bump_bps, snap.ts_ms)
 
         # Track this decision for the in-flight cap.
         if self._inflight_cap > 0:

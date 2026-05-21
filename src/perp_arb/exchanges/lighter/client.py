@@ -374,18 +374,9 @@ class LighterClient(BaseExchange):
             cb(pos)
 
     def _handle_trade(self, t: dict[str, Any]) -> None:
-        """One filled trade from the account_all stream. Disambiguates which
-        side of the match is ours via `account_id` and emits an `OrderInfo`
-        to all registered `subscribe_fills` callbacks.
-
-        Trade schema source: lighter-sdk `models/trade.py`. The two fields
-        we depend on are:
-          - `ask_account_id` / `bid_account_id`: integer account indices,
-            one of which == `self.account_index` for any trade pushed to us
-          - `ask_client_id` / `bid_client_id`: the `client_order_index` we
-            passed in at submit time, surfaced for the matching side
-          - `timestamp`: server-side fill time (ms since epoch)
-        """
+        """Emit one fill to subscribers, disambiguating our side of the
+        match via `ask_account_id` / `bid_account_id`. Schema: lighter-sdk
+        `models/trade.py`."""
         raw_symbol = self._symbol_by_market_index.get(int(t["market_id"]))
         if raw_symbol is None:
             return

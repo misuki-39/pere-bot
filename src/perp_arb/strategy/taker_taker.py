@@ -73,22 +73,13 @@ class SyntheticPosition:
 
 @dataclass(slots=True)
 class _FillAccumulator:
-    """Aggregates per-`client_id` fill events from `subscribe_fills`.
-
-    A single market-IOC order can match against multiple resting levels,
-    producing several trade events. We accumulate them so the LegReport
-    reflects the *whole* order: total filled qty, size-weighted avg price,
-    and the timestamp of the LAST partial (= "fill complete" instant).
-
-    `is_complete()` uses a 0.1% slack to absorb rounding between the
-    base_multiplier-encoded venue numbers and our Decimal arithmetic.
-    """
+    """Per-`client_id` aggregate of fill events. A market-IOC order can match
+    several resting levels, so the LegReport needs size-weighted-avg price
+    and the timestamp of the LAST partial across all of them."""
 
     filled_qty: Decimal = Decimal("0")
     weighted_price_sum: Decimal = Decimal("0")
     last_ts_ms: int = 0
-    fills_count: int = 0
-    last_order_id: str | None = None
 
     def add(self, info: OrderInfo) -> None:
         size = info.filled_size or info.size or Decimal("0")
@@ -99,11 +90,10 @@ class _FillAccumulator:
         self.weighted_price_sum += size * price
         if info.ts_ms:
             self.last_ts_ms = max(self.last_ts_ms, info.ts_ms)
-        self.fills_count += 1
-        if info.order_id:
-            self.last_order_id = info.order_id
 
     def is_complete(self, requested_qty: Decimal) -> bool:
+        # 0.1 % slack absorbs base_multiplier rounding on lighter; a true
+        # underfill larger than that surfaces as `filled_qty < requested`.
         return self.filled_qty >= requested_qty * Decimal("0.999")
 
     @property
@@ -111,13 +101,6 @@ class _FillAccumulator:
         if self.filled_qty <= 0:
             return None
         return self.weighted_price_sum / self.filled_qty
-
-
-async def _none_async() -> _FillAccumulator | None:
-    """Stand-in for `_await_fill` when the corresponding REST submit failed
-    — there's no fill coming, so the gather slot must still return None
-    without blocking."""
-    return None
 
 
 def _leg_report_with_fill(
@@ -129,19 +112,11 @@ def _leg_report_with_fill(
     latency_ms: int | None,
     fill: _FillAccumulator | None,
 ) -> LegReport:
-    """Build a LegReport that merges the REST submit response with the
-    authoritative WS fill data when available.
-
-    Resolution priority:
-      * `filled_qty`, `realized_price`, `fill_ts_ms`: use WS fill data
-        when it arrived (more authoritative — the matching engine's view),
-        otherwise fall back to REST (works for aster; lighter REST has
-        neither so the LegReport stays "None" if the fill timed out).
-      * Everything else (`order_id`, `client_id`, `status`, `error`,
-        `latency_ms`) comes from REST, which always exists.
-    """
+    """LegReport built from REST + (when present) the authoritative WS fill —
+    WS wins on filled_qty / realized_price / fill_ts_ms; REST supplies the
+    rest (and is the only source for lighter when the WS event never lands)."""
     leg = LegReport.from_result(venue, side, qty, expected, rest, latency_ms)
-    if fill is not None and fill.fills_count > 0:
+    if fill is not None and fill.filled_qty > 0:
         leg.filled_qty = fill.filled_qty
         leg.realized_price = fill.avg_price
         leg.fill_ts_ms = fill.last_ts_ms or leg.fill_ts_ms
@@ -208,20 +183,14 @@ class TakerTakerArbitrage(BaseStrategy):
         self._inflight_cap = int(opt.in_flight_cap_per_direction)
         self._inflight_dir: dict[str, Direction] = {}
 
-        # Fill event tracking. `subscribe_fills` callbacks on both venues
-        # push `OrderInfo` updates into these dicts keyed by `client_id`.
-        # `_fire` registers an Event before submitting each leg, then awaits
-        # the Event with a timeout so the LegReport can be enriched with
-        # the authoritative server-side fill price + fill_ts_ms.
-        #   - aster: REST place_order already returns avg_price + transactTime
-        #     synchronously; the WS fill event is a redundant confirmation.
-        #   - lighter: REST place_order returns only submit-ack — the WS fill
-        #     event is the ONLY source of realized_price + fill_ts_ms.
+        # Per-`client_id` fill-event slots. Pre-registered in `_fire` BEFORE
+        # the REST submit, so a fast aster fill can't race past the
+        # registration and be dropped by `_on_fill`'s unknown-cid guard.
+        # Lighter's REST returns submit-ack only, so the WS fill event is
+        # the ONLY source of realized_price + fill_ts_ms for that leg.
         self._fill_events: dict[str, asyncio.Event] = {}
         self._fill_acc: dict[str, _FillAccumulator] = {}
-        # How long to wait per leg for the fill WS event to arrive. Picked
-        # generously: lighter sequencer normally confirms within <1 s; 5 s
-        # absorbs the long tail without stalling the strategy indefinitely.
+        # 5 s comfortably absorbs lighter sequencer's long tail (typical <1 s).
         self._fill_wait_timeout_s = 5.0
 
         if markout.direction_A or markout.direction_B:
@@ -250,9 +219,6 @@ class TakerTakerArbitrage(BaseStrategy):
         self._aster().subscribe_book(self._aster_market(), lambda _b: self._schedule_eval())
         self._lighter().subscribe_book(self._lighter_market(), lambda _b: self._schedule_eval())
 
-        # Subscribe to authoritative fill events. Mode is irrelevant here:
-        # in PAPER no real orders fire so callbacks never trigger; in LIVE
-        # they backfill LegReport with server-side fill price + ts.
         if self.cfg.strategy.mode is RunMode.LIVE:
             self._aster().subscribe_fills(self._aster_market(), self._on_fill)
             self._lighter().subscribe_fills(self._lighter_market(), self._on_fill)
@@ -266,42 +232,27 @@ class TakerTakerArbitrage(BaseStrategy):
     # ---- fill event handling ----
 
     def _on_fill(self, info: OrderInfo) -> None:
-        """Callback for `subscribe_fills` on both venues. Routes the fill to
-        the accumulator keyed by `client_id` and signals waiting `_fire`.
-
-        Fill events arriving for a `client_id` we don't have a registered
-        Event for are silently dropped (e.g. fills from a previous run on
-        the same account, or a stale order canceled by the venue). This is
-        intentional — only OUR active legs should consume Event slots.
-        """
+        # Drop fills for cids we didn't pre-register (stale orders, other
+        # sessions on the same account).
         cid = info.client_id
         if not cid or cid not in self._fill_events:
             return
-        acc = self._fill_acc.setdefault(cid, _FillAccumulator())
-        acc.add(info)
-        # Wake `_await_fill` whenever a fill lands; the accumulator state is
-        # checked there. Multiple partial fills will repeatedly set the
-        # Event, which is idempotent.
+        self._fill_acc.setdefault(cid, _FillAccumulator()).add(info)
         self._fill_events[cid].set()
 
     async def _await_fill(
         self, client_id: str, requested_qty: Decimal,
     ) -> _FillAccumulator | None:
-        """Block up to `_fill_wait_timeout_s` for one OR MORE fill events
-        whose accumulated qty meets `requested_qty`. Returns the (possibly
-        partial) accumulator regardless of completion so the caller can
-        log what landed; returns None only when no events at all arrived.
-        Always cleans up the Event + accumulator slots before returning.
-        """
+        """Wait up to `_fill_wait_timeout_s` for accumulated fills to reach
+        `requested_qty`. Returns whatever landed (None if no events at all)
+        and unconditionally releases the slot."""
         ev = self._fill_events.get(client_id)
+        if ev is None:
+            return None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._fill_wait_timeout_s
         try:
-            if ev is None:
-                return None
-            deadline = asyncio.get_event_loop().time() + self._fill_wait_timeout_s
-            while True:
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0:
-                    break
+            while (remaining := deadline - loop.time()) > 0:
                 try:
                     await asyncio.wait_for(ev.wait(), timeout=remaining)
                 except TimeoutError:
@@ -309,7 +260,6 @@ class TakerTakerArbitrage(BaseStrategy):
                 acc = self._fill_acc.get(client_id)
                 if acc and acc.is_complete(requested_qty):
                     return acc
-                # Reset for the next partial fill.
                 ev.clear()
             return self._fill_acc.get(client_id)
         finally:
@@ -469,64 +419,46 @@ class TakerTakerArbitrage(BaseStrategy):
         _log.info("[%s] FIRE qty=%s aster=%s lighter=%s mode=%s",
                   d.decision_id, qty, a_side, l_side, self.cfg.strategy.mode)
 
-        # Track in-flight before send so the slot is held even across an
-        # await. Released in the `finally` below regardless of outcome
-        # (success, partial, both-fail).
         if self._inflight_cap > 0:
             self._inflight_dir[d.decision_id] = d.direction
 
-        # Pre-register fill watchers BEFORE submitting so a fast fill event
-        # (esp. from aster) cannot race ahead of our registration and be
-        # dropped by `_on_fill`'s "unknown client_id" guard. Live mode only;
-        # paper has no real WS fills.
         aster_cid = f"{d.decision_id}-a"
         lighter_cid = f"{d.decision_id}-l"
         is_live = self.cfg.strategy.mode is RunMode.LIVE
-        if is_live:
-            self._fill_events[aster_cid] = asyncio.Event()
-            self._fill_events[lighter_cid] = asyncio.Event()
 
         try:
+            if is_live:
+                # Register fill slots BEFORE submit so a fast aster fill
+                # can't race past `_on_fill`'s unknown-cid guard.
+                self._fill_events[aster_cid] = asyncio.Event()
+                self._fill_events[lighter_cid] = asyncio.Event()
+
             d.timeline.mark(Phase.SEND)
             d.send_ts_ms = now_ms()
             if self.cfg.strategy.mode is RunMode.PAPER:
                 ra, rl = self._paper_fill(a_side, l_side, qty)
                 d.timeline.mark("result_aster")
                 d.timeline.mark("result_lighter")
+                aster_fill: _FillAccumulator | None = None
+                lighter_fill: _FillAccumulator | None = None
             else:
-                async def _leg(coro, venue: str) -> OrderResult:
-                    r = await coro
-                    d.timeline.mark(f"result_{venue}")  # this leg's own fill instant
-                    return r
-                ra, rl = await asyncio.gather(
-                    _leg(self._aster().place_market_order(
+                async def _submit_and_await(
+                    place_coro, venue: str, cid: str,
+                ) -> tuple[OrderResult, _FillAccumulator | None]:
+                    r = await place_coro
+                    d.timeline.mark(f"result_{venue}")
+                    fill = await self._await_fill(cid, qty) if r.success else None
+                    return r, fill
+
+                (ra, aster_fill), (rl, lighter_fill) = await asyncio.gather(
+                    _submit_and_await(self._aster().place_market_order(
                         self._aster_market(), a_side, qty, client_id=aster_cid),
-                        "aster"),
-                    _leg(self._lighter().place_market_order(
+                        "aster", aster_cid),
+                    _submit_and_await(self._lighter().place_market_order(
                         self._lighter_market(), l_side, qty, client_id=lighter_cid),
-                        "lighter"),
+                        "lighter", lighter_cid),
                 )
             d.timeline.mark(Phase.RESULT)
-
-            # In live, await the WS fill events to enrich each LegReport
-            # with the authoritative server-side fill price + ts. For aster
-            # the REST already has them, so the await is a redundancy check
-            # (timeout is non-fatal). For lighter the REST returned only
-            # submit-ack, so the fill event is the only source of price.
-            # When REST already failed, no fill is coming — skip the wait
-            # and just drop the pre-registered slot.
-            aster_fill: _FillAccumulator | None = None
-            lighter_fill: _FillAccumulator | None = None
-            if is_live:
-                aster_wait = (self._await_fill(aster_cid, qty)
-                              if ra.success else _none_async())
-                lighter_wait = (self._await_fill(lighter_cid, qty)
-                                if rl.success else _none_async())
-                aster_fill, lighter_fill = await asyncio.gather(aster_wait, lighter_wait)
-                if not ra.success:
-                    self._drop_fill_slot(aster_cid)
-                if not rl.success:
-                    self._drop_fill_slot(lighter_cid)
 
             lat_a = d.timeline.span(Phase.SEND, "result_aster")
             lat_l = d.timeline.span(Phase.SEND, "result_lighter")
@@ -541,17 +473,11 @@ class TakerTakerArbitrage(BaseStrategy):
                 self._position.lighter += qty * Decimal(l_side.sign)
                 self._risk.record_success(leg_latency_ms=latency or 0)
 
-                # Seed the same-side throttle bump on confirmed FILLED only —
-                # a partial/both-fail decision doesn't actually consume any
-                # edge, so we shouldn't widen the threshold for it.
+                # Seed throttle bump only on confirmed FILLED — a partial /
+                # both-fail consumed no edge.
                 if self._throttle_enabled:
                     target = self._bump_a if d.direction is Direction.A else self._bump_b
-                    current = target.value if target.value is not None else Decimal(0)
-                    # Hard-set (not EWMA-blend) so the bump is exactly Δ on top
-                    # of whatever already-decaying bump remains. The tick-level
-                    # decay in `_assess` is what brings it back toward 0.
-                    target.value = current + self._throttle_bump_bps
-                    target._last_ts_ms = now_ms()
+                    target.bump(self._throttle_bump_bps, now_ms())
 
                 _log.info(
                     "[%s] FILLED aster=%s lighter=%s latency=%sms pos_a=%s pos_l=%s",
@@ -561,23 +487,15 @@ class TakerTakerArbitrage(BaseStrategy):
             else:
                 await self._handle_partial_failure(d, a_side, l_side, qty, ra, rl)
         finally:
-            # Always release the in-flight slot, even on exception. The
-            # `_evaluating` gate elsewhere ensures only one `_fire` runs at
-            # a time so this dict will normally hit 0 entries here.
             if self._inflight_cap > 0:
                 self._inflight_dir.pop(d.decision_id, None)
-            # Belt-and-braces: ensure no fill-event slots leak if `_fire`
-            # raised between pre-register and the `_await_fill` cleanup.
-            # `_await_fill`'s own `finally` covers the happy path; this
-            # covers exceptions before/during gather.
-            if is_live:
-                self._drop_fill_slot(aster_cid)
-                self._drop_fill_slot(lighter_cid)
-
-    def _drop_fill_slot(self, client_id: str) -> None:
-        """Idempotent cleanup of a pre-registered fill watcher slot."""
-        self._fill_events.pop(client_id, None)
-        self._fill_acc.pop(client_id, None)
+            # `_await_fill` cleans up on the happy path; this covers the
+            # short window where Event() registered but REST never reached
+            # `_await_fill` (e.g. failed REST + exception before gather).
+            self._fill_events.pop(aster_cid, None)
+            self._fill_acc.pop(aster_cid, None)
+            self._fill_events.pop(lighter_cid, None)
+            self._fill_acc.pop(lighter_cid, None)
 
     async def _handle_partial_failure(
         self,
