@@ -35,6 +35,8 @@ _SYM = Symbol(exchange="aster", raw="CLUSDT", base="WTI", quote="USDT")
 # ---- _FillAccumulator --------------------------------------------------
 
 def _fill_info(size: str, price: str, ts: int, *, client_id: str = "x") -> OrderInfo:
+    """A trade-stream OrderInfo: per-fill delta, status UNKNOWN (a single
+    trade doesn't mean the whole order is filled)."""
     return OrderInfo(
         order_id="t-1",
         client_id=client_id,
@@ -42,10 +44,31 @@ def _fill_info(size: str, price: str, ts: int, *, client_id: str = "x") -> Order
         side=Side.BUY,
         size=Decimal(size),
         price=Decimal(price),
-        status=OrderStatus.FILLED,
+        status=OrderStatus.UNKNOWN,
         filled_size=Decimal(size),
         avg_fill_price=Decimal(price),
         ts_ms=ts,
+        cumulative=False,
+    )
+
+
+def _order_info(
+    *, filled: str, avg: str, status: OrderStatus, ts: int = 0,
+    client_id: str = "x",
+) -> OrderInfo:
+    """An account_orders OrderInfo: cumulative qty + price, authoritative status."""
+    return OrderInfo(
+        order_id="o-1",
+        client_id=client_id,
+        symbol=_SYM,
+        side=Side.BUY,
+        size=Decimal("0"),
+        price=Decimal("0"),
+        status=status,
+        filled_size=Decimal(filled),
+        avg_fill_price=Decimal(avg) if avg else None,
+        ts_ms=ts,
+        cumulative=True,
     )
 
 
@@ -75,15 +98,40 @@ def test_accumulator_ignores_zero_or_negative_size() -> None:
     assert acc.filled_qty == Decimal("0")
 
 
-def test_accumulator_is_complete_within_tolerance() -> None:
-    """The 0.1 % slack absorbs base_multiplier rounding."""
+def test_accumulator_complete_via_terminal_status() -> None:
+    """FILLED status from account_orders short-circuits the qty check."""
     acc = _FillAccumulator()
-    acc.add(_fill_info("0.9995", "100", ts=1))   # 0.05% short of 1.0
+    acc.add(_order_info(filled="0.4", avg="100.00", status=OrderStatus.OPEN))
+    assert not acc.is_complete(Decimal("1.0"))
+    acc.add(_order_info(filled="1.0", avg="100.05", status=OrderStatus.FILLED))
     assert acc.is_complete(Decimal("1.0"))
 
-    acc2 = _FillAccumulator()
-    acc2.add(_fill_info("0.99", "100", ts=1))   # 1% short — NOT complete
-    assert not acc2.is_complete(Decimal("1.0"))
+
+def test_accumulator_complete_on_cancel_too() -> None:
+    """Cancel means no more fills — caller stops waiting promptly."""
+    acc = _FillAccumulator()
+    acc.add(_order_info(filled="0", avg="", status=OrderStatus.CANCELED))
+    assert acc.is_complete(Decimal("1.0"))   # terminal, even though 0 filled
+    assert acc.filled_qty == Decimal("0")
+
+
+def test_accumulator_qty_fallback_when_status_absent() -> None:
+    """Trade-only path (no orders stream): qty comparison must be exact."""
+    acc = _FillAccumulator()
+    acc.add(_fill_info("0.9995", "100", ts=1))
+    assert not acc.is_complete(Decimal("1.0"))   # no slack anymore
+    acc.add(_fill_info("0.0005", "100", ts=2))
+    assert acc.is_complete(Decimal("1.0"))
+
+
+def test_accumulator_cumulative_overwrites_delta() -> None:
+    """Trade delta arrives first; orders cumulative arrives second and wins."""
+    acc = _FillAccumulator()
+    acc.add(_fill_info("0.4", "100.00", ts=1000))     # delta
+    acc.add(_order_info(filled="1.0", avg="100.06", status=OrderStatus.FILLED))
+    assert acc.filled_qty == Decimal("1.0")
+    assert acc.avg_price == Decimal("100.06")
+    assert acc.last_ts_ms == 1000   # ts preserved from trade event
 
 
 # ---- _leg_report_with_fill --------------------------------------------

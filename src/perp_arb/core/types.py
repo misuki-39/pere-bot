@@ -147,6 +147,12 @@ class OrderInfo:
     filled_size: Decimal = Decimal("0")
     avg_fill_price: Decimal | None = None
     ts_ms: int = 0
+    # True when `filled_size` / `avg_fill_price` are cumulative ORDER totals
+    # (lighter `account_orders.filled_base_amount`); False when they are
+    # PER-FILL deltas (aster `l`/`L`, lighter `account_all.trades`). The
+    # `_FillAccumulator` overwrites on cumulative events, accumulates on
+    # deltas — feeding cumulative values to the delta path double-counts.
+    cumulative: bool = False
 
 
 @dataclass(slots=True)

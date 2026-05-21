@@ -252,19 +252,48 @@ class LighterUserWs:
         base_url: str,
         account_index: int,
         auth_token_factory: AuthTokenFactory | None = None,
+        subscribe_account_all: bool = True,
     ) -> None:
         self.ws_url = _ws_url(base_url)
         self.account_index = account_index
         self._auth_token_factory = auth_token_factory
+        self._subscribe_account_all = subscribe_account_all
         self._stop = asyncio.Event()
         self._connected = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._ws: websockets.ClientConnection | None = None
         self._account_cbs: list[AccountCallback] = []
+        self._market_cbs: list[AccountCallback] = []
+        # Per-market opt-in subs. Recorded so `_run` re-subscribes them on
+        # every reconnect.
+        self._market_channels: list[str] = []
         self._pending_tx: dict[str, asyncio.Future[dict[str, Any]]] = {}
 
     def add_account_callback(self, cb: AccountCallback) -> None:
         self._account_cbs.append(cb)
+
+    def add_market_callback(self, cb: AccountCallback) -> None:
+        self._market_cbs.append(cb)
+
+    async def subscribe_account_market(self, market_index: int) -> None:
+        """Subscribe `account_market/<market>/<account>` — per-market stream
+        bundling positions, orders, trades, and funding. Strict superset
+        of `account_orders` for our purposes (orders carry cumulative qty
+        + status + matching-engine `transaction_time`)."""
+        channel = f"account_market/{market_index}/{self.account_index}"
+        if channel in self._market_channels:
+            return
+        self._market_channels.append(channel)
+        if self._ws is not None and self._connected.is_set():
+            await self._send_subscribe(self._ws, channel)
+
+    async def _send_subscribe(
+        self, ws: websockets.ClientConnection, channel: str,
+    ) -> None:
+        msg = {"type": "subscribe", "channel": channel}
+        if self._auth_token_factory is not None:
+            msg["auth"] = self._auth_token_factory()
+        await ws.send(orjson.dumps(msg).decode())
 
     async def start(self, *, connect_timeout_s: float = 10.0) -> None:
         """Open the WS and wait until the handshake + first subscribe land."""
@@ -320,13 +349,12 @@ class LighterUserWs:
                 ) as ws:
                     self._ws = ws
                     backoff = 1.0
-                    sub_msg = {
-                        "type": "subscribe",
-                        "channel": f"account_all/{self.account_index}",
-                    }
-                    if self._auth_token_factory is not None:
-                        sub_msg["auth"] = self._auth_token_factory()
-                    await ws.send(orjson.dumps(sub_msg).decode())
+                    if self._subscribe_account_all:
+                        await self._send_subscribe(
+                            ws, f"account_all/{self.account_index}",
+                        )
+                    for ch in self._market_channels:
+                        await self._send_subscribe(ws, ch)
                     self._connected.set()
                     async for raw in ws:
                         if self._stop.is_set():
@@ -368,6 +396,9 @@ class LighterUserWs:
                 _log.warning("lighter-user-ws unmatched sendtx reply: %s", raw)
         elif t in ("subscribed/account_all", "update/account_all"):
             for cb in self._account_cbs:
+                cb(data)
+        elif t in ("subscribed/account_market", "update/account_market"):
+            for cb in self._market_cbs:
                 cb(data)
         else:
             _log.debug("lighter-user-ws unhandled frame type=%r", t)

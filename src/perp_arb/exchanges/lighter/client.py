@@ -101,8 +101,9 @@ class LighterClient(BaseExchange):
             base_url=self.base_url,
             account_index=self.account_index,
             auth_token_factory=self._make_auth_token,
+            subscribe_account_all=False,   # account_market is the superset
         )
-        self._user_ws.add_account_callback(self._on_account_event)
+        self._user_ws.add_market_callback(self._on_market_event)
         await self._user_ws.start()
 
     def _make_auth_token(self) -> str:
@@ -149,6 +150,8 @@ class LighterClient(BaseExchange):
             )
             self._meta_by_symbol[raw_symbol] = meta
             self._symbol_by_market_index[meta.market_index] = raw_symbol
+            if self._user_ws is not None:
+                await self._user_ws.subscribe_account_market(meta.market_index)
             return MarketInfo(
                 symbol=symbol,
                 tick_size=tick,
@@ -343,20 +346,20 @@ class LighterClient(BaseExchange):
             )
         return self._api_client
 
-    def _on_account_event(self, payload: dict[str, Any]) -> None:
-        """`subscribed/account_all` (snapshot) and `update/account_all` (delta).
-
-        Both push `positions` and `trades` as dicts keyed by id-string.
-        `positions` give the authoritative net-position state for the
-        account; `trades` are the per-fill events that drive `_fill_cbs`
-        subscribers (see Lighter SDK `models/trade.py` for the schema).
-        Lighter does not push `orders` on this channel — fills must be
-        reconstructed from the trades stream.
+    def _on_market_event(self, payload: dict[str, Any]) -> None:
+        """`subscribed/account_market` (snapshot) / `update/account_market`
+        (delta). Per-market channel bundling positions + orders + trades +
+        funding. Each push has ONE non-null collection — we route the
+        single `position` dict to position_cbs and each entry of `orders`
+        to fill_cbs. `trades` is ignored: orders already carry cumulative
+        `filled_base_amount` / `filled_quote_amount` + matching-engine
+        `transaction_time`, making the per-trade stream redundant.
         """
-        for p in _iter_dict_values(payload.get("positions")):
-            self._handle_position_update(p)
-        for t in _iter_dict_values(payload.get("trades")):
-            self._handle_trade(t)
+        pos = payload.get("position")
+        if isinstance(pos, dict):
+            self._handle_position_update(pos)
+        for o in payload.get("orders") or []:
+            self._handle_order_update(o)
 
     def _handle_position_update(self, p: dict[str, Any]) -> None:
         raw_symbol = self._symbol_by_market_index.get(int(p["market_id"]))
@@ -373,50 +376,24 @@ class LighterClient(BaseExchange):
         for cb in self._position_cbs.get(raw_symbol, ()):
             cb(pos)
 
-    def _handle_trade(self, t: dict[str, Any]) -> None:
-        """Emit one fill to subscribers, disambiguating our side of the
-        match via `ask_account_id` / `bid_account_id`. Schema: lighter-sdk
-        `models/trade.py`."""
-        raw_symbol = self._symbol_by_market_index.get(int(t["market_id"]))
+    def _handle_order_update(self, o: dict[str, Any]) -> None:
+        market_index = o.get("market_index")
+        if market_index is None:
+            return
+        raw_symbol = self._symbol_by_market_index.get(int(market_index))
         if raw_symbol is None:
             return
         cbs = self._fill_cbs.get(raw_symbol)
         if not cbs:
             return
         meta = self._meta_by_symbol[raw_symbol]
-        ask_acc = int(t["ask_account_id"])
-        bid_acc = int(t["bid_account_id"])
-        if ask_acc == self.account_index:
-            our_side, our_client_id = Side.SELL, str(t["ask_client_id"])
-        elif bid_acc == self.account_index:
-            our_side, our_client_id = Side.BUY, str(t["bid_client_id"])
-        else:
-            # Should not happen — account_all is scoped to our account_id —
-            # but guard rather than mis-attribute.
-            _log.warning("lighter trade with no matching account_id: %s", t)
+        try:
+            info = _order_to_orderinfo(o, meta.symbol)
+        except (KeyError, ValueError, ArithmeticError) as e:
+            _log.warning("lighter order parse failed (%s): %s", e, o)
             return
-        size = Decimal(t["size"])
-        info = OrderInfo(
-            order_id=str(t["trade_id"]),
-            client_id=our_client_id,
-            symbol=meta.symbol,
-            side=our_side,
-            size=size,
-            price=Decimal(t["price"]),
-            status=OrderStatus.FILLED,
-            filled_size=size,
-            avg_fill_price=Decimal(t["price"]),
-            ts_ms=int(t["timestamp"]),
-        )
         for cb in cbs:
             cb(info)
-
-
-def _iter_dict_values(coll: Any) -> list[dict[str, Any]]:
-    """Lighter's account_all uses dicts keyed by id-string for collections."""
-    if not isinstance(coll, dict):
-        return []
-    return [v for v in coll.values() if isinstance(v, dict)]
 
 
 def _worst_acceptable_price(q: Quote | None, is_ask: bool) -> Decimal:
@@ -466,3 +443,47 @@ _LIGHTER_STATUS_MAP = {
 
 def _status_from_str(s: str) -> OrderStatus:
     return _LIGHTER_STATUS_MAP.get(s.upper(), OrderStatus.UNKNOWN)
+
+
+def _account_orders_status(s: str) -> OrderStatus:
+    """Map `account_orders.status` (lowercase, doc-listed values) to our enum.
+    The various `canceled-*` variants all collapse to CANCELED except
+    `canceled-expired`, which is semantically EXPIRED."""
+    s = (s or "").lower()
+    if s == "pending":
+        return OrderStatus.PENDING
+    if s == "open":
+        return OrderStatus.OPEN
+    if s == "filled":
+        return OrderStatus.FILLED
+    if s == "canceled-expired":
+        return OrderStatus.EXPIRED
+    if s.startswith("canceled"):
+        return OrderStatus.CANCELED
+    return OrderStatus.UNKNOWN
+
+
+def _order_to_orderinfo(o: dict[str, Any], symbol: Symbol) -> OrderInfo:
+    """Parse one entry of an `account_market.orders` array. `filled_base`
+    and `filled_quote` are cumulative across the order's lifetime; derive
+    avg fill price as quote/base when filled_base > 0. `transaction_time`
+    is the matching-engine timestamp in MICROSECONDS — divide by 1000 for
+    epoch ms to match other venues' fill_ts_ms semantics."""
+    filled_base = Decimal(str(o.get("filled_base_amount", "0") or "0"))
+    filled_quote = Decimal(str(o.get("filled_quote_amount", "0") or "0"))
+    avg_price = (filled_quote / filled_base) if filled_base > 0 else None
+    txn_time_us = o.get("transaction_time")
+    ts_ms = int(int(txn_time_us) // 1000) if txn_time_us else 0
+    return OrderInfo(
+        order_id=str(o.get("order_id") or o.get("order_index") or ""),
+        client_id=str(o["client_order_id"]),
+        symbol=symbol,
+        side=Side.SELL if o.get("is_ask") else Side.BUY,
+        size=Decimal(str(o.get("initial_base_amount", "0") or "0")),
+        price=Decimal(str(o.get("price", "0") or "0")),
+        status=_account_orders_status(o.get("status", "")),
+        filled_size=filled_base,
+        avg_fill_price=avg_price,
+        ts_ms=ts_ms,
+        cumulative=True,
+    )
