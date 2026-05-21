@@ -155,9 +155,10 @@ class Engine:
         # the user dialled in). Matches the live semantic where latency_ms is
         # the span between SEND and "result_<venue>".
         latency_ms = fill.arrival_ts_ms - intent.sim_ts_ms
-        d.legs.append(LegReport.from_result(
-            fill.venue, fill.side, fill.requested_qty,
-            intent.expected_price, r, latency_ms, kind=LegKind.ENTRY,
+        d.legs.append(LegReport.build(
+            venue=fill.venue, side=fill.side, qty=fill.requested_qty,
+            expected=intent.expected_price, rest=r,
+            latency_ms=latency_ms, kind=LegKind.ENTRY,
         ))
         if fill.success:
             self.summary.fills_succeeded += 1

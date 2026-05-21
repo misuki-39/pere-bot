@@ -17,10 +17,14 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..utils.time import mono_ms
 from .logging import CsvWriter
 from .types import OrderResult, Side
+
+if TYPE_CHECKING:
+    from ..strategy.taker_taker import _FillAccumulator
 
 
 class Outcome(StrEnum):
@@ -107,26 +111,40 @@ class LegReport:
     kind: LegKind = LegKind.ENTRY
 
     @classmethod
-    def from_result(
-        cls, venue: str, side: Side, qty: Decimal,
-        expected: Decimal | None, r: OrderResult, latency_ms: int | None,
-        kind: LegKind = LegKind.ENTRY,
+    def build(
+        cls, *, venue: str, side: Side, qty: Decimal,
+        expected: Decimal | None, rest: OrderResult,
+        fill: _FillAccumulator | None = None,
+        latency_ms: int | None, kind: LegKind = LegKind.ENTRY,
     ) -> LegReport:
+        """Single LegReport constructor: merges REST submit-ack with the
+        WS-derived authoritative fill aggregate. When `fill` carries real
+        fills (`filled_qty > 0`), its qty / avg / ts win; otherwise REST
+        is the source. Everything else (order_id, client_id, status,
+        error, latency_ms) always comes from REST."""
+        if fill is not None and fill.filled_qty > 0:
+            filled_qty = fill.filled_qty
+            realized_price = fill.weighted_price_sum / fill.filled_qty
+            fill_ts_ms = fill.last_ts_ms or rest.exchange_ts_ms
+        else:
+            filled_qty = rest.filled_size
+            realized_price = rest.avg_price
+            fill_ts_ms = rest.exchange_ts_ms
         return cls(
             exchange=venue,
             side=side.value,
             requested_qty=qty,
-            filled_qty=r.filled_size,
+            filled_qty=filled_qty,
             expected_price=expected,
-            realized_price=r.avg_price,
-            status=r.status.value if r.status else "",
-            success=r.success,
-            error=r.error_message,
-            order_id=r.order_id,
-            client_id=r.client_id,
-            fee=None,            # fill in once we have a fee accounting source
+            realized_price=realized_price,
+            status=rest.status.value,
+            success=rest.success,
+            error=rest.error_message,
+            order_id=rest.order_id,
+            client_id=rest.client_id,
+            fee=None,
             latency_ms=latency_ms,
-            fill_ts_ms=r.exchange_ts_ms,
+            fill_ts_ms=fill_ts_ms,
             kind=kind,
         )
 

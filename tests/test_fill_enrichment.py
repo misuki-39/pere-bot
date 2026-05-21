@@ -34,7 +34,7 @@ from perp_arb.core.types import (
     Side,
     Symbol,
 )
-from perp_arb.strategy.taker_taker import _FillAccumulator, _leg_report_with_fill
+from perp_arb.strategy.taker_taker import _FillAccumulator
 
 _SYM = Symbol(exchange="aster", raw="CLUSDT", base="WTI", quote="USDT")
 
@@ -142,86 +142,72 @@ def _rest_ok(*, avg_price: str = "100.00", exchange_ts: int | None = None) -> Or
     )
 
 
-def test_leg_report_uses_rest_data_when_no_fill_event() -> None:
-    """Aster timeout / lighter not yet wired → fall back to REST data."""
+def test_build_uses_rest_data_when_no_fill() -> None:
+    """No WS fill (aster timeout / pure REST path): REST is the sole source."""
     rest = _rest_ok(avg_price="100.00", exchange_ts=1_700_000_000_000)
-    leg = _leg_report_with_fill(
+    leg = LegReport.build(
         venue="aster", side=Side.BUY, qty=Decimal("1.0"),
-        expected=Decimal("99.95"), rest=rest, latency_ms=50, fill=None,
+        expected=Decimal("99.95"), rest=rest, latency_ms=50,
     )
     assert leg.realized_price == Decimal("100.00")
     assert leg.filled_qty == Decimal("1.0")
-    assert leg.fill_ts_ms == 1_700_000_000_000   # from REST transactTime
+    assert leg.fill_ts_ms == 1_700_000_000_000
 
 
-def test_leg_report_prefers_ws_fill_over_rest_when_both_present() -> None:
+def test_build_prefers_ws_fill_over_rest_when_both_present() -> None:
     """WS fill is the matching-engine's authoritative view — wins on price,
-    qty, and ts. (REST values may be stale or partial.)"""
+    qty, and ts. REST stays the source for status / order_id / etc."""
     rest = _rest_ok(avg_price="100.00", exchange_ts=1_700_000_000_000)
     acc = _FillAccumulator()
     acc.add(_delta("1.0", "100.05", ts=1_700_000_000_500))
-    leg = _leg_report_with_fill(
+    leg = LegReport.build(
         venue="aster", side=Side.BUY, qty=Decimal("1.0"),
-        expected=Decimal("99.95"), rest=rest, latency_ms=50, fill=acc,
+        expected=Decimal("99.95"), rest=rest, fill=acc, latency_ms=50,
     )
-    assert leg.realized_price == Decimal("100.05")     # WS wins
+    assert leg.realized_price == Decimal("100.05")
     assert leg.filled_qty == Decimal("1.0")
-    assert leg.fill_ts_ms == 1_700_000_000_500         # WS wins
+    assert leg.fill_ts_ms == 1_700_000_000_500
+    assert leg.order_id == "rest-1"    # REST still supplies these
 
 
-def test_leg_report_falls_back_when_ws_accumulator_empty() -> None:
-    """An accumulator with 0 fills (timed out before any event) should
-    not overwrite REST data."""
+def test_build_falls_back_when_accumulator_empty() -> None:
+    """Accumulator with zero fills (timed out) → REST data unchanged."""
     rest = _rest_ok(avg_price="100.00", exchange_ts=1_700_000_000_000)
-    empty = _FillAccumulator()
-    leg = _leg_report_with_fill(
+    leg = LegReport.build(
         venue="aster", side=Side.BUY, qty=Decimal("1.0"),
-        expected=Decimal("99.95"), rest=rest, latency_ms=50, fill=empty,
+        expected=Decimal("99.95"), rest=rest, fill=_FillAccumulator(),
+        latency_ms=50,
     )
     assert leg.realized_price == Decimal("100.00")
     assert leg.fill_ts_ms == 1_700_000_000_000
 
 
-def test_leg_report_lighter_path_only_ws_data_available() -> None:
-    """Lighter REST gives only submit-ack: filled_size=None, avg_price=None.
-    The WS fill event is the *only* source of realized data."""
+def test_build_lighter_path_ws_is_only_price_source() -> None:
+    """Lighter REST returns submit-ack only (no avg_price / filled_size).
+    WS fill is the only realized-data source for that leg."""
     rest = OrderResult(
-        success=True, order_id="seq-1", client_id="x",
-        side=Side.SELL, requested_size=Decimal("1.0"),
-        filled_size=None, avg_price=None,        # ← submit-ack only
-        status=OrderStatus.OPEN, latency_ms=200,
-        exchange_ts_ms=None,
+        success=True, order_id="seq-1", client_id="x", side=Side.SELL,
+        requested_size=Decimal("1.0"), status=OrderStatus.OPEN, latency_ms=200,
     )
     acc = _FillAccumulator()
     acc.add(_delta("1.0", "100.20", ts=1_700_000_001_000))
-    leg = _leg_report_with_fill(
+    leg = LegReport.build(
         venue="lighter", side=Side.SELL, qty=Decimal("1.0"),
-        expected=Decimal("100.25"), rest=rest, latency_ms=200, fill=acc,
+        expected=Decimal("100.25"), rest=rest, fill=acc, latency_ms=200,
     )
     assert leg.realized_price == Decimal("100.20")
     assert leg.filled_qty == Decimal("1.0")
     assert leg.fill_ts_ms == 1_700_000_001_000
 
 
-# ---- LegReport.from_result propagates exchange_ts_ms ------------------
-
-def test_legreport_from_result_propagates_exchange_ts_ms() -> None:
-    """Aster's transactTime path: REST sets exchange_ts_ms → LegReport.fill_ts_ms."""
-    rest = _rest_ok(exchange_ts=1_700_000_000_777)
-    leg = LegReport.from_result(
-        "aster", Side.BUY, Decimal("1.0"),
-        expected=Decimal("99.95"), r=rest, latency_ms=50,
+def test_build_propagates_exchange_ts_ms_from_rest() -> None:
+    """Aster's transactTime path: rest.exchange_ts_ms → fill_ts_ms when no WS fill."""
+    leg = LegReport.build(
+        venue="aster", side=Side.BUY, qty=Decimal("1.0"),
+        expected=Decimal("99.95"),
+        rest=_rest_ok(exchange_ts=1_700_000_000_777), latency_ms=50,
     )
     assert leg.fill_ts_ms == 1_700_000_000_777
-
-
-def test_legreport_from_result_handles_missing_exchange_ts() -> None:
-    rest = _rest_ok(exchange_ts=None)
-    leg = LegReport.from_result(
-        "aster", Side.BUY, Decimal("1.0"),
-        expected=Decimal("99.95"), r=rest, latency_ms=50,
-    )
-    assert leg.fill_ts_ms is None
 
 
 # ---- recorder CSV header contains the new columns ---------------------

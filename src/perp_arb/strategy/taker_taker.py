@@ -116,32 +116,6 @@ class _FillAccumulator:
             return True
         return self.filled_qty >= requested_qty
 
-    @property
-    def avg_price(self) -> Decimal | None:
-        if self.filled_qty <= 0:
-            return None
-        return self.weighted_price_sum / self.filled_qty
-
-
-def _leg_report_with_fill(
-    venue: str,
-    side: Side,
-    qty: Decimal,
-    expected: Decimal | None,
-    rest: OrderResult,
-    latency_ms: int | None,
-    fill: _FillAccumulator | None,
-) -> LegReport:
-    """LegReport built from REST + (when present) the authoritative WS fill —
-    WS wins on filled_qty / realized_price / fill_ts_ms; REST supplies the
-    rest (and is the only source for lighter when the WS event never lands)."""
-    leg = LegReport.from_result(venue, side, qty, expected, rest, latency_ms)
-    if fill is not None and fill.filled_qty > 0:
-        leg.filled_qty = fill.filled_qty
-        leg.realized_price = fill.avg_price
-        leg.fill_ts_ms = fill.last_ts_ms or leg.fill_ts_ms
-    return leg
-
 
 class TakerTakerArbitrage(BaseStrategy):
     name = "taker_taker"
@@ -483,8 +457,10 @@ class TakerTakerArbitrage(BaseStrategy):
             lat_a = d.timeline.span(Phase.SEND, "result_aster")
             lat_l = d.timeline.span(Phase.SEND, "result_lighter")
             d.legs = [
-                _leg_report_with_fill("aster", a_side, qty, exp_a, ra, lat_a, aster_fill),
-                _leg_report_with_fill("lighter", l_side, qty, exp_l, rl, lat_l, lighter_fill),
+                LegReport.build(venue="aster", side=a_side, qty=qty, expected=exp_a,
+                                rest=ra, fill=aster_fill, latency_ms=lat_a),
+                LegReport.build(venue="lighter", side=l_side, qty=qty, expected=exp_l,
+                                rest=rl, fill=lighter_fill, latency_ms=lat_l),
             ]
             latency = d.timeline.span(Phase.SEND, Phase.RESULT)
 
@@ -568,9 +544,10 @@ class TakerTakerArbitrage(BaseStrategy):
             r = OrderResult(success=False, side=side, requested_size=qty,
                              error_message=f"unwind raised: {e}")
         d.timeline.mark("unwind_result")
-        d.legs.append(LegReport.from_result(
-            venue, side, qty, cost_basis, r,
-            d.timeline.span("unwind_send", "unwind_result"), kind=LegKind.UNWIND,
+        d.legs.append(LegReport.build(
+            venue=venue, side=side, qty=qty, expected=cost_basis,
+            rest=r, latency_ms=d.timeline.span("unwind_send", "unwind_result"),
+            kind=LegKind.UNWIND,
         ))
 
     def _paper_fill(
