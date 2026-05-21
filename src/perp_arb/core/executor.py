@@ -113,27 +113,13 @@ class TwoLegExecutor:
         if self.is_paper:
             ack_a = self._paper_fill_one(a_intent, qty, cid)
             ack_b = self._paper_fill_one(b_intent, qty, cid)
-            timeline.mark(f"result_{a_intent.venue}")
-            timeline.mark(f"result_{b_intent.venue}")
             a_fill: TerminalFill | None = None
             b_fill: TerminalFill | None = None
         else:
             (ack_a, a_fill), (ack_b, b_fill) = await asyncio.gather(
-                self._submit_leg(timeline, a_intent, qty, cid),
-                self._submit_leg(timeline, b_intent, qty, cid),
+                self._submit_leg(a_intent, qty, cid),
+                self._submit_leg(b_intent, qty, cid),
             )
-        # Phase.RESULT = the moment both place acks had returned, NOT the
-        # moment gather() unblocked (which also waits on the WS fill timeout
-        # inside _submit_leg). Without this, a missed WS fill inflates
-        # `lat_send_result_ms` and TradeReport.latency_ms by the full
-        # fill_wait_timeout_s — turning the per-leg "leg latency" budget into
-        # a fill-wait check.
-        a_res = timeline.get(f"result_{a_intent.venue}")
-        b_res = timeline.get(f"result_{b_intent.venue}")
-        if a_res is not None and b_res is not None:
-            timeline.mark_at(Phase.RESULT, max(a_res, b_res))
-        else:
-            timeline.mark(Phase.RESULT)
 
         # CSV `exchange` column = actual venue ("aster"/"lighter") via
         # BaseExchange.name, not the leg label key ("leg_a") — keeps audit
@@ -143,16 +129,20 @@ class TwoLegExecutor:
                 venue=self.exchanges[a_intent.venue].name,
                 side=a_intent.side, qty=qty,
                 expected=a_intent.expected_price, ack=ack_a, fill=a_fill,
-                latency_ms=timeline.span(Phase.SEND, f"result_{a_intent.venue}"),
+                send_ts_ms=send_ts_ms,
             ),
             LegReport.build(
                 venue=self.exchanges[b_intent.venue].name,
                 side=b_intent.side, qty=qty,
                 expected=b_intent.expected_price, ack=ack_b, fill=b_fill,
-                latency_ms=timeline.span(Phase.SEND, f"result_{b_intent.venue}"),
+                send_ts_ms=send_ts_ms,
             ),
         ]
-        latency = timeline.span(Phase.SEND, Phase.RESULT)
+        # Trade-level latency = worst per-leg fill latency. Same metric
+        # the risk manager budgets against — "did the slow leg blow our
+        # max_leg_latency_ms?".
+        leg_latencies = [l.latency_ms for l in legs_out if l.latency_ms is not None]
+        latency = max(leg_latencies) if leg_latencies else None
         report = TradeReport(
             legs=legs_out, latency_ms=latency, send_ts_ms=send_ts_ms,
         )
@@ -172,21 +162,17 @@ class TwoLegExecutor:
             return report
 
         await self._handle_partial_failure(
-            trade_id, timeline, a_intent, b_intent, qty, ack_a, ack_b, report,
+            trade_id, a_intent, b_intent, qty, ack_a, ack_b, report,
         )
         return report
 
     # ----- one-leg submit (live only) -----
 
     async def _submit_leg(
-        self, timeline: Timeline, leg: LegIntent, qty: Decimal, cid: str,
+        self, leg: LegIntent, qty: Decimal, cid: str,
     ) -> tuple[OrderResult, TerminalFill | None]:
-        """Place + WS fill await for one leg.
-
-        Per-leg timeline mark `result_{venue}` lands the moment the
-        place ack returns — independent of when (or whether) the WS
-        terminal fill resolves. That preserves per-leg inter-venue
-        latency semantics."""
+        """Place + WS fill await for one leg. Per-leg timing lives on
+        the resulting LegReport (fill_ts_ms - send_ts_ms)."""
         ex = self.exchanges[leg.venue]
         mkt = self.markets[leg.venue]
         ex.register_fill_slot(cid)
@@ -194,7 +180,6 @@ class TwoLegExecutor:
             ack = await ex.place_market_order(
                 mkt, leg.side, qty, client_id=cid,
             )
-            timeline.mark(f"result_{leg.venue}")
             if not ack.success:
                 return ack, None
             fill = await ex.await_fill(
@@ -209,7 +194,6 @@ class TwoLegExecutor:
     async def _handle_partial_failure(
         self,
         trade_id: str,
-        timeline: Timeline,
         a: LegIntent,
         b: LegIntent,
         qty: Decimal,
@@ -228,7 +212,7 @@ class TwoLegExecutor:
                 trade_id, a_name, b_name, ack_b.error_message, a_name,
             )
             unwind = await self._unwind_leg(
-                timeline, a.venue, a.side.opposite, qty, ack_a.avg_price,
+                a.venue, a.side.opposite, qty, ack_a.avg_price,
             )
             if unwind is not None:
                 report.legs.append(unwind)
@@ -239,7 +223,7 @@ class TwoLegExecutor:
                 trade_id, b_name, a_name, ack_a.error_message, b_name,
             )
             unwind = await self._unwind_leg(
-                timeline, b.venue, b.side.opposite, qty, ack_b.avg_price,
+                b.venue, b.side.opposite, qty, ack_b.avg_price,
             )
             if unwind is not None:
                 report.legs.append(unwind)
@@ -253,7 +237,6 @@ class TwoLegExecutor:
 
     async def _unwind_leg(
         self,
-        timeline: Timeline,
         venue: str,
         side: Side,
         qty: Decimal,
@@ -267,7 +250,7 @@ class TwoLegExecutor:
             return None
         ex = self.exchanges[venue]
         mkt = self.markets[venue]
-        timeline.mark("unwind_send")
+        unwind_send_ts = now_ms()
         try:
             ack = await ex.place_market_order(mkt, side, qty, reduce_only=True)
             if not ack.success:
@@ -278,10 +261,9 @@ class TwoLegExecutor:
                 success=False, side=side, requested_qty=qty,
                 error_message=f"unwind raised: {e}",
             )
-        timeline.mark("unwind_result")
         return LegReport.build(
             venue=ex.name, side=side, qty=qty, expected=cost_basis, ack=ack,
-            latency_ms=timeline.span("unwind_send", "unwind_result"),
+            send_ts_ms=unwind_send_ts,
             kind=LegKind.UNWIND,
         )
 

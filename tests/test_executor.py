@@ -373,19 +373,15 @@ async def test_legs_with_opposite_sides() -> None:
 # ---- timeline marks survive ---------------------------------------------
 
 @pytest.mark.asyncio
-async def test_timeline_marks_set_send_and_per_leg_result() -> None:
+async def test_timeline_send_mark_set() -> None:
+    """The executor stamps SEND so `lat_decision_send_ms` is computable.
+    All other latencies live on per-leg LegReport (fill_ts_ms - send_ts_ms)."""
     qty = Decimal("1.0")
-
-    class _SlowLighter(_StubExchange):
-        async def place_market_order(self, *args, **kwargs):  # type: ignore[override]
-            await asyncio.sleep(0.01)
-            return await super().place_market_order(*args, **kwargs)
-
     aster = _StubExchange(
         name="aster",
         submit_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.05"),
     )
-    lighter = _SlowLighter(
+    lighter = _StubExchange(
         name="lighter",
         submit_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.07"),
     )
@@ -396,8 +392,3 @@ async def test_timeline_marks_set_send_and_per_leg_result() -> None:
     )
 
     assert timeline.get(Phase.SEND) is not None
-    assert timeline.get("result_leg_a") is not None
-    assert timeline.get("result_leg_b") is not None
-    assert timeline.get(Phase.RESULT) is not None
-    # Per-leg marks reflect REST completion order, not gather completion
-    assert timeline.get("result_leg_b") > timeline.get("result_leg_a")  # type: ignore[operator]

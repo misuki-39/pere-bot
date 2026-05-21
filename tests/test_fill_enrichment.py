@@ -141,16 +141,20 @@ def _ack_ok(*, avg_price: str = "100.00", exchange_ts: int | None = None) -> Ord
     )
 
 
+_SEND_TS = 1_699_999_999_900   # reference SEND for build tests
+
+
 def test_build_uses_ack_data_when_no_fill() -> None:
     """No WS fill (timeout / synchronous-only venue): ack is the sole source."""
     ack = _ack_ok(avg_price="100.00", exchange_ts=1_700_000_000_000)
     leg = LegReport.build(
         venue="aster", side=Side.BUY, qty=Decimal("1.0"),
-        expected=Decimal("99.95"), ack=ack, latency_ms=50,
+        expected=Decimal("99.95"), ack=ack, send_ts_ms=_SEND_TS,
     )
     assert leg.realized_price == Decimal("100.00")
     assert leg.filled_qty == Decimal("1.0")
     assert leg.fill_ts_ms == 1_700_000_000_000
+    assert leg.latency_ms == 100   # 1_700_000_000_000 - _SEND_TS
 
 
 def test_build_prefers_ws_fill_over_ack_when_both_present() -> None:
@@ -161,11 +165,12 @@ def test_build_prefers_ws_fill_over_ack_when_both_present() -> None:
     acc.add(_delta("1.0", "100.05", ts=1_700_000_000_500))
     leg = LegReport.build(
         venue="aster", side=Side.BUY, qty=Decimal("1.0"),
-        expected=Decimal("99.95"), ack=ack, fill=acc, latency_ms=50,
+        expected=Decimal("99.95"), ack=ack, fill=acc, send_ts_ms=_SEND_TS,
     )
     assert leg.realized_price == Decimal("100.05")
     assert leg.filled_qty == Decimal("1.0")
     assert leg.fill_ts_ms == 1_700_000_000_500
+    assert leg.latency_ms == 600   # WS fill ts wins over ack.exchange_ts_ms
     assert leg.client_id == "x"    # ack still supplies these
 
 
@@ -175,7 +180,7 @@ def test_build_falls_back_when_accumulator_empty() -> None:
     leg = LegReport.build(
         venue="aster", side=Side.BUY, qty=Decimal("1.0"),
         expected=Decimal("99.95"), ack=ack, fill=_FillAccumulator(),
-        latency_ms=50,
+        send_ts_ms=_SEND_TS,
     )
     assert leg.realized_price == Decimal("100.00")
     assert leg.fill_ts_ms == 1_700_000_000_000
@@ -193,7 +198,7 @@ def test_build_lighter_path_ws_is_only_price_source() -> None:
     acc.add(_delta("1.0", "100.20", ts=1_700_000_001_000))
     leg = LegReport.build(
         venue="lighter", side=Side.SELL, qty=Decimal("1.0"),
-        expected=Decimal("100.25"), ack=ack, fill=acc, latency_ms=200,
+        expected=Decimal("100.25"), ack=ack, fill=acc, send_ts_ms=_SEND_TS,
     )
     assert leg.realized_price == Decimal("100.20")
     assert leg.filled_qty == Decimal("1.0")
@@ -205,9 +210,25 @@ def test_build_propagates_exchange_ts_ms_from_ack() -> None:
     leg = LegReport.build(
         venue="aster", side=Side.BUY, qty=Decimal("1.0"),
         expected=Decimal("99.95"),
-        ack=_ack_ok(exchange_ts=1_700_000_000_777), latency_ms=50,
+        ack=_ack_ok(exchange_ts=1_700_000_000_777), send_ts_ms=_SEND_TS,
     )
     assert leg.fill_ts_ms == 1_700_000_000_777
+    assert leg.latency_ms == 877
+
+
+def test_build_latency_none_when_no_fill_ts() -> None:
+    """No WS fill AND no ack.exchange_ts_ms (e.g. lighter timeout): fill_ts_ms
+    and latency_ms are both None — we don't fabricate a fill latency."""
+    ack = OrderResult(
+        success=True, client_id="x", side=Side.SELL,
+        requested_qty=Decimal("1.0"), status=OrderStatus.OPEN, latency_ms=200,
+    )
+    leg = LegReport.build(
+        venue="lighter", side=Side.SELL, qty=Decimal("1.0"),
+        expected=Decimal("100.25"), ack=ack, send_ts_ms=_SEND_TS,
+    )
+    assert leg.fill_ts_ms is None
+    assert leg.latency_ms is None
 
 
 # ---- recorder CSV header contains the new columns ---------------------

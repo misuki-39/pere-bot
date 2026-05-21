@@ -38,10 +38,11 @@ def test_headers_are_derived_from_dataclasses() -> None:
     dh = _decision_header()
     assert "timeline" not in dh and "legs" not in dh
     assert dh[:2] == ["decision_id", "ts_ms"]
-    assert dh[-3:] == ["lat_decision_send_ms", "lat_send_result_ms", "lat_total_ms"]
+    assert dh[-1] == "lat_decision_send_ms"
     lh = _leg_header()
     assert lh[:2] == ["decision_id", "ts_ms"]
     assert "expected_price" in lh and "realized_price" in lh
+    assert "latency_ms" in lh and "fill_ts_ms" in lh
 
 
 def _read(path):
@@ -66,8 +67,6 @@ def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkey
     d.timeline.mark(Phase.DECISION)
     clock["t"] = 12
     d.timeline.mark(Phase.SEND)
-    clock["t"] = 47
-    d.timeline.mark(Phase.RESULT)
     d.legs = [
         LegReport("aster", "buy", Decimal("0.6"), Decimal("0.6"),
                   Decimal("100.02"), Decimal("100.03"), "filled", True),
@@ -85,8 +84,6 @@ def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkey
     assert row["decision_id"] == "d-abc"
     assert row["outcome"] == "FIRED"
     assert row["lat_decision_send_ms"] == "7"
-    assert row["lat_send_result_ms"] == "35"
-    assert row["lat_total_ms"] == "42"
 
     assert legs[0] == _leg_header()
     assert len(legs) == 3  # header + 2 legs
@@ -112,5 +109,5 @@ def test_abort_decision_emits_row_with_no_legs(tmp_path) -> None:
     assert len(dec) == 2 and len(legs) == 1  # decision recorded, no leg rows
     row = dict(zip(dec[0], dec[1], strict=True))
     assert row["outcome"] == "ABORT_STALE"
-    assert row["lat_total_ms"] == ""  # never fired → no timeline
-    assert row["direction"] == "" and row["edge_bps"] == "0"
+    assert row["lat_decision_send_ms"] == ""  # never marked → no span
+    assert row["direction"] == "" and row["edge_bps"] == "0.0"

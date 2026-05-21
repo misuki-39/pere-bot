@@ -141,6 +141,11 @@ class Engine:
             - intent.qty * Decimal(intent.side.sign)
         )
         d = self.in_flight[fill.decision_id]
+        # Mirror live: ack carries the venue-side fill instant as
+        # `exchange_ts_ms`. In backtest, that's the simulated arrival ts
+        # (= submit ts + venue latency). LegReport.build then computes
+        # latency_ms = fill_ts_ms - send_ts_ms (= the venue latency the
+        # user dialled in, modulo NTP skew which is 0 in backtest).
         r = OrderResult(
             success=fill.success,
             side=fill.side,
@@ -149,15 +154,12 @@ class Engine:
             avg_price=fill.realized_price,
             status=OrderStatus.FILLED if fill.success else OrderStatus.REJECTED,
             error_message=fill.error,
+            exchange_ts_ms=fill.arrival_ts_ms,
         )
-        # latency = simulated submit delay (= the per-venue network leg latency
-        # the user dialled in). Matches the live semantic where latency_ms is
-        # the span between SEND and "result_<venue>".
-        latency_ms = fill.arrival_ts_ms - intent.sim_ts_ms
         d.legs.append(LegReport.build(
             venue=fill.venue, side=fill.side, qty=fill.requested_qty,
             expected=intent.expected_price, ack=r,
-            latency_ms=latency_ms, kind=LegKind.ENTRY,
+            send_ts_ms=intent.sim_ts_ms, kind=LegKind.ENTRY,
         ))
         if fill.success:
             self.summary.fills_succeeded += 1
@@ -183,9 +185,6 @@ class Engine:
                 left_leg.filled_qty or Decimal(0),
                 self.cfg.fee_bps_per_leg,
             )
-        latest_latency = max((leg.latency_ms or 0) for leg in d.legs) if d.legs else 0
-        send_mark = d.timeline.get(Phase.SEND) or 0
-        d.timeline.mark_at(Phase.RESULT, send_mark + latest_latency)
         recorder.emit(d)
         self.summary.decisions_emitted += 1
 

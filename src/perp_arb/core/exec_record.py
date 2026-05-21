@@ -44,11 +44,14 @@ class Direction(StrEnum):
 
 class Phase(StrEnum):
     """Canonical Timeline checkpoints `latencies()` derives columns from. The
-    recorder depends only on these — the strategy owns any other marks."""
+    recorder depends only on these — the strategy owns any other marks.
+
+    No RESULT phase: end-to-end latency lives on per-leg LegReport
+    (fill_ts_ms - send_ts_ms), which is the only measurement that
+    reflects actual execution time on a single clock-comparable basis."""
 
     DECISION = "decision"
     SEND = "send"
-    RESULT = "result"
 
 
 class Timeline:
@@ -75,12 +78,11 @@ class Timeline:
         return None
 
     def latencies(self) -> dict[str, int | None]:
-        """The three derived latency columns — the recorder's only contract
-        with Timeline, so the phase names live in exactly one place."""
+        """One derived latency column: decision-compute → fire. Pure
+        local-clock CPU/wait. End-to-end execution latency is on
+        LegReport, not here."""
         return {
             "lat_decision_send_ms": self.span(Phase.DECISION, Phase.SEND),
-            "lat_send_result_ms": self.span(Phase.SEND, Phase.RESULT),
-            "lat_total_ms": self.span(Phase.DECISION, Phase.RESULT),
         }
 
 
@@ -99,9 +101,13 @@ class LegReport:
     error: str | None = None
     client_id: str | None = None
     fee: Decimal | None = None
-    latency_ms: int | None = None    # send → THIS leg's result (inter-leg skew)
-    # Matching-engine fill instant (aster `transactTime` / lighter trade
-    # `timestamp`). Exchange clock, not ours — distinct from `latency_ms`.
+    # End-to-end fill latency: local SEND timestamp → venue matching-engine
+    # fill timestamp (`fill_ts_ms - send_ts_ms`). Mixed-clock, so carries
+    # NTP skew; in practice that's ms-scale and well below the budget
+    # threshold the risk manager checks.
+    latency_ms: int | None = None
+    # Matching-engine fill instant on the venue's clock (aster `transactTime`,
+    # lighter `transaction_time`). Kept raw for cross-venue audits.
     fill_ts_ms: int | None = None
     kind: LegKind = LegKind.ENTRY
 
@@ -110,13 +116,13 @@ class LegReport:
         cls, *, venue: str, side: Side, qty: Decimal,
         expected: Decimal | None, ack: OrderResult,
         fill: TerminalFill | None = None,
-        latency_ms: int | None, kind: LegKind = LegKind.ENTRY,
+        send_ts_ms: int, kind: LegKind = LegKind.ENTRY,
     ) -> LegReport:
         """Single LegReport constructor: merges the synchronous place-ack
         with the WS-derived authoritative fill aggregate. When `fill`
         carries real fills (`filled_qty > 0`), its qty / avg / ts win;
         otherwise the ack is the source. Everything else (client_id,
-        status, error, latency_ms) always comes from the ack."""
+        status, error) always comes from the ack."""
         if fill is not None and fill.filled_qty > 0:
             filled_qty = fill.filled_qty
             realized_price = fill.weighted_price_sum / fill.filled_qty
@@ -125,6 +131,7 @@ class LegReport:
             filled_qty = ack.filled_qty
             realized_price = ack.avg_price
             fill_ts_ms = ack.exchange_ts_ms
+        latency_ms = fill_ts_ms - send_ts_ms if fill_ts_ms is not None else None
         return cls(
             exchange=venue,
             side=side.value,
@@ -204,6 +211,15 @@ class ExecutionRecorder:
         row = {f.name: getattr(d, f.name)
                for f in fields(d) if f.name not in _DECISION_SKIP}
         row |= d.timeline.latencies()
+        # CSV-only precision shaping: keep the in-memory Decimals
+        # full-precision so analytics math doesn't lose digits, but the
+        # human-facing file only carries what's meaningful.
+        #   - edge_bps: bps scale, 1 dp ≈ 0.1 bps is well below noise.
+        #   - bias: price-scale quantity; dp tracks the price magnitude
+        #     so an asset at ~3000 shows ~mille-px resolution and one
+        #     at ~1 shows micro-px resolution (4-ish sigfigs in either).
+        row["edge_bps"] = d.edge_bps.quantize(Decimal("0.1"))
+        row["bias"] = _quantize_to_price_scale(d.bias, d.mid_left)
         self._dec.write([row[h] for h in self._dec.header])
         for leg in d.legs:
             lrow = {"decision_id": d.decision_id, "ts_ms": d.ts_ms}
@@ -213,3 +229,15 @@ class ExecutionRecorder:
     def close(self) -> None:
         self._dec.close()
         self._legs.close()
+
+
+def _quantize_to_price_scale(value: Decimal, price: Decimal) -> Decimal:
+    """Round `value` to a decimal place appropriate for a price-scale
+    quantity at the given price level — yields ~4 sigfigs of resolution
+    relative to the underlying ratio. Falls back to 4 dp if price is
+    non-positive (only seen pre-warmup / aborted tick)."""
+    if price <= 0:
+        return value.quantize(Decimal("0.0001"))
+    magnitude = len(str(int(price))) - 1   # ⌊log10(price)⌋
+    dp = max(2, 6 - magnitude)
+    return value.quantize(Decimal(10) ** -dp)
