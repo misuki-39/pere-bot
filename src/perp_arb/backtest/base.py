@@ -1,4 +1,9 @@
-"""BacktestStrategy ABC + supporting context types.
+"""Backtest strategy ABC + supporting context types.
+
+Mirrors `perp_arb.strategy.base` (which holds the *live* strategy ABC and
+shared EWMA primitives) — same naming, different concern. Concrete BT
+strategy classes live under `backtest/strategies/` and inherit from the
+`BacktestStrategy` ABC defined here.
 
 Strategies are *pure synchronous*: `on_tick(snapshot, view)` returns a list
 of `OrderIntent`s (possibly empty), and `on_fill(fill, view)` is a no-op
@@ -11,7 +16,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from decimal import Decimal
-
 from pathlib import Path
 
 from ..core.exec_record import ExecutionRecorder

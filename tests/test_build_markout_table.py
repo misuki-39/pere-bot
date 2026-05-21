@@ -28,7 +28,7 @@ pd = pytest.importorskip("pandas")
 pa = pytest.importorskip("pyarrow")
 pq = pytest.importorskip("pyarrow.parquet")
 
-from perp_arb.strategy.markout import MarkoutTable
+from perp_arb.strategy.markout import MarkoutTable  # noqa: E402 — must follow importorskip
 
 
 def _load_builder():

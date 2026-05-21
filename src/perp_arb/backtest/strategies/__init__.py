@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from ..strategy import BacktestStrategy, StrategyContext
+from ..base import BacktestStrategy, StrategyContext
 from .taker_taker_bt import TakerTakerBT
 
 _REGISTRY: dict[str, Callable[[StrategyContext], BacktestStrategy]] = {

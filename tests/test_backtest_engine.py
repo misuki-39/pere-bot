@@ -9,13 +9,13 @@ from __future__ import annotations
 from decimal import Decimal
 from pathlib import Path
 
+from perp_arb.backtest.base import BacktestStrategy, EngineView, StrategyContext
 from perp_arb.backtest.dataset import BBORow
 from perp_arb.backtest.engine import Engine, EngineConfig
 from perp_arb.backtest.fills import FillModelKind
 from perp_arb.backtest.intents import OrderIntent
 from perp_arb.backtest.latency import BookIndex, LatencyModel
 from perp_arb.backtest.snapshot import MarketSnapshot
-from perp_arb.backtest.strategy import BacktestStrategy, EngineView, StrategyContext
 from perp_arb.core.exec_record import Decision, ExecutionRecorder, Outcome
 from perp_arb.core.types import Side
 

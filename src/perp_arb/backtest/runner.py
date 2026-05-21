@@ -12,10 +12,10 @@ from decimal import Decimal
 from pathlib import Path
 
 from ..core.exec_record import ExecutionRecorder
+from .base import StrategyContext
 from .dataset import load_capture
 from .engine import Engine, EngineConfig, EngineSummary, write_summary
 from .strategies import build_strategy
-from .strategy import StrategyContext
 
 _log = logging.getLogger(__name__)
 

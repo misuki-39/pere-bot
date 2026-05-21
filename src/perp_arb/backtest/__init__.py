@@ -9,13 +9,13 @@ analyze_exec.py script works on either.
 
 from __future__ import annotations
 
+from .base import BacktestStrategy, EngineView, StrategyContext
 from .dataset import BBORow, load_capture
 from .engine import Engine, EngineConfig, EngineSummary
 from .fills import BBOFill, FillModel, FillModelKind, VwapFill
 from .intents import FillEvent, OrderIntent
 from .latency import BookIndex, LatencyModel
 from .snapshot import MarketSnapshot
-from .strategy import BacktestStrategy, EngineView, StrategyContext
 
 __all__ = [
     "BBOFill",

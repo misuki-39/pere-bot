@@ -29,13 +29,13 @@ from ..core.exec_record import (
     Phase,
 )
 from ..core.types import OrderResult, OrderStatus, Side
+from .base import BacktestStrategy, EngineView, StrategyContext
 from .dataset import BBORow
 from .fills import FillModelKind, VenueSide, fill_model_for
 from .intents import FillEvent, OrderIntent, PendingOrder
 from .latency import BookIndex, LatencyModel
 from .pnl import SyntheticPositions
 from .snapshot import build_snapshot
-from .strategy import BacktestStrategy, EngineView, StrategyContext
 
 _log = logging.getLogger(__name__)
 

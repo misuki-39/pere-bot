@@ -8,8 +8,15 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from perp_arb.core.exec_record import Direction, Outcome
 from perp_arb.core.types import BookLevel, OrderBook, Quote, Symbol
 from perp_arb.strategy.base import SpreadModel, TimeEwma
+from perp_arb.strategy.markout import MarkoutTable, _Bucket
+from perp_arb.strategy.taker_taker_core import (
+    AssessInputs,
+    AssessParams,
+    assess_taker_taker,
+)
 from perp_arb.utils.precision import vwap_fill
 
 # ---- TimeEwma ----------------------------------------------------------
@@ -206,14 +213,6 @@ def test_thin_book_returns_no_edge() -> None:
 
 
 # ---- Wave-1 optimisation knobs in assess_taker_taker -------------------
-
-from perp_arb.core.exec_record import Direction, Outcome
-from perp_arb.strategy.markout import MarkoutTable, _Bucket
-from perp_arb.strategy.taker_taker_core import (
-    AssessInputs,
-    AssessParams,
-    assess_taker_taker,
-)
 
 
 def _params(**overrides) -> AssessParams:

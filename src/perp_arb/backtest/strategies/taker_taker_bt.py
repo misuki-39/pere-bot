@@ -23,9 +23,9 @@ from ...strategy.taker_taker_core import (
     left_side,
     right_side,
 )
+from ..base import BacktestStrategy, EngineView
 from ..intents import FillEvent, OrderIntent
 from ..snapshot import MarketSnapshot
-from ..strategy import BacktestStrategy, EngineView
 
 
 class TakerTakerBT(BacktestStrategy):
