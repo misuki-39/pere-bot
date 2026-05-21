@@ -170,6 +170,10 @@ class AsterClient(BaseExchange):
                 error_message=str(e),
                 latency_ms=int((time.monotonic() - t0) * 1000),
             )
+        # `transactTime` (Binance-fork convention) is the exchange-server
+        # millisecond timestamp of the order action. Promote it to
+        # `exchange_ts_ms` so the recorder can log matching-engine time
+        # alongside our client-observed latency.
         return OrderResult(
             success=True,
             order_id=str(resp["orderId"]),
@@ -180,6 +184,7 @@ class AsterClient(BaseExchange):
             avg_price=_dec(resp.get("avgPrice")),
             status=_ASTER_STATUS_MAP.get(resp["status"], OrderStatus.UNKNOWN),
             latency_ms=int((time.monotonic() - t0) * 1000),
+            exchange_ts_ms=int(resp["transactTime"]) if resp.get("transactTime") else None,
         )
 
     async def cancel_order(self, market: MarketInfo, order_id: str) -> OrderResult:

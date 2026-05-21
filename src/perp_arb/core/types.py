@@ -128,6 +128,12 @@ class OrderResult:
     status: OrderStatus = OrderStatus.UNKNOWN
     error_message: str | None = None
     latency_ms: int | None = None
+    # Exchange-server timestamp of the order action, in epoch ms. The value
+    # is the EXCHANGE's clock (NOT our local time) — sourced verbatim from
+    # the venue's response field (e.g. `transactTime` on aster). Useful for
+    # joining against the exchange UI / external trade logs that share the
+    # same clock source. None when the venue did not surface a server ts.
+    exchange_ts_ms: int | None = None
 
 
 @dataclass(slots=True)

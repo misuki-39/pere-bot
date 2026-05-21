@@ -346,12 +346,17 @@ class LighterClient(BaseExchange):
     def _on_account_event(self, payload: dict[str, Any]) -> None:
         """`subscribed/account_all` (snapshot) and `update/account_all` (delta).
 
-        Both push `positions` and `trades` as dicts keyed by id-string. Only
-        positions are routed — Lighter does not push `orders` on this channel,
-        so position updates are the authoritative fill signal.
+        Both push `positions` and `trades` as dicts keyed by id-string.
+        `positions` give the authoritative net-position state for the
+        account; `trades` are the per-fill events that drive `_fill_cbs`
+        subscribers (see Lighter SDK `models/trade.py` for the schema).
+        Lighter does not push `orders` on this channel — fills must be
+        reconstructed from the trades stream.
         """
         for p in _iter_dict_values(payload.get("positions")):
             self._handle_position_update(p)
+        for t in _iter_dict_values(payload.get("trades")):
+            self._handle_trade(t)
 
     def _handle_position_update(self, p: dict[str, Any]) -> None:
         raw_symbol = self._symbol_by_market_index.get(int(p["market_id"]))
@@ -367,6 +372,53 @@ class LighterClient(BaseExchange):
         self._live_positions[raw_symbol] = pos
         for cb in self._position_cbs.get(raw_symbol, ()):
             cb(pos)
+
+    def _handle_trade(self, t: dict[str, Any]) -> None:
+        """One filled trade from the account_all stream. Disambiguates which
+        side of the match is ours via `account_id` and emits an `OrderInfo`
+        to all registered `subscribe_fills` callbacks.
+
+        Trade schema source: lighter-sdk `models/trade.py`. The two fields
+        we depend on are:
+          - `ask_account_id` / `bid_account_id`: integer account indices,
+            one of which == `self.account_index` for any trade pushed to us
+          - `ask_client_id` / `bid_client_id`: the `client_order_index` we
+            passed in at submit time, surfaced for the matching side
+          - `timestamp`: server-side fill time (ms since epoch)
+        """
+        raw_symbol = self._symbol_by_market_index.get(int(t["market_id"]))
+        if raw_symbol is None:
+            return
+        cbs = self._fill_cbs.get(raw_symbol)
+        if not cbs:
+            return
+        meta = self._meta_by_symbol[raw_symbol]
+        ask_acc = int(t["ask_account_id"])
+        bid_acc = int(t["bid_account_id"])
+        if ask_acc == self.account_index:
+            our_side, our_client_id = Side.SELL, str(t["ask_client_id"])
+        elif bid_acc == self.account_index:
+            our_side, our_client_id = Side.BUY, str(t["bid_client_id"])
+        else:
+            # Should not happen — account_all is scoped to our account_id —
+            # but guard rather than mis-attribute.
+            _log.warning("lighter trade with no matching account_id: %s", t)
+            return
+        size = Decimal(t["size"])
+        info = OrderInfo(
+            order_id=str(t["trade_id"]),
+            client_id=our_client_id,
+            symbol=meta.symbol,
+            side=our_side,
+            size=size,
+            price=Decimal(t["price"]),
+            status=OrderStatus.FILLED,
+            filled_size=size,
+            avg_fill_price=Decimal(t["price"]),
+            ts_ms=int(t["timestamp"]),
+        )
+        for cb in cbs:
+            cb(info)
 
 
 def _iter_dict_values(coll: Any) -> list[dict[str, Any]]:

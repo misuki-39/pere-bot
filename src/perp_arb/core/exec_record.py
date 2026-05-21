@@ -101,6 +101,14 @@ class LegReport:
     client_id: str | None = None
     fee: Decimal | None = None
     latency_ms: int | None = None    # send → THIS leg's result (inter-leg skew)
+    # Exchange-server fill timestamp in epoch ms. The value comes from the
+    # EXCHANGE's clock (NOT our local time): `transactTime` from aster's
+    # REST place_order response, or `timestamp` from lighter's account_all
+    # trade event. Distinct from `latency_ms` (client-observed) — this is
+    # the matching-engine's own view of when the fill happened, joinable to
+    # exchange UIs and external trade logs. None when the venue did not
+    # surface a server timestamp.
+    fill_ts_ms: int | None = None
     kind: LegKind = LegKind.ENTRY
 
     @classmethod
@@ -123,6 +131,7 @@ class LegReport:
             client_id=r.client_id,
             fee=None,            # fill in once we have a fee accounting source
             latency_ms=latency_ms,
+            fill_ts_ms=r.exchange_ts_ms,
             kind=kind,
         )
 
@@ -148,6 +157,15 @@ class Decision:
     direction: Direction | None = None
     outcome: Outcome = Outcome.PENDING
     abort_reason: str | None = None
+    # Local epoch-ms when the strategy entered `_fire` (== when the first
+    # leg was about to be submitted). This is OUR clock — useful as an
+    # absolute reference alongside the exchange-clock `LegReport.fill_ts_ms`.
+    # The difference (`fill_ts_ms - send_ts_ms`) includes both network RTT
+    # and any client/server clock skew; assume small if NTP-synced.
+    # Distinct from `ts_ms` (decision time) and from the monotonic
+    # `lat_decision_send_ms` span. Set in live by `taker_taker._fire`;
+    # None for non-FIRED outcomes.
+    send_ts_ms: int | None = None
     timeline: Timeline = field(default_factory=Timeline)
     legs: list[LegReport] = field(default_factory=list)
 
