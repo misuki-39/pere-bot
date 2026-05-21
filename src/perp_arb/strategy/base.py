@@ -113,7 +113,7 @@ class SpreadState:
 
 
 class SpreadModel:
-    """Decomposes (mid_a - mid_l) into a slow center + fast residual.
+    """Decomposes (mid_left - mid_right) into a slow center + fast residual.
 
     The data says the spread is a slowly-wandering center (hours, ~5-8 bps
     range, an intraday session effect) plus a strongly mean-reverting residual

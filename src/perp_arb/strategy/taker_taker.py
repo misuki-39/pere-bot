@@ -34,7 +34,6 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import NamedTuple
 
 from ..core.config import RunMode
 from ..core.exec_record import (
@@ -48,21 +47,18 @@ from ..core.exec_record import (
 )
 from ..core.types import OrderResult, Side
 from ..risk.manager import RiskManager
-from ..utils.precision import BPS, vwap_fill
+from ..utils.precision import vwap_fill
 from ..utils.time import now_ms
 from .base import BaseStrategy, SpreadModel
+from .taker_taker_core import (
+    AssessInputs,
+    AssessParams,
+    assess_taker_taker,
+    left_side,
+    right_side,
+)
 
 _log = logging.getLogger(__name__)
-
-
-class _Vwaps(NamedTuple):
-    """The four depth-aware fill prices the edge math uses, passed as one
-    typed value so Decision construction stays statically checkable."""
-
-    a_sell: Decimal
-    a_buy: Decimal
-    l_sell: Decimal
-    l_buy: Decimal
 
 
 @dataclass
@@ -92,10 +88,16 @@ class TakerTakerArbitrage(BaseStrategy):
         self._last_heartbeat_ms = 0
         self._heartbeat_interval_ms = 60_000  # liveness only; trades go to CSV
         self._risk_blocked = False
-        # hoist per-tick constants into Decimals once
-        self._slip_cap = s.max_slippage_bps / BPS
-        self._fee_frac = s.fees_bps / BPS
-        self._min_profit_frac = s.min_profit_bps / BPS
+        # parameters consumed by the pure decision function
+        self._params = AssessParams(
+            qty=Decimal(str(s.qty)),
+            max_levels=s.max_levels,
+            fees_bps=Decimal(str(s.fees_bps)),
+            min_profit_bps=Decimal(str(s.min_profit_bps)),
+            max_slippage_bps=Decimal(str(s.max_slippage_bps)),
+            max_stale_ms=s.max_stale_ms,
+            max_qty=Decimal(str(s.max_qty)),
+        )
 
     async def run(self) -> None:
         ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -145,126 +147,84 @@ class TakerTakerArbitrage(BaseStrategy):
                 self._recorder.emit(d)
 
     def _assess(self, a_book, l_book, a_q, l_q) -> Decision | None:
-        """Pure decision logic: no order placement, no persistence. Returns the
-        Decision to record (outcome already terminal), or None for ticks not
-        worth recording (not warm, or no tradeable edge — that is the spread
-        monitor's job)."""
-        s = self.cfg.strategy
+        """Thin wrapper around the pure `assess_taker_taker` decision math.
+
+        Live-only responsibilities kept here: update the EWMA, run the
+        operational `RiskManager` gates (halted / consecutive-failures / daily
+        PnL — the pure function only checks the structural `max_qty` cap), and
+        emit the throttled heartbeat log."""
         now = now_ms()
-        mid_a = a_q.mid
-        mid_l = l_q.mid
+        bias = self._spread.update(a_q.mid - l_q.mid, now).center
+        d = assess_taker_taker(self._params, AssessInputs(
+            now_ms=now,
+            left_book=a_book, right_book=l_book,
+            left_quote=a_q, right_quote=l_q,
+            bias=bias, is_warm=self._spread.is_warm,
+            position_left=self._position.aster,
+            position_right=self._position.lighter,
+        ))
 
-        def new(
-            outcome: Outcome, reason: str | None = None, *,
-            bias: Decimal = Decimal(0), edge_bps: Decimal = Decimal(0),
-            direction: Direction | None = None, vwaps: _Vwaps | None = None,
-        ) -> Decision:
-            v = vwaps or _Vwaps(Decimal(0), Decimal(0), Decimal(0), Decimal(0))
-            return Decision(
-                decision_id=f"d-{uuid.uuid4().hex[:10]}",
-                ts_ms=now, mid_a=mid_a, mid_l=mid_l,
-                a_quote_ts_ms=a_q.ts_ms, l_quote_ts_ms=l_q.ts_ms,
-                bias=bias, vwap_a_sell=v.a_sell, vwap_a_buy=v.a_buy,
-                vwap_l_sell=v.l_sell, vwap_l_buy=v.l_buy,
-                edge_bps=edge_bps, direction=direction,
-                outcome=outcome, abort_reason=reason,
+        if d is not None and d.outcome is Outcome.FIRED:
+            assert d.direction is not None
+            d.timeline.mark(Phase.DECISION)
+            qty = self.cfg.strategy.qty
+            post_a = self._position.aster + qty * Decimal(left_side(d.direction).sign)
+            post_l = self._position.lighter + qty * Decimal(right_side(d.direction).sign)
+            ok, reason = self._risk.can_trade(
+                post_trade_abs_position=max(abs(post_a), abs(post_l)),
             )
+            if not ok:
+                if not self._risk_blocked:
+                    self._risk_blocked = True
+                    _log.info("entry blocked by risk: %s (suppressing until cleared)", reason)
+                d.outcome = Outcome.BLOCKED_RISK
+                d.abort_reason = reason
+            elif self._risk_blocked:
+                self._risk_blocked = False
+                _log.info("risk block cleared — resuming entries")
 
-        if (now - max(a_q.ts_ms, l_q.ts_ms)) > s.max_stale_ms:
-            return new(Outcome.ABORT_STALE, "quote older than max_stale_ms")
-
-        bias = self._spread.update(mid_a - mid_l, now).center
-        if not self._spread.is_warm:
-            return None  # warmup: not interesting telemetry
-
-        qty = s.qty
-        vwap_a_sell, _ = vwap_fill(a_book.bids, qty, max_levels=s.max_levels)
-        vwap_a_buy,  _ = vwap_fill(a_book.asks, qty, max_levels=s.max_levels)
-        vwap_l_sell, _ = vwap_fill(l_book.bids, qty, max_levels=s.max_levels)
-        vwap_l_buy,  _ = vwap_fill(l_book.asks, qty, max_levels=s.max_levels)
-        if None in (vwap_a_sell, vwap_a_buy, vwap_l_sell, vwap_l_buy):
-            return new(Outcome.ABORT_NO_DEPTH,
-                       "qty does not fill within max_levels", bias=bias)
-
-        vw = _Vwaps(vwap_a_sell, vwap_a_buy, vwap_l_sell, vwap_l_buy)
-
-        slip = self._slip_cap
-        if (abs((vwap_a_sell - mid_a) / mid_a) > slip
-                or abs((vwap_a_buy - mid_a) / mid_a) > slip
-                or abs((vwap_l_sell - mid_l) / mid_l) > slip
-                or abs((vwap_l_buy - mid_l) / mid_l) > slip):
-            return new(Outcome.ABORT_SLIPPAGE, "vwap-mid exceeds max_slippage_bps",
-                       bias=bias, vwaps=vw)
-
-        ref_mid = (mid_a + mid_l) / Decimal(2)
-        threshold = ref_mid * (self._fee_frac + self._min_profit_frac)
-        edge_A = (vwap_a_sell - vwap_l_buy) - bias - threshold   # sell A, buy L
-        edge_B = (vwap_l_sell - vwap_a_buy) + bias - threshold   # reverse
-
-        self._maybe_heartbeat(now, mid_a, mid_l, bias, edge_A, edge_B, ref_mid)
-
-        if edge_A <= 0 and edge_B <= 0:
-            return None  # nothing we'd act on
-
-        direction = Direction.A if edge_A >= edge_B else Direction.B
-        edge_bps = max(edge_A, edge_B) / ref_mid * BPS
-
-        post_a = self._position.aster + qty * Decimal(self._a_side(direction).sign)
-        post_l = self._position.lighter + qty * Decimal(self._l_side(direction).sign)
-        ok, reason = self._risk.can_trade(
-            post_trade_abs_position=max(abs(post_a), abs(post_l)),
-        )
-        if not ok:
-            if not self._risk_blocked:
-                self._risk_blocked = True
-                _log.info("entry blocked by risk: %s (suppressing until cleared)", reason)
-            return new(Outcome.BLOCKED_RISK, reason, bias=bias,
-                       edge_bps=edge_bps, direction=direction, vwaps=vw)
-
-        if self._risk_blocked:
-            self._risk_blocked = False
-            _log.info("risk block cleared — resuming entries")
-
-        d = new(Outcome.FIRED, bias=bias, edge_bps=edge_bps,
-                direction=direction, vwaps=vw)
-        d.timeline.mark(Phase.DECISION)  # latency clock starts at decision
+        self._maybe_heartbeat(now, a_q.mid, l_q.mid, bias, d)
         return d
-
-    @staticmethod
-    def _a_side(direction: Direction) -> Side:
-        return Side.SELL if direction is Direction.A else Side.BUY
-
-    @staticmethod
-    def _l_side(direction: Direction) -> Side:
-        return Side.BUY if direction is Direction.A else Side.SELL
 
     def _maybe_heartbeat(
         self,
         now: int,
-        mid_a: Decimal, mid_l: Decimal, bias: Decimal,
-        edge_A: Decimal, edge_B: Decimal, ref_mid: Decimal,
+        mid_left: Decimal, mid_right: Decimal, bias: Decimal,
+        d: Decision | None,
     ) -> None:
-        """Throttled INFO log so paper runs are observable when nothing fires."""
+        """Throttled INFO log so paper runs are observable when nothing fires.
+
+        When `d` has VWAPs (any post-warmup non-stale tick), log both raw
+        edge directions in bps — operators rely on seeing whether the *other*
+        direction is approaching threshold even when this one isn't firing.
+        """
         if now - self._last_heartbeat_ms < self._heartbeat_interval_ms:
             return
         self._last_heartbeat_ms = now
-        edge_A_bps = edge_A / ref_mid * BPS
-        edge_B_bps = edge_B / ref_mid * BPS
+        if d is not None and d.vwap_left_sell > 0:
+            ref_mid = (mid_left + mid_right) / Decimal(2)
+            edge_A = (d.vwap_left_sell  - d.vwap_right_buy) - bias
+            edge_B = (d.vwap_right_sell - d.vwap_left_buy)  + bias
+            edge_str = (f"edge_A={edge_A / ref_mid * Decimal(10_000):+.2f}bps "
+                        f"edge_B={edge_B / ref_mid * Decimal(10_000):+.2f}bps")
+        else:
+            edge_str = "no-edge"
         _log.info(
-            "edge: mid_a=%.2f mid_l=%.2f bias=%.4f edge_A=%+.2fbps edge_B=%+.2fbps pos_a=%s pos_l=%s",
-            mid_a, mid_l, bias, edge_A_bps, edge_B_bps,
+            "tick: mid_left=%.2f mid_right=%.2f bias=%.4f %s pos_a=%s pos_l=%s",
+            mid_left, mid_right, bias, edge_str,
             self._position.aster, self._position.lighter,
         )
 
     # ---- order firing ----
 
     async def _fire(self, d: Decision) -> None:
+        assert d.direction is not None
         qty = self.cfg.strategy.qty
-        a_side, l_side = self._a_side(d.direction), self._l_side(d.direction)
+        a_side, l_side = left_side(d.direction), right_side(d.direction)
         if d.direction is Direction.A:
-            exp_a, exp_l = d.vwap_a_sell, d.vwap_l_buy
+            exp_a, exp_l = d.vwap_left_sell, d.vwap_right_buy
         else:
-            exp_a, exp_l = d.vwap_a_buy, d.vwap_l_sell
+            exp_a, exp_l = d.vwap_left_buy, d.vwap_right_sell
 
         _log.info("[%s] FIRE qty=%s aster=%s lighter=%s mode=%s",
                   d.decision_id, qty, a_side, l_side, self.cfg.strategy.mode)

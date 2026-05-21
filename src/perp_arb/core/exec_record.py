@@ -61,6 +61,14 @@ class Timeline:
     def mark(self, phase: str) -> None:
         self._marks[phase] = mono_ms()
 
+    def mark_at(self, phase: str, ts_ms: int) -> None:
+        """Stamp a mark with an explicit timestamp instead of mono_ms().
+        Backtest uses this to record sim-time spans; live never calls it."""
+        self._marks[phase] = ts_ms
+
+    def get(self, phase: str) -> int | None:
+        return self._marks.get(phase)
+
     def span(self, a: str, b: str) -> int | None:
         if a in self._marks and b in self._marks:
             return self._marks[b] - self._marks[a]
@@ -126,16 +134,16 @@ class Decision:
 
     decision_id: str
     ts_ms: int
-    mid_a: Decimal
-    mid_l: Decimal
-    a_quote_ts_ms: int              # for decision-time staleness analysis
-    l_quote_ts_ms: int
+    mid_left: Decimal
+    mid_right: Decimal
+    left_quote_ts_ms: int           # for decision-time staleness analysis
+    right_quote_ts_ms: int
     # below are unknown at an early (pre-edge) abort, hence defaulted
     bias: Decimal = Decimal(0)
-    vwap_a_sell: Decimal = Decimal(0)
-    vwap_a_buy: Decimal = Decimal(0)
-    vwap_l_sell: Decimal = Decimal(0)
-    vwap_l_buy: Decimal = Decimal(0)
+    vwap_left_sell: Decimal = Decimal(0)
+    vwap_left_buy: Decimal = Decimal(0)
+    vwap_right_sell: Decimal = Decimal(0)
+    vwap_right_buy: Decimal = Decimal(0)
     edge_bps: Decimal = Decimal(0)  # chosen direction's net edge, bps
     direction: Direction | None = None
     outcome: Outcome = Outcome.PENDING
@@ -160,11 +168,17 @@ class ExecutionRecorder:
     """Single sink. `emit(decision)` writes one decisions row + one legs row
     per leg. The only place the strategy's telemetry reaches disk."""
 
-    def __init__(self, log_dir: Path, run_ts: str | None = None) -> None:
+    def __init__(
+        self,
+        log_dir: Path,
+        run_ts: str | None = None,
+        *,
+        strategy_id: str = "taker_taker",
+    ) -> None:
         ts = run_ts or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        self._dec = CsvWriter(log_dir / f"decisions_taker_taker_{ts}.csv",
+        self._dec = CsvWriter(log_dir / f"decisions_{strategy_id}_{ts}.csv",
                               _decision_header())
-        self._legs = CsvWriter(log_dir / f"legs_taker_taker_{ts}.csv",
+        self._legs = CsvWriter(log_dir / f"legs_{strategy_id}_{ts}.csv",
                                _leg_header())
 
     def emit(self, d: Decision) -> None:

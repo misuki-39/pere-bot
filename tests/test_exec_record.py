@@ -55,11 +55,11 @@ def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkey
     rec = ExecutionRecorder(tmp_path, run_ts="TEST")
 
     d = Decision(
-        decision_id="d-abc", ts_ms=111, mid_a=Decimal("100"), mid_l=Decimal("100.05"),
-        a_quote_ts_ms=110, l_quote_ts_ms=109,
-        bias=Decimal("-0.03"), vwap_a_sell=Decimal("100.01"),
-        vwap_a_buy=Decimal("100.02"), vwap_l_sell=Decimal("100.04"),
-        vwap_l_buy=Decimal("100.06"), edge_bps=Decimal("2.5"),
+        decision_id="d-abc", ts_ms=111, mid_left=Decimal("100"), mid_right=Decimal("100.05"),
+        left_quote_ts_ms=110, right_quote_ts_ms=109,
+        bias=Decimal("-0.03"), vwap_left_sell=Decimal("100.01"),
+        vwap_left_buy=Decimal("100.02"), vwap_right_sell=Decimal("100.04"),
+        vwap_right_buy=Decimal("100.06"), edge_bps=Decimal("2.5"),
         direction=Direction.B, outcome=Outcome.FIRED,
     )
     clock["t"] = 5
@@ -101,8 +101,8 @@ def test_abort_decision_emits_row_with_no_legs(tmp_path) -> None:
     # only the always-known fields; the rest default — proves early aborts
     # (pre-edge) can be recorded without fabricating values.
     d = Decision(
-        decision_id="d-x", ts_ms=9, mid_a=Decimal("100"), mid_l=Decimal("100"),
-        a_quote_ts_ms=1, l_quote_ts_ms=2,
+        decision_id="d-x", ts_ms=9, mid_left=Decimal("100"), mid_right=Decimal("100"),
+        left_quote_ts_ms=1, right_quote_ts_ms=2,
         outcome=Outcome.ABORT_STALE, abort_reason="quote older than max_stale_ms",
     )
     rec.emit(d)

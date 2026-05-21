@@ -22,6 +22,7 @@ dependencies = [
 
 [project.scripts]
 runbot = "perp_arb.runbot:main"
+runbt = "perp_arb.backtest.cli:main"
 
 [dependency-groups]
 dev = [
