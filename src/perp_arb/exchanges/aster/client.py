@@ -245,6 +245,13 @@ class AsterClient(BaseExchange):
         cbs = self._fill_cbs.get(raw_symbol)
         if not cbs:
             return
+        # `l` / `L` = THIS event's fill delta + price (Binance-fork
+        # convention). The accumulator does `+=`, so we feed deltas, not
+        # the cumulative `z` / `ap` (which would double-count multi-event
+        # orders). Non-fill events (NEW status) carry l=0 and are filtered
+        # by the accumulator's size>0 guard.
+        last_qty = Decimal(o["l"]) if o.get("l") else Decimal("0")
+        last_price = Decimal(o["L"]) if o.get("L") else None
         info = OrderInfo(
             order_id=str(o["i"]),
             client_id=o.get("c"),
@@ -253,9 +260,11 @@ class AsterClient(BaseExchange):
             size=Decimal(o["q"]),
             price=Decimal(o["p"]),
             status=_ASTER_STATUS_MAP.get(o["X"], OrderStatus.UNKNOWN),
-            filled_size=Decimal(o["z"]),
-            avg_fill_price=Decimal(o["ap"]) if o.get("ap") else None,
-            ts_ms=int(data.get("E") or 0),
+            filled_size=last_qty,
+            avg_fill_price=last_price,
+            # `T` is the trade time (set on fills); `E` is event time
+            # (always present). Prefer T for fill provenance.
+            ts_ms=int(data.get("T") or data.get("E") or 0),
         )
         for cb in cbs:
             cb(info)

@@ -82,8 +82,12 @@ class _FillAccumulator:
     last_ts_ms: int = 0
 
     def add(self, info: OrderInfo) -> None:
-        size = info.filled_size or info.size or Decimal("0")
-        price = info.avg_fill_price or info.price or Decimal("0")
+        # `filled_size` / `avg_fill_price` must be PER-FILL DELTAS (aster
+        # `o["l"]` / `o["L"]`, lighter trade's own size/price). No fallback
+        # to `info.size` — that's the requested qty and would let a NEW /
+        # OPEN event with no fill poison the accumulator.
+        size = info.filled_size or Decimal("0")
+        price = info.avg_fill_price or Decimal("0")
         if size <= 0 or price <= 0:
             return
         self.filled_qty += size
