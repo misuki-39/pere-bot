@@ -19,6 +19,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from ..core.exec_record import ExecutionRecorder
+from ..strategy.persistence_gate import PersistenceParams
 from .fills import FillModelKind
 from .intents import FillEvent, OrderIntent
 from .snapshot import MarketSnapshot
@@ -53,6 +54,7 @@ class StrategyContext:
     throttle_bump_bps: Decimal = Decimal(0)    # Δ added to same-direction threshold on FIRED
     throttle_halflife_s: float = 3.0           # decay of the throttle bump
     in_flight_cap_per_direction: int = 0       # 0 = unlimited; K = at most K same-dir entries pending
+    persistence: PersistenceParams = PersistenceParams()   # edge-persistence gate (off by default)
 
 
 @dataclass(slots=True)

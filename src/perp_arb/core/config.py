@@ -46,6 +46,18 @@ class RiskCfg(BaseModel):
     min_free_margin_usd: Decimal = Decimal("0")
 
 
+class PersistenceConfirmCfg(BaseModel):
+    """Edge-persistence confirmation gate (2026-05-22 strategy search,
+    "Strategy 3"). Suppresses a FIRED decision until its edge has survived
+    `t_confirm_ms` across `n_confirm` venue updates with no adverse mid-drift.
+    `enabled=False` ⇒ the gate is an identity pass-through."""
+
+    enabled: bool = False
+    t_confirm_ms: int = Field(default=400, ge=0)
+    n_confirm: int = Field(default=6, ge=1)
+    drift_max_bps: Decimal = Decimal("1.0")
+
+
 class OptimisationsCfg(BaseModel):
     """Wave-1 optional knobs. All default-off = identical pre-Wave-1 behaviour.
 
@@ -75,6 +87,9 @@ class OptimisationsCfg(BaseModel):
     # in practice a no-op in live; kept for parity with the backtest path and
     # as a forward-safety belt if the gate is ever relaxed.
     in_flight_cap_per_direction: int = Field(default=0, ge=0)
+
+    # Edge-persistence confirmation gate. Disabled by default.
+    persistence_confirm: PersistenceConfirmCfg = PersistenceConfirmCfg()
 
 
 class StrategyCfg(BaseModel):

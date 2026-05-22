@@ -12,6 +12,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from ..core.exec_record import ExecutionRecorder
+from ..strategy.persistence_gate import PersistenceParams
 from .base import StrategyContext
 from .dataset import load_capture
 from .engine import Engine, EngineConfig, EngineSummary, write_summary
@@ -39,6 +40,7 @@ class StrategyParams:
     throttle_bump_bps: Decimal = Decimal(0)
     throttle_halflife_s: float = 3.0
     in_flight_cap_per_direction: int = 0       # 0 = unlimited (current behaviour)
+    persistence: PersistenceParams = PersistenceParams()   # edge-persistence gate
 
 
 def build_context(
@@ -72,6 +74,7 @@ def build_context(
         throttle_bump_bps=params.throttle_bump_bps,
         throttle_halflife_s=params.throttle_halflife_s,
         in_flight_cap_per_direction=params.in_flight_cap_per_direction,
+        persistence=params.persistence,
     )
 
 

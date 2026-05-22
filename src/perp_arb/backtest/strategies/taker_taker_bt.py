@@ -16,6 +16,7 @@ from decimal import Decimal
 from ...core.exec_record import Direction, Outcome, Phase
 from ...strategy.base import SpreadModel, TimeEwma
 from ...strategy.markout import MarkoutTable
+from ...strategy.persistence_gate import PersistenceGate
 from ...strategy.taker_taker_core import (
     AssessInputs,
     AssessParams,
@@ -69,6 +70,13 @@ class TakerTakerBT(BacktestStrategy):
         self._inflight_dir: dict[str, Direction] = {}     # decision_id -> direction
         self._inflight_legs: dict[str, int] = {}          # decision_id -> legs remaining
 
+        # Edge-persistence confirmation gate — a temporal filter applied to the
+        # `assess_taker_taker` output, identical to the live wiring in
+        # `strategy/taker_taker.py`. Off (identity pass-through) by default.
+        self._gate = PersistenceGate(ctx.persistence)
+        self._prev_left_ts: int | None = None
+        self._prev_right_ts: int | None = None
+
     def on_tick(self, snap: MarketSnapshot, view: EngineView) -> list[OrderIntent]:
         bias = self._spread.update(snap.left_quote.mid - snap.right_quote.mid, snap.ts_ms).center
 
@@ -96,6 +104,15 @@ class TakerTakerBT(BacktestStrategy):
             bump_a_bps=bump_a if self._throttle_enabled else Decimal(0),
             bump_b_bps=bump_b if self._throttle_enabled else Decimal(0),
         ))
+
+        # Persistence-confirm gate: suppress a FIRED decision until its edge
+        # has survived the confirmation window. No-op when disabled.
+        left_ticked = snap.left_ts_ms != self._prev_left_ts
+        right_ticked = snap.right_ts_ms != self._prev_right_ts
+        self._prev_left_ts = snap.left_ts_ms
+        self._prev_right_ts = snap.right_ts_ms
+        d = self._gate.admit(d, left_ticked=left_ticked, right_ticked=right_ticked)
+
         if d is None:
             return []
         if d.outcome is not Outcome.FIRED:

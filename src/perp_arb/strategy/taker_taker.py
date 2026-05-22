@@ -59,6 +59,7 @@ from ..risk.manager import RiskManager
 from ..utils.time import now_ms
 from .base import BaseStrategy, SpreadModel, TimeEwma
 from .markout import MarkoutTable
+from .persistence_gate import PersistenceGate, PersistenceParams
 from .taker_taker_core import (
     AssessInputs,
     AssessParams,
@@ -139,6 +140,22 @@ class TakerTakerArbitrage(BaseStrategy):
         self._inflight_cap = int(opt.in_flight_cap_per_direction)
         self._inflight_dir: dict[str, Direction] = {}
 
+        # Edge-persistence confirmation gate (search 2026-05-22, "Strategy 3").
+        # A temporal filter between signal and execution: a FIRED decision is
+        # suppressed until its edge has survived `t_confirm_ms` across
+        # `n_confirm` venue updates with no adverse mid-drift. Disabled by
+        # default → identity pass-through.
+        pc = opt.persistence_confirm
+        self._gate = PersistenceGate(PersistenceParams(
+            enabled=pc.enabled,
+            t_confirm_ms=pc.t_confirm_ms,
+            n_confirm=pc.n_confirm,
+            drift_max_bps=Decimal(str(pc.drift_max_bps)),
+        ))
+        # Per-venue last-seen quote ts, for the gate's per-tick update count.
+        self._prev_a_ts: int | None = None
+        self._prev_b_ts: int | None = None
+
         # Execution is delegated: two-leg gather, WS fill tracking,
         # partial-failure unwind, paper synth all live in the executor +
         # driver layers. Strategy resolves Direction→sides itself and
@@ -165,6 +182,12 @@ class TakerTakerArbitrage(BaseStrategy):
                 "in-flight cap enabled K=%d (note: structural no-op in "
                 "live due to _evaluating serialization)",
                 self._inflight_cap,
+            )
+        if pc.enabled:
+            _log.info(
+                "persistence-confirm enabled: t_confirm=%dms n_confirm=%d "
+                "drift_max=%s bps",
+                pc.t_confirm_ms, pc.n_confirm, pc.drift_max_bps,
             )
 
     async def run(self) -> None:
@@ -246,6 +269,16 @@ class TakerTakerArbitrage(BaseStrategy):
             bump_b_bps=bump_b,
         ))
 
+        # Persistence-confirm gate: a temporal filter that suppresses a FIRED
+        # decision until its edge has survived the confirmation window. A
+        # no-op when disabled. Runs BEFORE the cap / risk gates so those only
+        # ever see a confirmed fire.
+        left_ticked = a_q.ts_ms != self._prev_a_ts
+        right_ticked = b_q.ts_ms != self._prev_b_ts
+        self._prev_a_ts = a_q.ts_ms
+        self._prev_b_ts = b_q.ts_ms
+        d = self._gate.admit(d, left_ticked=left_ticked, right_ticked=right_ticked)
+
         if d is not None and d.outcome is Outcome.FIRED:
             assert d.direction is not None
 
@@ -272,6 +305,7 @@ class TakerTakerArbitrage(BaseStrategy):
         # RiskManager observe the FIRED-intent state via the position math —
         # but we must not overwrite the cap's reason. Guard with the outcome.
         if d is not None and d.outcome is Outcome.FIRED:
+            assert d.direction is not None
             d.timeline.mark(Phase.DECISION)
             qty = self.cfg.strategy.qty
             post_a = self._position.leg_a + qty * Decimal(left_side(d.direction).sign)

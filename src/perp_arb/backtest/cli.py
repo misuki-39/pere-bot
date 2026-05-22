@@ -13,6 +13,7 @@ from pathlib import Path
 
 import yaml
 
+from ..strategy.persistence_gate import PersistenceParams
 from .engine import EngineConfig
 from .fills import FillModelKind
 from .latency import LatencyModel
@@ -40,6 +41,13 @@ def _load_params(config_path: Path, override_qty: Decimal | None) -> StrategyPar
     qty = override_qty if override_qty is not None else Decimal(str(raw["qty"]))
     opt = raw.get("optimisations", {}) or {}
     markout_path = opt.get("markout_table_path")
+    pc = opt.get("persistence_confirm", {}) or {}
+    persistence = PersistenceParams(
+        enabled=bool(pc.get("enabled", False)),
+        t_confirm_ms=int(pc.get("t_confirm_ms", 400)),
+        n_confirm=int(pc.get("n_confirm", 6)),
+        drift_max_bps=Decimal(str(pc.get("drift_max_bps", "1.0"))),
+    )
     return StrategyParams(
         qty=qty,
         fees_bps=Decimal(str(raw.get("fees_bps", 0))),
@@ -55,6 +63,7 @@ def _load_params(config_path: Path, override_qty: Decimal | None) -> StrategyPar
         throttle_bump_bps=Decimal(str(opt.get("throttle_bump_bps", 0))),
         throttle_halflife_s=float(opt.get("throttle_halflife_s", 3.0)),
         in_flight_cap_per_direction=int(opt.get("in_flight_cap_per_direction", 0)),
+        persistence=persistence,
     )
 
 
