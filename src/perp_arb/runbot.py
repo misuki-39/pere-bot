@@ -40,17 +40,25 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+_STRATEGIES: dict[str, type[BaseStrategy]] = {
+    SpreadMonitor.name: SpreadMonitor,
+    TakerTakerArbitrage.name: TakerTakerArbitrage,
+}
+
+
 def _build_strategy(
     cfg: AppCfg,
     exchanges: dict[str, BaseExchange],
     markets: dict[str, MarketInfo],
 ) -> BaseStrategy:
-    name = cfg.strategy.strategy
-    if name == "spread_monitor":
-        return SpreadMonitor(cfg, exchanges, markets)
-    if name == "taker_taker":
-        return TakerTakerArbitrage(cfg, exchanges, markets)
-    raise ValueError(f"unknown strategy: {name!r}")
+    try:
+        cls = _STRATEGIES[cfg.strategy.strategy]
+    except KeyError:
+        known = ", ".join(sorted(_STRATEGIES))
+        raise ValueError(
+            f"unknown strategy {cfg.strategy.strategy!r}. known: {known}"
+        ) from None
+    return cls(cfg, exchanges, markets)
 
 
 async def _async_main(cfg: AppCfg) -> int:
