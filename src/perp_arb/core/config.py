@@ -62,7 +62,7 @@ class OptimisationsCfg(BaseModel):
     """Wave-1 optional knobs. All default-off = identical pre-Wave-1 behaviour.
 
     Live `taker_taker` consumes these via `taker_taker.__init__`. The pure
-    decision function `assess_taker_taker` already accepts the corresponding
+    decision function `assess_reversion` already accepts the corresponding
     `AssessParams` / `AssessInputs` fields, so the live wiring is just
     plumbing.
 

@@ -1,8 +1,9 @@
 """Backtest port of the taker-taker arbitrage strategy.
 
-Composes the shared pure decision function `assess_taker_taker` with a fresh
-`SpreadModel` (EWMA bias / scale) and a per-venue synthetic position. When
-`assess_taker_taker` returns `FIRED`, this strategy issues two `OrderIntent`s
+Composes the shared pure decision function `assess_reversion` (fed by
+`compute_taker_fills`) with a fresh `SpreadModel` (EWMA bias / scale) and a
+per-venue synthetic position. When `assess_reversion` returns `FIRED`, this
+strategy issues two `OrderIntent`s
 (left + right legs) sharing the same `Decision`; for any other terminal
 outcome it emits the Decision directly via `recorder.emit`. None outcomes
 (warmup or no-edge ticks) are silently dropped — that's the spread monitor's
@@ -17,13 +18,14 @@ from ...core.exec_record import Direction, Outcome, Phase
 from ...strategy.base import SpreadModel, TimeEwma
 from ...strategy.markout import MarkoutTable
 from ...strategy.persistence_gate import PersistenceGate
-from ...strategy.taker_taker_core import (
+from ...strategy.reversion_signal import (
     AssessInputs,
     AssessParams,
-    assess_taker_taker,
+    assess_reversion,
     left_side,
     right_side,
 )
+from ...strategy.taker_fill_model import TakerFillParams, compute_taker_fills
 from ..base import BacktestStrategy, EngineView
 from ..intents import FillEvent, OrderIntent
 from ..snapshot import MarketSnapshot
@@ -44,12 +46,15 @@ class TakerTakerBT(BacktestStrategy):
             if ctx.markout_table_path is not None
             else MarkoutTable.disabled()
         )
-        self._params = AssessParams(
+        self._fill_params = TakerFillParams(
             qty=ctx.capture_qty,
             max_levels=1,                      # BBO snapshot → one level
+            max_slippage_bps=ctx.max_slippage_bps,
+        )
+        self._params = AssessParams(
+            qty=ctx.capture_qty,
             fees_bps=ctx.fees_bps,             # round-trip, matches live convention
             min_profit_bps=ctx.min_profit_bps,
-            max_slippage_bps=ctx.max_slippage_bps,
             max_stale_ms=ctx.max_stale_ms,
             max_qty=ctx.max_qty,
             markout=markout,
@@ -71,7 +76,7 @@ class TakerTakerBT(BacktestStrategy):
         self._inflight_legs: dict[str, int] = {}          # decision_id -> legs remaining
 
         # Edge-persistence confirmation gate — a temporal filter applied to the
-        # `assess_taker_taker` output, identical to the live wiring in
+        # `assess_reversion` output, identical to the live wiring in
         # `strategy/taker_taker.py`. Off (identity pass-through) by default.
         self._gate = PersistenceGate(ctx.persistence)
         self._prev_left_ts: int | None = None
@@ -91,12 +96,14 @@ class TakerTakerBT(BacktestStrategy):
             bump_a = self._bump_a.update(Decimal(0), snap.ts_ms)  # decay toward 0
             bump_b = self._bump_b.update(Decimal(0), snap.ts_ms)
 
-        d = assess_taker_taker(self._params, AssessInputs(
+        fills = compute_taker_fills(
+            self._fill_params, snap.left_book, snap.right_book,
+            snap.left_quote.mid, snap.right_quote.mid)
+        d = assess_reversion(self._params, AssessInputs(
             now_ms=snap.ts_ms,
-            left_book=snap.left_book,
-            right_book=snap.right_book,
             left_quote=snap.left_quote,
             right_quote=snap.right_quote,
+            fills=fills,
             bias=bias,
             is_warm=self._spread.is_warm,
             position_left=view.position(self.ctx.left_venue),

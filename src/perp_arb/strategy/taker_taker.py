@@ -6,7 +6,8 @@ the factory wires the `exchanges` / `markets` dicts under those leg
 labels. This file does not name any specific venue.
 
 Layering: this module is the *signal* layer. It produces a `Decision`
-per tick (via `assess_taker_taker`) and hands fired decisions to
+per tick (via `compute_taker_fills` + `assess_reversion`) and hands fired
+decisions to
 `TwoLegExecutor`, which owns cid generation, the two-leg gather, WS
 fill tracking, partial-failure unwind, and paper-mode synth. The
 strategy only feeds `TradeReport` back into position / risk /
@@ -60,13 +61,14 @@ from ..utils.time import now_ms
 from .base import BaseStrategy, SpreadModel, TimeEwma
 from .markout import MarkoutTable
 from .persistence_gate import PersistenceGate, PersistenceParams
-from .taker_taker_core import (
+from .reversion_signal import (
     AssessInputs,
     AssessParams,
-    assess_taker_taker,
+    assess_reversion,
     left_side,
     right_side,
 )
+from .taker_fill_model import TakerFillParams, compute_taker_fills
 
 _log = logging.getLogger(__name__)
 
@@ -108,12 +110,15 @@ class TakerTakerArbitrage(BaseStrategy):
             if opt.markout_table_path is not None
             else MarkoutTable.disabled()
         )
-        self._params = AssessParams(
+        self._fill_params = TakerFillParams(
             qty=Decimal(str(s.qty)),
             max_levels=s.max_levels,
+            max_slippage_bps=Decimal(str(s.max_slippage_bps)),
+        )
+        self._params = AssessParams(
+            qty=Decimal(str(s.qty)),
             fees_bps=Decimal(str(s.fees_bps)),
             min_profit_bps=Decimal(str(s.min_profit_bps)),
-            max_slippage_bps=Decimal(str(s.max_slippage_bps)),
             max_stale_ms=s.max_stale_ms,
             max_qty=Decimal(str(s.max_qty)),
             markout=markout,
@@ -238,7 +243,7 @@ class TakerTakerArbitrage(BaseStrategy):
                 self._recorder.emit(d)
 
     def _assess(self, a_book, b_book, a_q, b_q) -> Decision | None:
-        """Thin wrapper around the pure `assess_taker_taker` decision math.
+        """Thin wrapper around the pure `assess_reversion` decision math.
 
         Live-only responsibilities kept here: update the EWMA, run the
         operational `RiskManager` gates (halted / consecutive-failures / daily
@@ -258,10 +263,12 @@ class TakerTakerArbitrage(BaseStrategy):
             bump_a = self._bump_a.update(Decimal(0), now)
             bump_b = self._bump_b.update(Decimal(0), now)
 
-        d = assess_taker_taker(self._params, AssessInputs(
+        fills = compute_taker_fills(
+            self._fill_params, a_book, b_book, a_q.mid, b_q.mid)
+        d = assess_reversion(self._params, AssessInputs(
             now_ms=now,
-            left_book=a_book, right_book=b_book,
             left_quote=a_q, right_quote=b_q,
+            fills=fills,
             bias=bias, is_warm=self._spread.is_warm,
             position_left=self._position.leg_a,
             position_right=self._position.leg_b,

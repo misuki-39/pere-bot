@@ -12,11 +12,12 @@ from perp_arb.core.exec_record import Direction, Outcome
 from perp_arb.core.types import BookLevel, OrderBook, Quote, Symbol
 from perp_arb.strategy.base import SpreadModel, TimeEwma
 from perp_arb.strategy.markout import MarkoutTable, _Bucket
-from perp_arb.strategy.taker_taker_core import (
+from perp_arb.strategy.reversion_signal import (
     AssessInputs,
     AssessParams,
-    assess_taker_taker,
+    assess_reversion,
 )
+from perp_arb.strategy.taker_fill_model import TakerFillParams, compute_taker_fills
 from perp_arb.utils.precision import vwap_fill
 
 # ---- TimeEwma ----------------------------------------------------------
@@ -212,22 +213,29 @@ def test_thin_book_returns_no_edge() -> None:
     assert edge is None
 
 
-# ---- Wave-1 optimisation knobs in assess_taker_taker -------------------
+# ---- Wave-1 optimisation knobs in assess_reversion --------------------
 
 
 def _params(**overrides) -> AssessParams:
     """Build an AssessParams with sensible test defaults."""
     base = dict(
         qty=Decimal("1"),
-        max_levels=3,
         fees_bps=Decimal("1"),
         min_profit_bps=Decimal("0"),
-        max_slippage_bps=Decimal("100"),
         max_stale_ms=10_000,
         max_qty=Decimal("10"),
     )
     base.update(overrides)
     return AssessParams(**base)
+
+
+def _fill_params() -> TakerFillParams:
+    """Taker fill-model params matching the `_params` test defaults."""
+    return TakerFillParams(
+        qty=Decimal("1"),
+        max_levels=3,
+        max_slippage_bps=Decimal("100"),
+    )
 
 
 def _inputs(*, a_bid: str, a_ask: str, l_bid: str, l_ask: str,
@@ -240,10 +248,11 @@ def _inputs(*, a_bid: str, a_ask: str, l_bid: str, l_ask: str,
     b_book = _book(sb, bids=[(l_bid, "100")], asks=[(l_ask, "100")])
     a_q = _bbo(sa, a_bid, a_ask)
     b_q = _bbo(sb, l_bid, l_ask)
+    fills = compute_taker_fills(_fill_params(), a_book, b_book, a_q.mid, b_q.mid)
     return AssessInputs(
         now_ms=0,
-        left_book=a_book, right_book=b_book,
         left_quote=a_q, right_quote=b_q,
+        fills=fills,
         bias=Decimal(bias), is_warm=True,
         position_left=Decimal(pos_left), position_right=Decimal(pos_right),
         bump_a_bps=Decimal(bump_a_bps),
@@ -260,7 +269,7 @@ def test_markout_subtraction_blocks_fire_just_above_fee_threshold() -> None:
 
     # Sanity: without markout, fires
     p_off = _params()
-    d = assess_taker_taker(p_off, inp)
+    d = assess_reversion(p_off, inp)
     assert d is not None and d.outcome is Outcome.FIRED
     assert d.direction is Direction.A
 
@@ -273,7 +282,7 @@ def test_markout_subtraction_blocks_fire_just_above_fee_threshold() -> None:
         latency_label="test",
     )
     p_on = _params(markout=table)
-    d2 = assess_taker_taker(p_on, inp)
+    d2 = assess_reversion(p_on, inp)
     assert d2 is None, f"expected no fire, got {d2}"
 
 
@@ -284,13 +293,13 @@ def test_bump_a_raises_threshold_for_direction_a_only() -> None:
     inp_a = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000",
                     bump_a_bps="1.0")  # +1 bps bump → effective threshold 2 bps > 1.5
     p = _params()
-    d = assess_taker_taker(p, inp_a)
+    d = assess_reversion(p, inp_a)
     assert d is None, "direction-A bump should suppress this fire"
 
     # Same bump on B does not affect a direction-A fire opportunity
     inp_b_bump = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000",
                          bump_b_bps="1.0")
-    d2 = assess_taker_taker(p, inp_b_bump)
+    d2 = assess_reversion(p, inp_b_bump)
     assert d2 is not None and d2.outcome is Outcome.FIRED and d2.direction is Direction.A
 
 
@@ -304,13 +313,13 @@ def test_inventory_skew_widens_growing_direction_narrows_flattening() -> None:
     inp = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000",
                   pos_left="5", pos_right="-5")
     p = _params(inventory_skew_bps=Decimal("2"))
-    d = assess_taker_taker(p, inp)
+    d = assess_reversion(p, inp)
     # A flattens → skew_A = +2 * (5 * -1) / 10 = -1 bps. Threshold drops; still fires.
     assert d is not None and d.outcome is Outcome.FIRED and d.direction is Direction.A
 
     # Now flip the position: long the OTHER way (position_left = -5 → A grows).
     inp_short = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000",
                         pos_left="-5", pos_right="5")
-    d2 = assess_taker_taker(p, inp_short)
+    d2 = assess_reversion(p, inp_short)
     # A grows → skew_A = +2 * (-5 * -1) / 10 = +1 bps. Effective threshold 2 bps > 1.5.
     assert d2 is None, "A should be blocked: growing |pos| and edge below skewed threshold"

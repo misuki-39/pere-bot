@@ -1,6 +1,6 @@
 """Persistence-confirmation gate — a stateful temporal filter on FIRED decisions.
 
-Sits between the signal layer (`assess_taker_taker`) and execution. The
+Sits between the signal layer (`assess_reversion`) and execution. The
 baseline fires the instant the edge clears threshold — the tick maximally
 enriched for one-tick winner's-curse noise. This gate suppresses a FIRED
 decision until its edge has *survived* `t_confirm_ms` across `n_confirm` venue
@@ -18,7 +18,7 @@ two cannot diverge. When disabled, `admit` is an identity pass-through —
 "disabled" is not a branch the caller has to handle.
 
 What it does NOT do: magnitude filtering. Whether an edge is *big enough* is
-`assess_taker_taker`'s job (`fees_bps + min_profit_bps`); a tick reaches this
+`assess_reversion`'s job (`fees_bps + min_profit_bps`); a tick reaches this
 gate as FIRED only once it already cleared that. The gate adds the orthogonal
 *duration* axis — has the edge lasted long enough to be real.
 """

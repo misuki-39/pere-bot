@@ -1,10 +1,17 @@
-"""Pure decision math for taker-taker arbitrage.
+"""Pure decision math for the spread-reversion arbitrage signal.
+
+This is the *signal* layer: given depth-aware fill prices and the EWMA bias,
+it decides whether the bias-adjusted spread is beyond the entry threshold
+(fees + min-profit + optional markout / inventory-skew / throttle), picks a
+direction, and builds a `Decision`. It is generic to a spread-reversion bet —
+it never computes fills and so makes no assumption about execution style; the
+caller supplies the fill prices (see `taker_fill_model.compute_taker_fills`).
 
 Shared by the live `TakerTakerArbitrage` strategy (which composes EWMA, risk,
 asyncio firing around this) and the backtest `TakerTakerBT` strategy. The
-function never reads or mutates global state — caller supplies the EWMA bias
-and the current synthetic position; this function only does math + builds a
-`Decision`.
+function never reads or mutates global state — caller supplies the EWMA bias,
+the fill prices, and the current synthetic position; this function only does
+math + builds a `Decision`.
 
 Convention: "left" = monitor_pair[0], "right" = monitor_pair[1]. In the
 existing live setup that's aster=left, lighter=right; in the WTI capture it's
@@ -16,19 +23,12 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import NamedTuple
 
 from ..core.exec_record import Decision, Direction, Outcome
-from ..core.types import OrderBook, Quote, Side
-from ..utils.precision import BPS, vwap_fill
+from ..core.types import Quote, Side
+from ..utils.precision import BPS
 from .markout import MarkoutTable
-
-
-class _Vwaps(NamedTuple):
-    left_sell: Decimal
-    left_buy: Decimal
-    right_sell: Decimal
-    right_buy: Decimal
+from .taker_fill_model import FillAbort, FillAbortKind, TakerFills
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,10 +45,8 @@ class AssessParams:
                κ=0 = current binary max_qty gate only.
     """
     qty: Decimal
-    max_levels: int
     fees_bps: Decimal
     min_profit_bps: Decimal
-    max_slippage_bps: Decimal
     max_stale_ms: int
     max_qty: Decimal
     markout: MarkoutTable = MarkoutTable.disabled()
@@ -59,6 +57,8 @@ class AssessParams:
 class AssessInputs:
     """Per-tick inputs. Caller is responsible for updating the EWMA model and
     passing the resulting `bias` + warm flag; we never touch EWMA state here.
+    Caller is likewise responsible for pricing the fills (`compute_taker_fills`)
+    and passing the result — a `TakerFills` or a `FillAbort`.
 
     Optional same-direction throttle bumps (default 0 = throttle off). When the
     caller maintains a per-direction TimeEwma of "recently fired" bumps,
@@ -66,10 +66,9 @@ class AssessInputs:
     the pure function does not own the EWMA state.
     """
     now_ms: int
-    left_book: OrderBook
-    right_book: OrderBook
     left_quote: Quote
     right_quote: Quote
+    fills: TakerFills | FillAbort
     bias: Decimal
     is_warm: bool
     position_left: Decimal
@@ -88,7 +87,7 @@ def right_side(direction: Direction) -> Side:
     return Side.BUY if direction is Direction.A else Side.SELL
 
 
-def assess_taker_taker(p: AssessParams, x: AssessInputs) -> Decision | None:
+def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
     """Returns a Decision (outcome terminal) or None when the tick isn't worth
     recording (warmup, or no positive edge). Pure; never raises for ordinary
     market states."""
@@ -98,9 +97,9 @@ def assess_taker_taker(p: AssessParams, x: AssessInputs) -> Decision | None:
     def new(
         outcome: Outcome, reason: str | None = None, *,
         bias: Decimal = Decimal(0), edge_bps: Decimal = Decimal(0),
-        direction: Direction | None = None, vwaps: _Vwaps | None = None,
+        direction: Direction | None = None, vwaps: TakerFills | None = None,
     ) -> Decision:
-        v = vwaps or _Vwaps(Decimal(0), Decimal(0), Decimal(0), Decimal(0))
+        v = vwaps or TakerFills(Decimal(0), Decimal(0), Decimal(0), Decimal(0))
         return Decision(
             decision_id=f"d-{uuid.uuid4().hex[:10]}",
             ts_ms=x.now_ms,
@@ -120,25 +119,18 @@ def assess_taker_taker(p: AssessParams, x: AssessInputs) -> Decision | None:
     if not x.is_warm:
         return None
 
-    qty = p.qty
-    vls, _ = vwap_fill(x.left_book.bids,  qty, max_levels=p.max_levels)
-    vlb, _ = vwap_fill(x.left_book.asks,  qty, max_levels=p.max_levels)
-    vrs, _ = vwap_fill(x.right_book.bids, qty, max_levels=p.max_levels)
-    vrb, _ = vwap_fill(x.right_book.asks, qty, max_levels=p.max_levels)
-    if vls is None or vlb is None or vrs is None or vrb is None:
-        return new(Outcome.ABORT_NO_DEPTH,
-                   "qty does not fill within max_levels", bias=x.bias)
-    vwap_left_sell, vwap_left_buy, vwap_right_sell, vwap_right_buy = vls, vlb, vrs, vrb
-
-    vw = _Vwaps(vwap_left_sell, vwap_left_buy, vwap_right_sell, vwap_right_buy)
-
-    slip = p.max_slippage_bps / BPS
-    if (abs((vwap_left_sell  - mid_left)  / mid_left)  > slip
-            or abs((vwap_left_buy   - mid_left)  / mid_left)  > slip
-            or abs((vwap_right_sell - mid_right) / mid_right) > slip
-            or abs((vwap_right_buy  - mid_right) / mid_right) > slip):
+    # The caller-supplied taker fill model may have declined to price the
+    # tick. Surface that as the matching abort Decision — done after the
+    # stale / warmup gates so outcome precedence is unchanged.
+    if isinstance(x.fills, FillAbort):
+        if x.fills.kind is FillAbortKind.NO_DEPTH:
+            return new(Outcome.ABORT_NO_DEPTH,
+                       "qty does not fill within max_levels", bias=x.bias)
         return new(Outcome.ABORT_SLIPPAGE, "vwap-mid exceeds max_slippage_bps",
-                   bias=x.bias, vwaps=vw)
+                   bias=x.bias, vwaps=x.fills.fills)
+    vw = x.fills
+    vwap_left_sell, vwap_left_buy = vw.left_sell, vw.left_buy
+    vwap_right_sell, vwap_right_buy = vw.right_sell, vw.right_buy
 
     ref_mid = (mid_left + mid_right) / Decimal(2)
 
@@ -171,6 +163,7 @@ def assess_taker_taker(p: AssessParams, x: AssessInputs) -> Decision | None:
     direction = Direction.A if edge_A >= edge_B else Direction.B
     edge_bps = max(edge_A, edge_B) / ref_mid * BPS
 
+    qty = p.qty
     post_left  = x.position_left  + qty * Decimal(left_side(direction).sign)
     post_right = x.position_right + qty * Decimal(right_side(direction).sign)
     if max(abs(post_left), abs(post_right)) > p.max_qty:
