@@ -24,6 +24,12 @@ logs/
 # content is host-specific.
 configs/markout/*.json
 
+# Docs (host-local, not tracked)
+docs/
+
+# Claude Code (host-local)
+CLAUDE.md
+
 # IDE
 .idea/
 .vscode/
