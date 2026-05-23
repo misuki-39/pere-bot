@@ -15,7 +15,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 import lighter
 
@@ -89,6 +89,9 @@ class LighterClient(BaseExchange):
         )
         if self.public_only:
             return
+        # `public_only` is True whenever `api_key_private_key` is None
+        # (set in __init__), so reaching here guarantees it's a real str.
+        assert self.api_key_private_key is not None
         self._signer = lighter.SignerClient(
             url=self.base_url,
             account_index=self.account_index,
@@ -253,9 +256,14 @@ class LighterClient(BaseExchange):
                 requested_qty=qty, error_message=f"sign: {err}",
             )
 
+        # After `err is None`, the SDK's union return guarantees the
+        # other tuple elements are populated. The SDK type stub declares
+        # tx_type as `str | None`, but the runtime value is the L2-tx-type
+        # int constant our `send_tx` serializes — cast at the boundary.
+        assert tx_type is not None and tx_info is not None
         t0 = time.monotonic()
         try:
-            reply = await self._user_ws.send_tx(tx_type, tx_info)
+            reply = await self._user_ws.send_tx(cast(int, tx_type), tx_info)
         except (TimeoutError, TxSubmitError) as e:
             return OrderResult(
                 success=False, client_id=client_id_str, side=side,

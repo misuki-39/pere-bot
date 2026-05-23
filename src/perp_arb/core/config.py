@@ -239,7 +239,9 @@ def require_live_creds(cfg: AppCfg) -> None:
     Called only when mode == LIVE; paper / spread_monitor tolerate placeholders.
     """
     venues_in_use = {cfg.strategy.pair.leg_a.venue, cfg.strategy.pair.leg_b.venue}
-    creds_by_venue = {"aster": cfg.aster, "lighter": cfg.lighter}
+    creds_by_venue: dict[str, AsterCreds | LighterCreds] = {
+        "aster": cfg.aster, "lighter": cfg.lighter,
+    }
     missing = [
         v for v in venues_in_use
         if v in creds_by_venue and creds_by_venue[v].is_placeholder

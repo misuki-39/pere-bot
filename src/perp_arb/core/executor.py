@@ -145,7 +145,7 @@ class TwoLegExecutor:
         # Trade-level latency = worst per-leg fill latency. Same metric
         # the risk manager budgets against — "did the slow leg blow our
         # max_leg_latency_ms?".
-        leg_latencies = [l.latency_ms for l in legs_out if l.latency_ms is not None]
+        leg_latencies = [leg.latency_ms for leg in legs_out if leg.latency_ms is not None]
         latency = max(leg_latencies) if leg_latencies else None
         report = TradeReport(
             legs=legs_out, latency_ms=latency, send_ts_ms=send_ts_ms,
@@ -161,6 +161,8 @@ class TwoLegExecutor:
             # 101.685 → +101.68 - 101.685 = -0.005 (paid 0.5 cents/unit).
             ap = legs_out[0].realized_price
             bp = legs_out[1].realized_price
+            ap_s: Decimal | None
+            bp_s: Decimal | None
             if ap is not None and bp is not None:
                 ap_s = ap if a_intent.side is Side.SELL else -ap
                 bp_s = bp if b_intent.side is Side.SELL else -bp

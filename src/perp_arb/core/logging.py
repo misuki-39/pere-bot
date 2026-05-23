@@ -16,7 +16,7 @@ from decimal import Decimal
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from threading import Lock
-from typing import TextIO
+from typing import Any, TextIO
 
 _DEFAULT_FORMAT = "%(asctime)s.%(msecs)03d %(levelname)-7s [%(name)s] %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -89,7 +89,9 @@ class CsvWriter:
         self.header = header
         self._lock = Lock()
         self._fp: TextIO | None = None
-        self._writer: csv.writer | None = None
+        # `csv.writer` is a factory function whose returned _writer object is
+        # not in any public type — Any here matches what cpython exposes.
+        self._writer: Any = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         is_new = not self.path.exists()
         self._fp = self.path.open("a", encoding="utf-8", newline="")

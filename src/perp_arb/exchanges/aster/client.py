@@ -213,7 +213,10 @@ class AsterClient(BaseExchange):
     # ----- user-data event fan-out -----
 
     def _on_user_event(self, data: dict) -> None:
-        handler = self._user_event_handlers.get(data.get("e"))
+        event_type = data.get("e")
+        if not isinstance(event_type, str):
+            return
+        handler = self._user_event_handlers.get(event_type)
         if handler is not None:
             handler(data)
 

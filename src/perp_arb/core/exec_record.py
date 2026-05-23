@@ -126,6 +126,9 @@ class LegReport:
         carries real fills (`filled_qty > 0`), its qty / avg / ts win;
         otherwise the ack is the source. Everything else (client_id,
         status, error) always comes from the ack."""
+        filled_qty: Decimal | None
+        realized_price: Decimal | None
+        fill_ts_ms: int | None
         if fill is not None and fill.filled_qty > 0:
             filled_qty = fill.filled_qty
             realized_price = fill.weighted_price_sum / fill.filled_qty

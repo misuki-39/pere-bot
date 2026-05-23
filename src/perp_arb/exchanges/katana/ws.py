@@ -332,5 +332,5 @@ class KatanaPublicWs:
         )
         for cb in self._book_cbs:
             cb(self._last_book)
-        for cb in self._quote_cbs:
-            cb(self._last_quote)
+        for qcb in self._quote_cbs:
+            qcb(self._last_quote)
