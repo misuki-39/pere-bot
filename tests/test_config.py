@@ -31,7 +31,6 @@ bias_halflife_s: 3600
 scale_halflife_s: 300
 warmup_seconds: 180
 max_levels: 3
-max_slippage_bps: 5
 max_stale_ms: 200
 risk:
   max_consecutive_failures: 3

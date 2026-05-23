@@ -22,7 +22,6 @@ warmup_seconds: 180           # don't trade until the centre has history
 
 # depth / staleness gates
 max_levels: 3                 # qty must fill within top-N levels
-max_slippage_bps: 5           # abort if (vwap - mid) / mid > this
 max_stale_ms: 200             # abort if either quote older than this
 
 risk:

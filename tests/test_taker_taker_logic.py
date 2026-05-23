@@ -231,11 +231,7 @@ def _params(**overrides) -> AssessParams:
 
 def _fill_params() -> TakerFillParams:
     """Taker fill-model params matching the `_params` test defaults."""
-    return TakerFillParams(
-        qty=Decimal("1"),
-        max_levels=3,
-        max_slippage_bps=Decimal("100"),
-    )
+    return TakerFillParams(qty=Decimal("1"), max_levels=3)
 
 
 def _inputs(*, a_bid: str, a_ask: str, l_bid: str, l_ask: str,
@@ -248,7 +244,7 @@ def _inputs(*, a_bid: str, a_ask: str, l_bid: str, l_ask: str,
     b_book = _book(sb, bids=[(l_bid, "100")], asks=[(l_ask, "100")])
     a_q = _bbo(sa, a_bid, a_ask)
     b_q = _bbo(sb, l_bid, l_ask)
-    fills = compute_taker_fills(_fill_params(), a_book, b_book, a_q.mid, b_q.mid)
+    fills = compute_taker_fills(_fill_params(), a_book, b_book)
     return AssessInputs(
         now_ms=0,
         left_quote=a_q, right_quote=b_q,

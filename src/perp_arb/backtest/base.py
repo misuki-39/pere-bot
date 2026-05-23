@@ -37,7 +37,6 @@ class StrategyContext:
     capture_qty: Decimal
     fees_bps: Decimal                          # round-trip, used for decision threshold
     min_profit_bps: Decimal
-    max_slippage_bps: Decimal
     max_stale_ms: int
     bias_halflife_s: float
     scale_halflife_s: float

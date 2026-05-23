@@ -113,7 +113,6 @@ class TakerTakerArbitrage(BaseStrategy):
         self._fill_params = TakerFillParams(
             qty=Decimal(str(s.qty)),
             max_levels=s.max_levels,
-            max_slippage_bps=Decimal(str(s.max_slippage_bps)),
         )
         self._params = AssessParams(
             qty=Decimal(str(s.qty)),
@@ -263,8 +262,7 @@ class TakerTakerArbitrage(BaseStrategy):
             bump_a = self._bump_a.update(Decimal(0), now)
             bump_b = self._bump_b.update(Decimal(0), now)
 
-        fills = compute_taker_fills(
-            self._fill_params, a_book, b_book, a_q.mid, b_q.mid)
+        fills = compute_taker_fills(self._fill_params, a_book, b_book)
         d = assess_reversion(self._params, AssessInputs(
             now_ms=now,
             left_quote=a_q, right_quote=b_q,

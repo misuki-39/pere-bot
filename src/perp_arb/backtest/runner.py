@@ -28,7 +28,6 @@ class StrategyParams:
     qty: Decimal
     fees_bps: Decimal
     min_profit_bps: Decimal
-    max_slippage_bps: Decimal
     max_stale_ms: int
     bias_halflife_s: float
     scale_halflife_s: float
@@ -59,7 +58,6 @@ def build_context(
         capture_qty=cfg.capture_qty,
         fees_bps=params.fees_bps,
         min_profit_bps=params.min_profit_bps,
-        max_slippage_bps=params.max_slippage_bps,
         max_stale_ms=params.max_stale_ms,
         bias_halflife_s=params.bias_halflife_s,
         scale_halflife_s=params.scale_halflife_s,

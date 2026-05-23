@@ -49,7 +49,6 @@ class TakerTakerBT(BacktestStrategy):
         self._fill_params = TakerFillParams(
             qty=ctx.capture_qty,
             max_levels=1,                      # BBO snapshot → one level
-            max_slippage_bps=ctx.max_slippage_bps,
         )
         self._params = AssessParams(
             qty=ctx.capture_qty,
@@ -97,8 +96,7 @@ class TakerTakerBT(BacktestStrategy):
             bump_b = self._bump_b.update(Decimal(0), snap.ts_ms)
 
         fills = compute_taker_fills(
-            self._fill_params, snap.left_book, snap.right_book,
-            snap.left_quote.mid, snap.right_quote.mid)
+            self._fill_params, snap.left_book, snap.right_book)
         d = assess_reversion(self._params, AssessInputs(
             now_ms=snap.ts_ms,
             left_quote=snap.left_quote,

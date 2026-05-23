@@ -2,14 +2,20 @@
 
 This module owns the part of the decision math that *assumes* both legs
 execute as market-order takers: it walks the visible book depth to price a
-`qty`-sized market order on each side, and gates on per-leg slippage versus
-mid. The reversion signal (`reversion_signal.py`) consumes the four fill
-prices it produces but knows nothing about how they were derived — swapping
-in a different execution style means swapping this module, not the signal.
+`qty`-sized market order on each side. The reversion signal
+(`reversion_signal.py`) consumes the four fill prices it produces but knows
+nothing about how they were derived — swapping in a different execution
+style means swapping this module, not the signal.
+
+Depth protection is structural: `max_levels` caps the VWAP walk, so a fill
+that would have to walk further than that returns `NO_DEPTH`. Economic
+protection lives in the signal layer's fee+min-profit threshold, which sees
+the same VWAPs and rejects unprofitable books automatically. No separate
+"slippage vs mid" gate — that would double-count BBO half-spread, which is
+already priced into the VWAPs the signal evaluates.
 
 `compute_taker_fills` is pure: no I/O, no global state, never raises for
-ordinary market states. A book too thin to fill `qty`, or a fill too far
-from mid, is reported as a `FillAbort`, not an exception.
+ordinary market states.
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ from decimal import Decimal
 from enum import StrEnum
 
 from ..core.types import OrderBook
-from ..utils.precision import BPS, vwap_fill
+from ..utils.precision import vwap_fill
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,49 +45,39 @@ class FillAbortKind(StrEnum):
     """Why the taker fill model declined to price the tick."""
 
     NO_DEPTH = "no_depth"      # qty does not fill within max_levels
-    SLIPPAGE = "slippage"      # a vwap-vs-mid deviation exceeds max_slippage_bps
 
 
 @dataclass(frozen=True, slots=True)
 class FillAbort:
-    """A tick the taker fill model could not (or would not) price.
-
-    `fills` is populated for `SLIPPAGE` — the four VWAPs are known and the
-    signal layer records them on the abort `Decision` — and `None` for
-    `NO_DEPTH`, where the book never filled."""
+    """A tick the taker fill model could not price (book too thin for qty
+    within max_levels)."""
 
     kind: FillAbortKind
-    fills: TakerFills | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class TakerFillParams:
     """Static taker fill-model parameters; build once per strategy instance.
 
-      qty:              order size each leg's market order must fill.
-      max_levels:       depth cap for the VWAP walk — a fill that needs more
-                        levels than this is treated as no-depth.
-      max_slippage_bps: per-leg cap on |vwap - mid|; a wider fill aborts the
-                        tick (stale / illiquid book guard).
+      qty:        order size each leg's market order must fill.
+      max_levels: depth cap for the VWAP walk — a fill that needs more
+                  levels than this is treated as no-depth.
     """
 
     qty: Decimal
     max_levels: int
-    max_slippage_bps: Decimal
 
 
 def compute_taker_fills(
     p: TakerFillParams,
     left_book: OrderBook,
     right_book: OrderBook,
-    mid_left: Decimal,
-    mid_right: Decimal,
 ) -> TakerFills | FillAbort:
     """Price a `qty`-sized taker market order on all four leg+side combos.
 
-    Returns `TakerFills` on success, or a `FillAbort` when the book is too
-    thin (`NO_DEPTH`) or a fill sits further from mid than `max_slippage_bps`
-    (`SLIPPAGE`). Pure; never raises for ordinary market states."""
+    Returns `TakerFills` on success, or `FillAbort(NO_DEPTH)` if the qty
+    doesn't fit within `max_levels` on any side. Pure; never raises for
+    ordinary market states."""
     qty = p.qty
     vls, _ = vwap_fill(left_book.bids,  qty, max_levels=p.max_levels)
     vlb, _ = vwap_fill(left_book.asks,  qty, max_levels=p.max_levels)
@@ -89,14 +85,4 @@ def compute_taker_fills(
     vrb, _ = vwap_fill(right_book.asks, qty, max_levels=p.max_levels)
     if vls is None or vlb is None or vrs is None or vrb is None:
         return FillAbort(FillAbortKind.NO_DEPTH)
-
-    fills = TakerFills(left_sell=vls, left_buy=vlb, right_sell=vrs, right_buy=vrb)
-
-    slip = p.max_slippage_bps / BPS
-    if (abs((fills.left_sell  - mid_left)  / mid_left)  > slip
-            or abs((fills.left_buy   - mid_left)  / mid_left)  > slip
-            or abs((fills.right_sell - mid_right) / mid_right) > slip
-            or abs((fills.right_buy  - mid_right) / mid_right) > slip):
-        return FillAbort(FillAbortKind.SLIPPAGE, fills=fills)
-
-    return fills
+    return TakerFills(left_sell=vls, left_buy=vlb, right_sell=vrs, right_buy=vrb)

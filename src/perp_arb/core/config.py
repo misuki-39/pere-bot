@@ -117,7 +117,6 @@ class StrategyCfg(BaseModel):
 
     # depth / staleness gates
     max_levels: int = 3
-    max_slippage_bps: Decimal = Decimal("5")
     max_stale_ms: int = 200
 
     risk: RiskCfg = RiskCfg()

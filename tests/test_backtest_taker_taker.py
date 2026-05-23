@@ -76,7 +76,7 @@ def test_taker_taker_zero_latency_captures_clean_edge(tmp_path: Path) -> None:
     from perp_arb.backtest.runner import StrategyParams
     params = StrategyParams(
         qty=Decimal("1"), fees_bps=Decimal("2"), min_profit_bps=Decimal("2"),
-        max_slippage_bps=Decimal("100"), max_stale_ms=10_000,
+        max_stale_ms=10_000,
         bias_halflife_s=1e9, scale_halflife_s=300, warmup_seconds=0,
         max_qty=Decimal("1000"),
     )
@@ -111,7 +111,7 @@ def test_taker_taker_qty_mismatch_fails_fast() -> None:
     from perp_arb.backtest.runner import StrategyParams
     params = StrategyParams(
         qty=Decimal("2"), fees_bps=Decimal("2"), min_profit_bps=Decimal("2"),
-        max_slippage_bps=Decimal("100"), max_stale_ms=10_000,
+        max_stale_ms=10_000,
         bias_halflife_s=3600, scale_halflife_s=300, warmup_seconds=0,
         max_qty=Decimal("1000"),
     )

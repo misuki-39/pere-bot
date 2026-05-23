@@ -28,7 +28,7 @@ from ..core.exec_record import Decision, Direction, Outcome
 from ..core.types import Quote, Side
 from ..utils.precision import BPS
 from .markout import MarkoutTable
-from .taker_fill_model import FillAbort, FillAbortKind, TakerFills
+from .taker_fill_model import FillAbort, TakerFills
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,14 +120,11 @@ def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
         return None
 
     # The caller-supplied taker fill model may have declined to price the
-    # tick. Surface that as the matching abort Decision — done after the
-    # stale / warmup gates so outcome precedence is unchanged.
+    # tick (book too thin for qty within max_levels). Surface as ABORT_NO_DEPTH
+    # — done after the stale / warmup gates so outcome precedence is unchanged.
     if isinstance(x.fills, FillAbort):
-        if x.fills.kind is FillAbortKind.NO_DEPTH:
-            return new(Outcome.ABORT_NO_DEPTH,
-                       "qty does not fill within max_levels", bias=x.bias)
-        return new(Outcome.ABORT_SLIPPAGE, "vwap-mid exceeds max_slippage_bps",
-                   bias=x.bias, vwaps=x.fills.fills)
+        return new(Outcome.ABORT_NO_DEPTH,
+                   "qty does not fill within max_levels", bias=x.bias)
     vw = x.fills
     vwap_left_sell, vwap_left_buy = vw.left_sell, vw.left_buy
     vwap_right_sell, vwap_right_buy = vw.right_sell, vw.right_buy

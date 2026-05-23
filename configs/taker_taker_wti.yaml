@@ -23,7 +23,6 @@ warmup_seconds: 180
 
 # depth / staleness gates
 max_levels: 3
-max_slippage_bps: 5
 max_stale_ms: 200
 
 risk:

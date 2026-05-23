@@ -52,7 +52,6 @@ def _load_params(config_path: Path, override_qty: Decimal | None) -> StrategyPar
         qty=qty,
         fees_bps=Decimal(str(raw.get("fees_bps", 0))),
         min_profit_bps=Decimal(str(raw.get("min_profit_bps", 0))),
-        max_slippage_bps=Decimal(str(raw.get("max_slippage_bps", 5))),
         max_stale_ms=int(raw.get("max_stale_ms", 200)),
         bias_halflife_s=float(raw.get("bias_halflife_s", 3600)),
         scale_halflife_s=float(raw.get("scale_halflife_s", 300)),
