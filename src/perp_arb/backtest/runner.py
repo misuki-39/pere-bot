@@ -105,9 +105,5 @@ def run_backtest(cfg: EngineConfig, params: StrategyParams) -> EngineSummary:
     finally:
         recorder.close()
     write_summary(summary, cfg.out_dir / "summary.json")
-    _log.info(
-        "backtest done: %d intents, %d filled, %d rejected, pnl=%s, final=%s",
-        summary.intents_emitted, summary.fills_succeeded,
-        summary.fills_rejected, summary.realised_pnl, summary.final_positions,
-    )
+    _log.info("%s", summary.pretty())
     return summary

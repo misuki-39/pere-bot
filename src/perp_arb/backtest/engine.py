@@ -23,6 +23,7 @@ from pathlib import Path
 
 from ..core.exec_record import (
     Decision,
+    Direction,
     ExecutionRecorder,
     LegKind,
     LegReport,
@@ -64,6 +65,15 @@ class EngineSummary:
     outage_count: int = 0
     outage_max_ms: int = 0
     reject_reasons: dict[str, int] = field(default_factory=dict)
+    # Direction-resolved fire counts (only successful 2-leg pairs).
+    fires_dir_a: int = 0
+    fires_dir_b: int = 0
+    # Per-venue tick count where |position| ≥ max_qty (combined settled+in_flight,
+    # sampled once per row at the moment the strategy decides). Diagnoses the
+    # position-cap blocking new same-direction fires.
+    ticks_pinned: dict[str, int] = field(default_factory=dict)
+    duration_ms: int = 0
+    max_qty: Decimal = Decimal("0")
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -77,7 +87,40 @@ class EngineSummary:
             "outage_count": self.outage_count,
             "outage_max_ms": self.outage_max_ms,
             "reject_reasons": self.reject_reasons,
+            "fires_dir_a": self.fires_dir_a,
+            "fires_dir_b": self.fires_dir_b,
+            "ticks_pinned": dict(self.ticks_pinned),
+            "duration_ms": self.duration_ms,
+            "max_qty": str(self.max_qty),
         }
+
+    def pretty(self) -> str:
+        """Human-rendered multi-line summary. Same source of truth as `to_dict`."""
+        dur_h, rem = divmod(self.duration_ms // 1000, 3600)
+        dur_m = rem // 60
+        per_day = (
+            self.realised_pnl * Decimal(86_400_000) / Decimal(self.duration_ms)
+            if self.duration_ms > 0 else Decimal(0)
+        )
+        per_pair = (
+            self.realised_pnl / Decimal(self.decisions_emitted)
+            if self.decisions_emitted > 0 else Decimal(0)
+        )
+        pin_lines = []
+        for venue, n in self.ticks_pinned.items():
+            pct = (n / self.rows_processed * 100) if self.rows_processed > 0 else 0.0
+            pin_lines.append(f"{venue}={n}/{self.rows_processed} ({pct:.2f}%)")
+        final_pos = ", ".join(f"{k}={v}" for k, v in self.final_positions.items()) or "(none)"
+        return (
+            "backtest done\n"
+            f"  duration:       {dur_h}h {dur_m}m  ({self.duration_ms} ms, {self.rows_processed} rows)\n"
+            f"  intents:        {self.intents_emitted}  (filled {self.fills_succeeded}, rejected {self.fills_rejected})\n"
+            f"  pairs:          {self.decisions_emitted}  (A={self.fires_dir_a} B={self.fires_dir_b})\n"
+            f"  pnl:            {self.realised_pnl:.4f}  (${per_day:.3f}/day, ${per_pair:.4f}/pair)\n"
+            f"  final pos:      {final_pos}  (cap=±{self.max_qty})\n"
+            f"  pinned ticks:   {'  '.join(pin_lines) if pin_lines else '(none)'}\n"
+            f"  outages:        {self.outage_count}  (max {self.outage_max_ms} ms)"
+        )
 
 
 _OUTAGE_THRESHOLD_MS = 5_000
@@ -121,6 +164,7 @@ class Engine:
         self.in_flight_qty: dict[str, Decimal] = {ctx.left_venue: Decimal("0"),
                                                   ctx.right_venue: Decimal("0")}
         self.summary = EngineSummary()
+        self.summary.ticks_pinned = {ctx.left_venue: 0, ctx.right_venue: 0}
         self.view = EngineView(_positions=self.positions.sizes,
                                _in_flight=self.in_flight_qty,
                                _sim_now_ms=0, _pending_count=0)
@@ -185,6 +229,10 @@ class Engine:
                 left_leg.filled_qty or Decimal(0),
                 self.cfg.fee_bps_per_leg,
             )
+            if d.direction is Direction.A:
+                self.summary.fires_dir_a += 1
+            elif d.direction is Direction.B:
+                self.summary.fires_dir_b += 1
         recorder.emit(d)
         self.summary.decisions_emitted += 1
 
@@ -232,6 +280,12 @@ class Engine:
             self._drain(row.ts_ms, recorder)
 
             self._refresh_view(row.ts_ms)
+            # Position-pin sample: at the moment the strategy decides, is
+            # |settled+in_flight| ≥ max_qty for either venue? Combined exposure
+            # is what `assess_reversion` actually gates on.
+            for venue in (self.ctx.left_venue, self.ctx.right_venue):
+                if abs(self.view.position(venue)) >= self.ctx.max_qty:
+                    self.summary.ticks_pinned[venue] += 1
             snap = build_snapshot(row)
             for intent in self.strategy.on_tick(snap, self.view):
                 self._schedule(intent)
@@ -260,6 +314,8 @@ class Engine:
         self.strategy.on_end(self.view)
         self.summary.realised_pnl = self.positions.realised_pnl
         self.summary.final_positions = dict(self.positions.sizes)
+        self.summary.duration_ms = self.rows[-1].ts_ms - self.rows[0].ts_ms
+        self.summary.max_qty = self.ctx.max_qty
         return self.summary
 
 

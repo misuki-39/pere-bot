@@ -11,7 +11,7 @@ from pathlib import Path
 
 from perp_arb.backtest.base import BacktestStrategy, EngineView, StrategyContext
 from perp_arb.backtest.dataset import BBORow
-from perp_arb.backtest.engine import Engine, EngineConfig
+from perp_arb.backtest.engine import Engine, EngineConfig, EngineSummary
 from perp_arb.backtest.fills import FillModelKind
 from perp_arb.backtest.intents import OrderIntent
 from perp_arb.backtest.latency import BookIndex, LatencyModel
@@ -157,6 +157,11 @@ def test_zero_latency_atomic_pair_updates_position_and_pnl(tmp_path) -> None:
     assert engine.positions.position("aster") == Decimal("3")
     # PnL per round: sell(100.00) + buy(-100.15) per ETH = -0.15 per leg-pair
     assert summary.realised_pnl == Decimal("-0.45")
+    # duration_ms = last_ts - first_ts; max_qty plumbed from ctx; max_qty=1000
+    # is way above the 3-tick exposure so no pin samples.
+    assert summary.duration_ms == 200
+    assert summary.max_qty == Decimal("1000")
+    assert summary.ticks_pinned == {"lighter": 0, "aster": 0}
 
 
 def test_eod_unfilled_when_arrival_past_last_tick(tmp_path) -> None:
@@ -222,3 +227,37 @@ def test_adverse_selection_lookup_picks_book_at_arrival(tmp_path) -> None:
     left_leg = next(r for r in leg_rows if r["exchange"] == "lighter")
     assert Decimal(left_leg["realized_price"]) == Decimal("100.00")
     assert summary.decisions_emitted == 1
+
+
+def test_summary_ticks_pinned_counts_pre_strategy_pin(tmp_path) -> None:
+    """max_qty=2; AlwaysFire fires 3 ticks ignoring the cap. Pin sampling
+    happens AFTER the pre-strategy drain — so by tick 3 the position is ±2
+    (settled from tick 2) and both legs count as pinned exactly once."""
+    rows = [_row(t, t, t) for t in (1000, 1100, 1200)]
+    ctx, rec = _ctx(tmp_path, max_qty="2")
+    engine, _ = _engine(rows, ctx)
+    summary = engine.run(rec)
+    rec.close()
+    # tick 1: pos=0 (no pin). tick 2: pos=±1 (no pin, |1|<2). tick 3: pos=±2 (PIN).
+    assert summary.ticks_pinned == {"lighter": 1, "aster": 1}
+
+
+def test_summary_pretty_smoke() -> None:
+    """`EngineSummary.pretty()` renders all the load-bearing fields. Format
+    is judged by humans — assert key substrings, not full string equality."""
+    s = EngineSummary(
+        rows_processed=1000, intents_emitted=20, fills_succeeded=20,
+        fills_rejected=0, decisions_emitted=10, realised_pnl=Decimal("1.2345"),
+        final_positions={"lighter": Decimal("-3"), "aster": Decimal("3")},
+        fires_dir_a=7, fires_dir_b=3,
+        ticks_pinned={"lighter": 100, "aster": 0},
+        duration_ms=3_600_000, max_qty=Decimal("10"),
+    )
+    text = s.pretty()
+    assert "backtest done" in text
+    assert "A=7" in text and "B=3" in text
+    assert "1.2345" in text
+    assert "/day" in text and "/pair" in text
+    assert "lighter=100/1000" in text                   # pin row
+    assert "lighter=-3" in text and "aster=3" in text   # final pos row
+    assert "cap=±10" in text

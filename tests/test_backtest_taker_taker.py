@@ -104,6 +104,10 @@ def test_taker_taker_zero_latency_captures_clean_edge(tmp_path: Path) -> None:
     # on each leg: 0.20 * 1e-4 ≈ 0.02 per leg. Net ≈ 0.18 / RT × 50 ≈ 9.
     assert summary.realised_pnl > Decimal("8")
     assert summary.realised_pnl < Decimal("10")
+    # All 50 fires are direction A (left expensive → sell left/buy right);
+    # protects the increment site in _maybe_emit + Decision.direction wiring.
+    assert summary.fires_dir_a == 50
+    assert summary.fires_dir_b == 0
 
 
 def test_taker_taker_qty_mismatch_fails_fast() -> None:
