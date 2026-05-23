@@ -17,7 +17,7 @@ from perp_arb.core.types import (
     Symbol,
 )
 from perp_arb.core.types import (
-    TerminalFill as _FillAccumulator,
+    LegOutcome as _FillAccumulator,
 )
 from perp_arb.exchanges.aster.client import AsterClient
 
@@ -122,7 +122,7 @@ def test_aster_terminal_status_propagates_on_filled() -> None:
 
 def test_aster_parses_commission_into_fill_delta_fee() -> None:
     """`o.n` is the per-fill commission (Binance-fork). Adapter promotes
-    it onto `FillDelta.fee`; accumulator sums into `TerminalFill.total_fee`."""
+    it onto `FillDelta.fee`; accumulator sums into `LegOutcome.total_fee`."""
     c, received = _make_client_with_market()
     c._handle_order_trade_update(_trade_evt(
         last_qty="0.4", last_price="100.00", cum_qty="0.4", commission="0.04",

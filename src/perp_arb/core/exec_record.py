@@ -20,7 +20,7 @@ from pathlib import Path
 
 from ..utils.time import mono_ms
 from .logging import CsvWriter
-from .types import OrderResult, Side, TerminalFill
+from .types import LegOutcome
 
 
 class Outcome(StrEnum):
@@ -115,44 +115,49 @@ class LegReport:
     kind: LegKind = LegKind.ENTRY
 
     @classmethod
-    def build(
-        cls, *, venue: str, side: Side, qty: Decimal,
-        expected: Decimal | None, ack: OrderResult,
-        fill: TerminalFill | None = None,
+    def from_outcome(
+        cls, *, venue: str, outcome: LegOutcome,
+        expected_price: Decimal | None,
         send_ts_ms: int, kind: LegKind = LegKind.ENTRY,
     ) -> LegReport:
-        """Single LegReport constructor: merges the synchronous place-ack
-        with the WS-derived authoritative fill aggregate. When `fill`
-        carries real fills (`filled_qty > 0`), its qty / avg / ts win;
-        otherwise the ack is the source. Everything else (client_id,
-        status, error) always comes from the ack."""
-        filled_qty: Decimal | None
-        realized_price: Decimal | None
-        fill_ts_ms: int | None
-        if fill is not None and fill.filled_qty > 0:
-            filled_qty = fill.filled_qty
-            realized_price = fill.weighted_price_sum / fill.filled_qty
-            fill_ts_ms = fill.last_ts_ms or ack.exchange_ts_ms
-        else:
-            filled_qty = ack.filled_qty
-            realized_price = ack.avg_price
-            fill_ts_ms = ack.exchange_ts_ms
-        fee = fill.total_fee if fill is not None else Decimal("0")
-        latency_ms = fill_ts_ms - send_ts_ms if fill_ts_ms is not None else None
+        """Pure field copy. The ack/WS merge already happened upstream in
+        `BaseExchange.submit_and_await`; this is just a projection from
+        the unified `LegOutcome` shape onto the recorder's row shape.
+
+        `side` is required (no defensive "" coercion) so a downstream
+        `Side(row['side'])` can never get an empty string. A successful
+        outcome with `filled_qty == 0` (e.g. cancel-on-place) preserves
+        the zero; only outright failure (`success=False`) records None.
+        """
+        assert outcome.side is not None, (
+            "LegOutcome must carry side for recording — drivers always set it; "
+            "an unset side means a bug at the construction site."
+        )
+        if outcome.requested_qty is None:
+            raise ValueError(
+                "LegOutcome.requested_qty is None at recorder boundary — "
+                "drivers must populate it from the LegIntent."
+            )
+        fill_ts = outcome.fill_ts_ms
+        latency_ms = fill_ts - send_ts_ms if fill_ts is not None else None
+        # filled_qty=None signals "no fill information" (failed ack);
+        # Decimal('0') signals "ack succeeded but zero qty filled" (a
+        # distinct, recordable outcome — e.g. cancel-on-place).
+        filled_qty = outcome.filled_qty if outcome.success else None
         return cls(
             exchange=venue,
-            side=side.value,
-            requested_qty=qty,
+            side=outcome.side.value,
+            requested_qty=outcome.requested_qty,
             filled_qty=filled_qty,
-            expected_price=expected,
-            realized_price=realized_price,
-            status=ack.status.value,
-            success=ack.success,
-            error=ack.error_message,
-            client_id=ack.client_id,
-            fee=fee,
+            expected_price=expected_price,
+            realized_price=outcome.avg_price,
+            status=outcome.status.value,
+            success=outcome.success,
+            error=outcome.error_message,
+            client_id=outcome.client_id,
+            fee=outcome.total_fee,
             latency_ms=latency_ms,
-            fill_ts_ms=fill_ts_ms,
+            fill_ts_ms=fill_ts,
             kind=kind,
         )
 

@@ -16,9 +16,9 @@ from perp_arb.core.config import (
 from perp_arb.core.exchange import BaseExchange
 from perp_arb.core.session import LiveSession, PaperSession
 from perp_arb.core.types import (
+    LegOutcome,
     MarketInfo,
     OrderBook,
-    OrderResult,
     Position,
     Quote,
     Symbol,
@@ -96,7 +96,7 @@ class _FakeExchange(BaseExchange):
     async def load_market(self, raw_symbol: str) -> MarketInfo: raise NotImplementedError
     async def place_market_order(  # type: ignore[override]
         self, market, side, qty, *, reduce_only=False, client_id=None,
-    ) -> OrderResult: raise NotImplementedError
+    ) -> LegOutcome: raise NotImplementedError
     def subscribe_quotes(self, market: MarketInfo, cb: Callable) -> None: raise NotImplementedError
     def subscribe_book(self, market: MarketInfo, cb: Callable) -> None: raise NotImplementedError
     def subscribe_fills(self, market: MarketInfo, cb: Callable) -> None: raise NotImplementedError

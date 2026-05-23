@@ -9,15 +9,13 @@ from decimal import Decimal
 from .fill_tracker import _PerCidFillTracker
 from .types import (
     FillDelta,
+    LegOutcome,
     MarketInfo,
     OrderBook,
-    OrderOutcome,
-    OrderResult,
     OrderSnapshot,
     Position,
     Quote,
     Side,
-    TerminalFill,
 )
 
 QuoteCallback = Callable[[Quote], None]
@@ -66,7 +64,14 @@ class BaseExchange(ABC):
         *,
         reduce_only: bool = False,
         client_id: str | None = None,
-    ) -> OrderResult: ...
+    ) -> LegOutcome:
+        """Submit a market order and return whatever the venue's synchronous
+        response provides — ack fields populated, fill-side populated only
+        if the venue's REST/WS-sync reply carries them (aster's
+        `executedQty`/`avgPrice` for synchronous-fill markets). WS fill
+        events arrive separately via the per-cid tracker.
+
+        For end-to-end submit + WS-fill resolution, use `submit_and_await`."""
 
     @abstractmethod
     async def get_position(self, market: MarketInfo) -> Position: ...
@@ -141,10 +146,11 @@ class BaseExchange(ABC):
         client_id: str,
         requested_qty: Decimal,
         timeout_s: float,
-    ) -> TerminalFill | None:
+    ) -> LegOutcome | None:
         """Wait up to `timeout_s` for accumulated fills on `client_id`
         to reach `requested_qty` or terminal status. Returns whatever
-        landed (`None` if never registered)."""
+        landed (`None` if never registered). Only fill-side fields are
+        populated — ack-side stays at defaults."""
         return await self._fill_tracker.await_terminal(
             client_id, requested_qty, timeout_s,
         )
@@ -164,23 +170,49 @@ class BaseExchange(ABC):
         client_id: str,
         timeout_s: float = 5.0,
         reduce_only: bool = False,
-    ) -> OrderOutcome:
+    ) -> LegOutcome:
         """One-shot wrapper: register + submit + await + release.
 
-        Use this when you don't need to interleave anything between
-        the place ack and WS terminal fill. Most callers should use
-        this. For finer-grained control (e.g. timeline marks between
-        ack and fill), use the three primitives above.
+        This is the **single merge point** between the synchronous REST/WS
+        place-ack and the WS-aggregated fill stream. The driver's
+        `place_market_order` returns a LegOutcome with ack fields plus any
+        REST-reported fill data (aster's `executedQty`/`avgPrice` for
+        synchronous-fill markets); we then overlay WS-aggregated fill data
+        on top when the tracker observes equal-or-larger fill quantity.
+
+        Overlay rule: WS only WINS when `ws.filled_qty >= outcome.filled_qty`.
+        That preserves REST's synchronous-full-fill view (aster) when the
+        WS stream only delivers a partial-with-terminal-status event (a
+        single trailing FillDelta would otherwise downgrade a complete
+        REST fill). For venues whose REST has no fill data (lighter:
+        outcome.filled_qty=0), any ws.filled_qty>0 wins. Fee and ts come
+        from the same source we accept the qty/price from, to keep the
+        view internally consistent.
+
+        Status reconciliation: when the WS stream observed a terminal
+        status (FILLED / CANCELED / REJECTED / EXPIRED), it's the
+        authoritative final state — promote it onto outcome.status so
+        downstream filters (CSV `status` column) see the real outcome.
         """
         self.register_fill_slot(client_id)
         try:
-            ack = await self.place_market_order(
+            outcome = await self.place_market_order(
                 market, side, qty,
                 reduce_only=reduce_only, client_id=client_id,
             )
-            if not ack.success:
-                return OrderOutcome(ack=ack, fill=None)
-            fill = await self.await_fill(client_id, qty, timeout_s)
-            return OrderOutcome(ack=ack, fill=fill)
+            if not outcome.success:
+                return outcome
+            ws = await self.await_fill(client_id, qty, timeout_s)
+            if ws is not None:
+                if ws.filled_qty >= outcome.filled_qty and ws.filled_qty > 0:
+                    outcome.filled_qty = ws.filled_qty
+                    outcome.weighted_price_sum = ws.weighted_price_sum
+                    outcome.last_ts_ms = ws.last_ts_ms
+                    outcome.total_fee = ws.total_fee
+                if ws.last_status is not None:
+                    outcome.last_status = ws.last_status
+                    if ws.last_status.terminal:
+                        outcome.status = ws.last_status
+            return outcome
         finally:
             self.release_fill_slot(client_id)

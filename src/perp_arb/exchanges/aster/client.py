@@ -18,9 +18,9 @@ from ...core.exchange import (
 )
 from ...core.types import (
     FillDelta,
+    LegOutcome,
     MarketInfo,
     OrderBook,
-    OrderResult,
     OrderStatus,
     Position,
     Quote,
@@ -147,7 +147,7 @@ class AsterClient(BaseExchange):
         *,
         reduce_only: bool = False,
         client_id: str | None = None,
-    ) -> OrderResult:
+    ) -> LegOutcome:
         if self.public_only:
             raise RuntimeError("aster is in public_only mode — cannot place orders")
         client_id = client_id or f"pa-{uuid.uuid4().hex[:16]}"
@@ -163,7 +163,7 @@ class AsterClient(BaseExchange):
             )
         except Exception as e:  # noqa: BLE001
             _log.warning("aster order failed: %s", e)
-            return OrderResult(
+            return LegOutcome(
                 success=False,
                 client_id=client_id,
                 side=side,
@@ -172,19 +172,38 @@ class AsterClient(BaseExchange):
                 latency_ms=int((time.monotonic() - t0) * 1000),
             )
         # `transactTime` (Binance-fork convention) is the exchange-server
-        # millisecond timestamp of the order action. Promote it to
-        # `exchange_ts_ms` so the recorder can log matching-engine time
-        # alongside our client-observed latency.
-        return OrderResult(
+        # millisecond timestamp of the order action. Aster's REST also
+        # returns `executedQty`/`avgPrice` for market orders (fills are
+        # synchronous), which we store as a fallback in case the WS
+        # ORDER_TRADE_UPDATE never lands; `submit_and_await` overlays WS
+        # data on top when it does.
+        #
+        # Only populate the fill-side fields when BOTH executedQty>0 AND
+        # avgPrice>0 are present — otherwise weighted_price_sum=qty*0=0
+        # would fabricate a `realized_price=0` (via the avg_price property)
+        # downstream, blowing up PnL math with a $0 fill price. `is not None`
+        # over `or`-fallback because Decimal('0') is falsy in Python.
+        rest_filled = _dec(resp.get("executedQty"))
+        rest_avg = _dec(resp.get("avgPrice"))
+        if (
+            rest_filled is not None and rest_avg is not None
+            and rest_filled > 0 and rest_avg > 0
+        ):
+            filled_qty = rest_filled
+            weighted_price_sum = rest_filled * rest_avg
+        else:
+            filled_qty = Decimal("0")
+            weighted_price_sum = Decimal("0")
+        return LegOutcome(
             success=True,
             client_id=client_id,
             side=side,
             requested_qty=qty,
-            filled_qty=_dec(resp.get("executedQty")),
-            avg_price=_dec(resp.get("avgPrice")),
             status=_ASTER_STATUS_MAP.get(resp["status"], OrderStatus.UNKNOWN),
             latency_ms=int((time.monotonic() - t0) * 1000),
             exchange_ts_ms=int(resp["transactTime"]) if resp.get("transactTime") else None,
+            filled_qty=filled_qty,
+            weighted_price_sum=weighted_price_sum,
         )
 
     async def get_position(self, market: MarketInfo) -> Position:

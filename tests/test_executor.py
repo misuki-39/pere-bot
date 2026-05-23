@@ -2,9 +2,10 @@
 strategy decisions and venue drivers.
 
 Tests pin the four partial-failure quadrants, the paper-mode synth path,
-the WS-timeout fallback, and a few representative latency/leg-report
-invariants. Driver behaviour is stubbed: these tests never hit the real
-`aster` / `lighter` clients.
+PnL computation, and a few representative latency/leg-report invariants.
+Driver behaviour is stubbed at the `submit_and_await` boundary: these
+tests never hit the real `aster` / `lighter` clients. The ack/WS merge
+itself is tested separately in test_fill_enrichment.py.
 
 The executor is strategy-agnostic: it takes `LegIntent`s with already-
 resolved sides + expected prices, plus a `Timeline` writeback target.
@@ -22,13 +23,12 @@ from perp_arb.core.exec_record import LegKind, Phase, Timeline
 from perp_arb.core.executor import LegIntent, TwoLegExecutor
 from perp_arb.core.types import (
     BookLevel,
+    LegOutcome,
     MarketInfo,
     OrderBook,
-    OrderResult,
     OrderStatus,
     Side,
     Symbol,
-    TerminalFill,
 )
 
 _SYM_A = Symbol(exchange="aster", raw="ETHUSDT", base="ETH", quote="USDT")
@@ -60,60 +60,69 @@ def _book(symbol: Symbol, *, bid: str = "100.00", ask: str = "100.02") -> OrderB
 
 @dataclass
 class _StubExchange:
-    """Stub `BaseExchange` for executor tests — only the methods the
-    executor actually calls."""
+    """Stub `BaseExchange` for executor tests. The stub overrides
+    `submit_and_await` (the merged-outcome entry point the executor uses)
+    and `place_market_order` (the unwind path). The real driver-side
+    ack/WS merge logic is exercised separately in test_fill_enrichment.py
+    against `BaseExchange.submit_and_await`."""
 
     name: str
-    submit_result: OrderResult | None = None
+    submit_outcome: LegOutcome | None = None
     submit_raises: Exception | None = None
-    fill_result: TerminalFill | None = None
     book_a: OrderBook = field(default_factory=lambda: _book(_SYM_A))
     book_l: OrderBook = field(default_factory=lambda: _book(_SYM_L))
     submit_calls: list[dict[str, Any]] = field(default_factory=list)
 
-    async def place_market_order(
+    async def submit_and_await(
         self, market: MarketInfo, side: Side, qty: Decimal,
-        *, reduce_only: bool = False, client_id: str | None = None,
-    ) -> OrderResult:
+        *, client_id: str, timeout_s: float = 5.0, reduce_only: bool = False,
+    ) -> LegOutcome:
         self.submit_calls.append({
             "side": side, "qty": qty, "reduce_only": reduce_only,
             "client_id": client_id,
         })
         if self.submit_raises is not None:
             raise self.submit_raises
-        assert self.submit_result is not None
-        return self.submit_result
+        assert self.submit_outcome is not None
+        return self.submit_outcome
 
-    def register_fill_slot(self, client_id: str) -> None:
-        pass
-
-    async def await_fill(
-        self, client_id: str, requested_qty: Decimal, timeout_s: float,
-    ) -> TerminalFill | None:
-        return self.fill_result
-
-    def release_fill_slot(self, client_id: str) -> None:
-        pass
+    async def place_market_order(
+        self, market: MarketInfo, side: Side, qty: Decimal,
+        *, reduce_only: bool = False, client_id: str | None = None,
+    ) -> LegOutcome:
+        # Used only by the unwind path. Reuse submit_outcome's shape but
+        # always return a success-shaped outcome (the unwind doesn't need
+        # to fail in any test today; if it does, override per-instance).
+        self.submit_calls.append({
+            "side": side, "qty": qty, "reduce_only": reduce_only,
+            "client_id": client_id,
+        })
+        assert self.submit_outcome is not None
+        return self.submit_outcome
 
     def order_book(self, market: MarketInfo) -> OrderBook:
         return self.book_a if market.symbol.exchange == "aster" else self.book_l
 
 
-def _ok(*, venue: str, side: Side, qty: Decimal, avg: str | None = "100.00") -> OrderResult:
-    return OrderResult(
+def _ok(*, side: Side, qty: Decimal, avg: str = "100.00",
+        fee: str = "0", exchange_ts: int | None = None) -> LegOutcome:
+    """Build a successful merged outcome (ack + WS already reconciled)."""
+    return LegOutcome(
         success=True,
         client_id="cid",
         side=side,
         requested_qty=qty,
-        filled_qty=qty if avg else None,
-        avg_price=Decimal(avg) if avg else None,
-        status=OrderStatus.FILLED if avg else OrderStatus.OPEN,
+        status=OrderStatus.FILLED,
         latency_ms=10,
+        exchange_ts_ms=exchange_ts,
+        filled_qty=qty,
+        weighted_price_sum=Decimal(avg) * qty,
+        total_fee=Decimal(fee),
     )
 
 
-def _bad(*, side: Side, qty: Decimal, msg: str) -> OrderResult:
-    return OrderResult(
+def _bad(*, side: Side, qty: Decimal, msg: str) -> LegOutcome:
+    return LegOutcome(
         success=False, side=side, requested_qty=qty, error_message=msg,
     )
 
@@ -149,11 +158,11 @@ async def test_both_legs_succeed_no_unwind() -> None:
     qty = Decimal("1.0")
     aster = _StubExchange(
         name="aster",
-        submit_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.05"),
+        submit_outcome=_ok(side=Side.SELL, qty=qty, avg="100.05"),
     )
     lighter = _StubExchange(
         name="lighter",
-        submit_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.07"),
+        submit_outcome=_ok(side=Side.BUY, qty=qty, avg="100.07"),
     )
     ex = _executor(aster, lighter)
     timeline = Timeline()
@@ -165,10 +174,11 @@ async def test_both_legs_succeed_no_unwind() -> None:
     assert report.failure_reason is None
     assert [leg.kind for leg in report.legs] == [LegKind.ENTRY, LegKind.ENTRY]
     assert [leg.exchange for leg in report.legs] == ["aster", "lighter"]
-    # executor allocates one cid per trade, shared across both legs
-    # (per-driver fill tracker scopes the namespace)
+    # executor allocates one cid per leg — defends against a future
+    # same-venue strategy where a shared cid would alias accumulator
+    # state and the first finishing leg's release would wipe the other.
     assert aster.submit_calls[0]["client_id"] == str(_TEST_CID_SEED)
-    assert lighter.submit_calls[0]["client_id"] == str(_TEST_CID_SEED)
+    assert lighter.submit_calls[0]["client_id"] == str(_TEST_CID_SEED + 1)
     # send_ts_ms populated on report so the caller can stamp its own record
     assert report.send_ts_ms > 0
     # Cash-flow pair PnL: sell 100.05, buy 100.07, no fees → -0.02.
@@ -176,30 +186,23 @@ async def test_both_legs_succeed_no_unwind() -> None:
 
 
 @pytest.mark.asyncio
-async def test_realised_pnl_includes_ws_fees() -> None:
-    """Aster's WS leg supplies a per-fill commission via `TerminalFill.total_fee`;
-    the executor's pair PnL subtracts it. Lighter is zero-fee."""
+async def test_realised_pnl_subtracts_fees() -> None:
+    """The merged outcome carries `total_fee`; pair PnL nets fees out.
+    Aster sells 100.10 with 0.03 fee; lighter buys 100.00 with 0 fee.
+    Gross spread = 0.10; net PnL = 0.07."""
     qty = Decimal("1.0")
     aster = _StubExchange(
         name="aster",
-        submit_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.00"),
-        fill_result=TerminalFill(
-            filled_qty=Decimal("1.0"),
-            weighted_price_sum=Decimal("100.10"),  # WS price overrides REST
-            last_ts_ms=1_700_000_000_500,
-            last_status=OrderStatus.FILLED,
-            total_fee=Decimal("0.03"),
-        ),
+        submit_outcome=_ok(side=Side.SELL, qty=qty, avg="100.10", fee="0.03"),
     )
     lighter = _StubExchange(
         name="lighter",
-        submit_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.00"),
+        submit_outcome=_ok(side=Side.BUY, qty=qty, avg="100.00"),
     )
     ex = _executor(aster, lighter)
     report = await ex.execute(
         trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
     )
-    # gross = +100.10 (sell) - 100.00 (buy) = +0.10; fees = 0.03 → +0.07.
     assert report.success is True
     assert report.realised_pnl == Decimal("0.07")
     assert report.legs[0].fee == Decimal("0.03")
@@ -210,10 +213,10 @@ async def test_realised_pnl_includes_ws_fees() -> None:
 async def test_failed_trade_has_no_realised_pnl() -> None:
     qty = Decimal("1.0")
     aster = _StubExchange(
-        name="aster", submit_result=_bad(side=Side.SELL, qty=qty, msg="A down"),
+        name="aster", submit_outcome=_bad(side=Side.SELL, qty=qty, msg="A down"),
     )
     lighter = _StubExchange(
-        name="lighter", submit_result=_bad(side=Side.BUY, qty=qty, msg="L down"),
+        name="lighter", submit_outcome=_bad(side=Side.BUY, qty=qty, msg="L down"),
     )
     ex = _executor(aster, lighter)
     report = await ex.execute(
@@ -230,11 +233,11 @@ async def test_aster_ok_lighter_fail_unwinds_aster() -> None:
     qty = Decimal("1.0")
     aster = _StubExchange(
         name="aster",
-        submit_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.05"),
+        submit_outcome=_ok(side=Side.SELL, qty=qty, avg="100.05"),
     )
     lighter = _StubExchange(
         name="lighter",
-        submit_result=_bad(side=Side.BUY, qty=qty, msg="sequencer rejected"),
+        submit_outcome=_bad(side=Side.BUY, qty=qty, msg="sequencer rejected"),
     )
     ex = _executor(aster, lighter)
     report = await ex.execute(
@@ -248,7 +251,8 @@ async def test_aster_ok_lighter_fail_unwinds_aster() -> None:
     assert len(report.legs) == 3
     assert report.legs[2].kind is LegKind.UNWIND
     assert report.legs[2].exchange == "aster"
-    # Second aster call is the unwind: opposite side + reduce_only
+    # Second aster call is the unwind (via place_market_order):
+    # opposite side + reduce_only
     assert len(aster.submit_calls) == 2
     unwind_call = aster.submit_calls[1]
     assert unwind_call["reduce_only"] is True
@@ -260,11 +264,11 @@ async def test_lighter_ok_aster_fail_unwinds_lighter() -> None:
     qty = Decimal("1.0")
     aster = _StubExchange(
         name="aster",
-        submit_result=_bad(side=Side.SELL, qty=qty, msg="aster timeout"),
+        submit_outcome=_bad(side=Side.SELL, qty=qty, msg="aster timeout"),
     )
     lighter = _StubExchange(
         name="lighter",
-        submit_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.07"),
+        submit_outcome=_ok(side=Side.BUY, qty=qty, avg="100.07"),
     )
     ex = _executor(aster, lighter)
     report = await ex.execute(
@@ -285,10 +289,10 @@ async def test_lighter_ok_aster_fail_unwinds_lighter() -> None:
 async def test_both_legs_fail_no_unwind() -> None:
     qty = Decimal("1.0")
     aster = _StubExchange(
-        name="aster", submit_result=_bad(side=Side.SELL, qty=qty, msg="A down"),
+        name="aster", submit_outcome=_bad(side=Side.SELL, qty=qty, msg="A down"),
     )
     lighter = _StubExchange(
-        name="lighter", submit_result=_bad(side=Side.BUY, qty=qty, msg="L down"),
+        name="lighter", submit_outcome=_bad(side=Side.BUY, qty=qty, msg="L down"),
     )
     ex = _executor(aster, lighter)
     report = await ex.execute(
@@ -300,61 +304,6 @@ async def test_both_legs_fail_no_unwind() -> None:
     # No unwind leg — nothing to flatten
     assert all(leg.kind is LegKind.ENTRY for leg in report.legs)
     assert len(report.legs) == 2
-
-
-# ---- WS fill paths -------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_ws_fill_overrides_rest_price() -> None:
-    """When WS fill carries a real price, LegReport prefers it over REST."""
-    qty = Decimal("1.0")
-    aster = _StubExchange(
-        name="aster",
-        submit_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.00"),
-        fill_result=TerminalFill(
-            filled_qty=Decimal("1.0"),
-            weighted_price_sum=Decimal("100.10"),
-            last_ts_ms=1_700_000_000_500,
-            last_status=OrderStatus.FILLED,
-        ),
-    )
-    lighter = _StubExchange(
-        name="lighter",
-        submit_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.00"),
-    )
-    ex = _executor(aster, lighter)
-    report = await ex.execute(
-        trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
-    )
-
-    aster_leg = report.legs[0]
-    assert aster_leg.realized_price == Decimal("100.10")
-    assert aster_leg.fill_ts_ms == 1_700_000_000_500
-
-
-@pytest.mark.asyncio
-async def test_ws_fill_timeout_falls_back_to_rest() -> None:
-    """REST ok but WS never delivered: report stays success=True (REST is
-    the success oracle); LegReport falls back to REST avg_price."""
-    qty = Decimal("1.0")
-    aster = _StubExchange(
-        name="aster",
-        submit_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.05"),
-        fill_result=None,
-    )
-    lighter = _StubExchange(
-        name="lighter",
-        submit_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.07"),
-        fill_result=TerminalFill(),  # empty: registered, no events
-    )
-    ex = _executor(aster, lighter)
-    report = await ex.execute(
-        trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
-    )
-
-    assert report.success is True
-    assert report.legs[0].realized_price == Decimal("100.05")
-    assert report.legs[1].realized_price == Decimal("100.07")
 
 
 # ---- paper mode ----------------------------------------------------------
@@ -374,7 +323,7 @@ async def test_paper_synth_uses_book_vwap() -> None:
     assert report.success is True
     assert report.legs[0].realized_price == Decimal("100.00")  # aster bid (SELL)
     assert report.legs[1].realized_price == Decimal("100.06")  # lighter ask (BUY)
-    # No REST calls — paper short-circuits
+    # No driver calls — paper short-circuits
     assert aster.submit_calls == [] and lighter.submit_calls == []
 
 
@@ -392,6 +341,51 @@ async def test_paper_does_not_unwind() -> None:
     assert all(leg.kind is LegKind.ENTRY for leg in report.legs)
 
 
+@pytest.mark.asyncio
+async def test_paper_raises_on_empty_book() -> None:
+    """`assert` would be stripped under python -O; explicit raise gives a
+    clear error path regardless of optimization flags."""
+    qty = Decimal("1.0")
+    # bid + ask both present but capped: vwap on a missing side returns None
+    empty_book = OrderBook(symbol=_SYM_A, bids=[], asks=[], ts_ms=0)
+    aster = _StubExchange(name="aster", book_a=empty_book)
+    lighter = _StubExchange(name="lighter", book_l=_book(_SYM_L))
+    ex = _executor(aster, lighter, is_paper=True)
+    with pytest.raises(RuntimeError, match="empty bids"):
+        await ex.execute(
+            trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
+        )
+
+
+# ---- exception coercion from gather --------------------------------------
+
+@pytest.mark.asyncio
+async def test_unexpected_exception_coerced_to_failure_outcome() -> None:
+    """A raise out of submit_and_await must NOT escape execute() —
+    `return_exceptions=True` + `_coerce_outcome` convert it into a
+    success=False outcome so `_handle_partial_failure` can run."""
+    qty = Decimal("1.0")
+    aster = _StubExchange(
+        name="aster",
+        submit_outcome=_ok(side=Side.SELL, qty=qty, avg="100.05"),
+    )
+    lighter = _StubExchange(
+        name="lighter", submit_raises=RuntimeError("ws crashed"),
+    )
+    ex = _executor(aster, lighter)
+    report = await ex.execute(
+        trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
+    )
+    # gather still resolved; partial-failure logic unwound aster
+    assert report.success is False
+    assert "lighter leg failed" in (report.failure_reason or "")
+    assert "ws crashed" in (report.failure_reason or "")
+    # Unwind appended (we use submit_and_await for the unwind too)
+    assert len(report.legs) == 3
+    assert report.legs[2].kind is LegKind.UNWIND
+    assert report.legs[2].exchange == "aster"
+
+
 # ---- side flip works through LegIntent ----------------------------------
 
 @pytest.mark.asyncio
@@ -401,11 +395,11 @@ async def test_legs_with_opposite_sides() -> None:
     qty = Decimal("1.0")
     aster = _StubExchange(
         name="aster",
-        submit_result=_ok(venue="aster", side=Side.BUY, qty=qty, avg="100.02"),
+        submit_outcome=_ok(side=Side.BUY, qty=qty, avg="100.02"),
     )
     lighter = _StubExchange(
         name="lighter",
-        submit_result=_ok(venue="lighter", side=Side.SELL, qty=qty, avg="100.04"),
+        submit_outcome=_ok(side=Side.SELL, qty=qty, avg="100.04"),
     )
     ex = _executor(aster, lighter)
     report = await ex.execute(
@@ -428,11 +422,11 @@ async def test_timeline_send_mark_set() -> None:
     qty = Decimal("1.0")
     aster = _StubExchange(
         name="aster",
-        submit_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.05"),
+        submit_outcome=_ok(side=Side.SELL, qty=qty, avg="100.05"),
     )
     lighter = _StubExchange(
         name="lighter",
-        submit_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.07"),
+        submit_outcome=_ok(side=Side.BUY, qty=qty, avg="100.07"),
     )
     ex = _executor(aster, lighter)
     timeline = Timeline()

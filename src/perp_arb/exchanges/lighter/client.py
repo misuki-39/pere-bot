@@ -27,9 +27,9 @@ from ...core.exchange import (
     QuoteCallback,
 )
 from ...core.types import (
+    LegOutcome,
     MarketInfo,
     OrderBook,
-    OrderResult,
     OrderSnapshot,
     OrderStatus,
     Position,
@@ -214,7 +214,7 @@ class LighterClient(BaseExchange):
         *,
         reduce_only: bool = False,
         client_id: str | None = None,
-    ) -> OrderResult:
+    ) -> LegOutcome:
         if self.public_only or self._signer is None or self._user_ws is None:
             raise RuntimeError("lighter is in public_only mode — cannot place orders")
         meta = self._meta_by_symbol.get(market.symbol.raw)
@@ -251,7 +251,7 @@ class LighterClient(BaseExchange):
             api_key_index=self.api_key_index,
         )
         if err is not None:
-            return OrderResult(
+            return LegOutcome(
                 success=False, client_id=client_id_str, side=side,
                 requested_qty=qty, error_message=f"sign: {err}",
             )
@@ -265,24 +265,26 @@ class LighterClient(BaseExchange):
         try:
             reply = await self._user_ws.send_tx(cast(int, tx_type), tx_info)
         except (TimeoutError, TxSubmitError) as e:
-            return OrderResult(
+            return LegOutcome(
                 success=False, client_id=client_id_str, side=side,
                 requested_qty=qty, error_message=str(e),
                 latency_ms=int((time.monotonic() - t0) * 1000),
             )
         ok, err_msg = _sendtx_outcome(reply)
         if not ok:
-            return OrderResult(
+            return LegOutcome(
                 success=False, client_id=client_id_str, side=side,
                 requested_qty=qty, error_message=err_msg,
                 latency_ms=int((time.monotonic() - t0) * 1000),
             )
-        return OrderResult(
+        # Lighter sendtx returns no fill data — the fill arrives later via
+        # the account_market WS stream; `submit_and_await` overlays it.
+        return LegOutcome(
             success=True,
             client_id=client_id_str,
             side=side,
             requested_qty=qty,
-            status=OrderStatus.OPEN,    # final fill state arrives via account WS
+            status=OrderStatus.OPEN,
             latency_ms=int((time.monotonic() - t0) * 1000),
         )
 

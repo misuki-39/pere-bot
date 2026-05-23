@@ -29,7 +29,7 @@ from ..core.exec_record import (
     LegReport,
     Phase,
 )
-from ..core.types import OrderResult, OrderStatus, Side
+from ..core.types import LegOutcome, OrderStatus, Side
 from .base import BacktestStrategy, EngineView, StrategyContext
 from .dataset import BBORow
 from .fills import FillModelKind, VenueSide, fill_model_for
@@ -189,24 +189,37 @@ class Engine:
             - intent.qty * Decimal(intent.side.sign)
         )
         d = self.in_flight[fill.decision_id]
-        # Mirror live: ack carries the venue-side fill instant as
+        # Mirror live: the outcome carries the venue-side fill instant as
         # `exchange_ts_ms`. In backtest, that's the simulated arrival ts
-        # (= submit ts + venue latency). LegReport.build then computes
+        # (= submit ts + venue latency). LegReport.from_outcome computes
         # latency_ms = fill_ts_ms - send_ts_ms (= the venue latency the
         # user dialled in, modulo NTP skew which is 0 in backtest).
-        r = OrderResult(
+        # Atomic: filled_qty + weighted_price_sum must be committed together.
+        # A fill with qty>0 but no realized_price would otherwise leave
+        # avg_price returning Decimal('0') (fabricated $0 fill) instead of
+        # None, blowing up downstream PnL math.
+        if (
+            fill.success and fill.filled_qty is not None
+            and fill.realized_price is not None and fill.filled_qty > 0
+        ):
+            bt_filled = fill.filled_qty
+            bt_wp_sum = fill.filled_qty * fill.realized_price
+        else:
+            bt_filled = Decimal("0")
+            bt_wp_sum = Decimal("0")
+        out = LegOutcome(
             success=fill.success,
             side=fill.side,
             requested_qty=fill.requested_qty,
-            filled_qty=fill.filled_qty,
-            avg_price=fill.realized_price,
             status=OrderStatus.FILLED if fill.success else OrderStatus.REJECTED,
             error_message=fill.error,
             exchange_ts_ms=fill.arrival_ts_ms,
+            filled_qty=bt_filled,
+            weighted_price_sum=bt_wp_sum,
         )
-        d.legs.append(LegReport.build(
-            venue=fill.venue, side=fill.side, qty=fill.requested_qty,
-            expected=intent.expected_price, ack=r,
+        d.legs.append(LegReport.from_outcome(
+            venue=fill.venue, outcome=out,
+            expected_price=intent.expected_price,
             send_ts_ms=intent.sim_ts_ms, kind=LegKind.ENTRY,
         ))
         if fill.success:

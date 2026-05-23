@@ -1,9 +1,9 @@
-"""Two-leg execution: gathers place-acks + WS fills on both venues,
+"""Two-leg execution: gathers `submit_and_await` outcomes on both venues,
 unwinds the stranded leg on partial failure, returns a `TradeReport`.
 
 Layering: the executor sits between **strategy** (signal — produces
 decisions and resolves them into venue-side intents) and **driver**
-(per-venue place_market_order + WS + cid-keyed fill tracking via
+(per-venue `submit_and_await` + WS + cid-keyed fill tracking via
 `BaseExchange`). It is strategy-agnostic — it never sees `Direction`,
 `vwap_*`, or any strategy-internal field. The caller hands it concrete
 `LegIntent`s (venue, side, expected_price) and a `Timeline` writeback
@@ -28,7 +28,7 @@ from ..utils.time import now_ms
 from .exchange import BaseExchange
 from .exec_record import LegKind, LegReport, Phase, Timeline
 from .pnl import pair_pnl_from_legs
-from .types import MarketInfo, OrderResult, Side, TerminalFill
+from .types import LegOutcome, MarketInfo, OrderStatus, Side
 
 _log = logging.getLogger(__name__)
 
@@ -49,8 +49,7 @@ class TradeReport:
     """Result the executor returns to the caller.
 
     `success=True` iff both entry legs' place acks returned success.
-    Per-leg WS fill data lives on `legs[*]` via `LegReport.build`; legs
-    without a WS event fall back to the place ack's values.
+    Per-leg WS fill data lives on `legs[*]` via `LegReport.from_outcome`.
 
     A partial-failure unwind appears as an additional leg with
     `kind=UNWIND`. Both-fail leaves `success` False with a populated
@@ -109,36 +108,56 @@ class TwoLegExecutor:
         timeline: Timeline,
     ) -> TradeReport:
         a_intent, b_intent = legs
-        cid = self._next_cid()
+        # Per-leg cids. cids are per-driver scoped (each driver has its
+        # own _fill_tracker), so they don't collide cross-venue today —
+        # but a same-venue two-leg strategy WOULD collide on a shared
+        # cid because the first finishing leg's release_fill_slot would
+        # wipe the second leg's accumulator mid-flight. Per-leg cids
+        # cost one int and close that door.
+        cid_a = self._next_cid()
+        cid_b = self._next_cid()
 
         timeline.mark(Phase.SEND)
         send_ts_ms = now_ms()
 
         if self._is_paper:
-            ack_a = self._paper_fill_one(a_intent, qty, cid)
-            ack_b = self._paper_fill_one(b_intent, qty, cid)
-            a_fill: TerminalFill | None = None
-            b_fill: TerminalFill | None = None
+            a_out = self._paper_outcome(a_intent, qty, cid_a)
+            b_out = self._paper_outcome(b_intent, qty, cid_b)
         else:
-            (ack_a, a_fill), (ack_b, b_fill) = await asyncio.gather(
-                self._submit_leg(a_intent, qty, cid),
-                self._submit_leg(b_intent, qty, cid),
+            # `return_exceptions=True`: an unexpected raise out of one
+            # submit_and_await (CancelledError aside) must NOT cancel
+            # the sibling — that sibling may have already placed a real
+            # venue order whose fill we still need to track. Coerce any
+            # captured exception into a `LegOutcome(success=False)` so
+            # the partial-failure / unwind path runs on both sides.
+            results = await asyncio.gather(
+                self.exchanges[a_intent.venue].submit_and_await(
+                    self.markets[a_intent.venue], a_intent.side, qty,
+                    client_id=cid_a, timeout_s=self.fill_wait_timeout_s,
+                ),
+                self.exchanges[b_intent.venue].submit_and_await(
+                    self.markets[b_intent.venue], b_intent.side, qty,
+                    client_id=cid_b, timeout_s=self.fill_wait_timeout_s,
+                ),
+                return_exceptions=True,
             )
+            a_out = _coerce_outcome(results[0], a_intent.side, qty)
+            b_out = _coerce_outcome(results[1], b_intent.side, qty)
 
         # CSV `exchange` column = actual venue ("aster"/"lighter") via
         # BaseExchange.name, not the leg label key ("leg_a") — keeps audit
         # traces joinable to venue-side records.
         legs_out = [
-            LegReport.build(
+            LegReport.from_outcome(
                 venue=self.exchanges[a_intent.venue].name,
-                side=a_intent.side, qty=qty,
-                expected=a_intent.expected_price, ack=ack_a, fill=a_fill,
+                outcome=a_out,
+                expected_price=a_intent.expected_price,
                 send_ts_ms=send_ts_ms,
             ),
-            LegReport.build(
+            LegReport.from_outcome(
                 venue=self.exchanges[b_intent.venue].name,
-                side=b_intent.side, qty=qty,
-                expected=b_intent.expected_price, ack=ack_b, fill=b_fill,
+                outcome=b_out,
+                expected_price=b_intent.expected_price,
                 send_ts_ms=send_ts_ms,
             ),
         ]
@@ -151,61 +170,21 @@ class TwoLegExecutor:
             legs=legs_out, latency_ms=latency, send_ts_ms=send_ts_ms,
         )
 
-        if ack_a.success and ack_b.success:
+        if a_out.success and b_out.success:
             report.success = True
             report.realised_pnl = pair_pnl_from_legs(legs_out[0], legs_out[1])
-            # Sign-encode by cash flow: sell → +price (cash in), buy →
-            # -price (cash out). Sum is then the per-unit net cash
-            # received — positive = profit captured pre-fees, negative
-            # = paid premium. Aster sells at 101.68, lighter buys at
-            # 101.685 → +101.68 - 101.685 = -0.005 (paid 0.5 cents/unit).
-            ap = legs_out[0].realized_price
-            bp = legs_out[1].realized_price
-            ap_s: Decimal | None
-            bp_s: Decimal | None
-            if ap is not None and bp is not None:
-                ap_s = ap if a_intent.side is Side.SELL else -ap
-                bp_s = bp if b_intent.side is Side.SELL else -bp
-                spread = f" spread={ap_s + bp_s}"
-            else:
-                ap_s, bp_s = ap, bp
-                spread = ""
             _log.info(
-                "[%s] FILLED %s=%s %s=%s%s pnl=%s latency=%sms",
+                "[%s] FILLED %s pnl=%s latency=%sms",
                 trade_id,
-                self.exchanges[a_intent.venue].name, ap_s,
-                self.exchanges[b_intent.venue].name, bp_s,
-                spread, report.realised_pnl, latency,
+                _spread_log(a_intent, b_intent, a_out, b_out),
+                report.realised_pnl, latency,
             )
             return report
 
         await self._handle_partial_failure(
-            trade_id, a_intent, b_intent, qty, ack_a, ack_b, report,
+            trade_id, a_intent, b_intent, qty, a_out, b_out, report,
         )
         return report
-
-    # ----- one-leg submit (live only) -----
-
-    async def _submit_leg(
-        self, leg: LegIntent, qty: Decimal, cid: str,
-    ) -> tuple[OrderResult, TerminalFill | None]:
-        """Place + WS fill await for one leg. Per-leg timing lives on
-        the resulting LegReport (fill_ts_ms - send_ts_ms)."""
-        ex = self.exchanges[leg.venue]
-        mkt = self.markets[leg.venue]
-        ex.register_fill_slot(cid)
-        try:
-            ack = await ex.place_market_order(
-                mkt, leg.side, qty, client_id=cid,
-            )
-            if not ack.success:
-                return ack, None
-            fill = await ex.await_fill(
-                cid, qty, self.fill_wait_timeout_s,
-            )
-            return ack, fill
-        finally:
-            ex.release_fill_slot(cid)
 
     # ----- partial-failure recovery -----
 
@@ -215,8 +194,8 @@ class TwoLegExecutor:
         a: LegIntent,
         b: LegIntent,
         qty: Decimal,
-        ack_a: OrderResult,
-        ack_b: OrderResult,
+        a_out: LegOutcome,
+        b_out: LegOutcome,
         report: TradeReport,
     ) -> None:
         # Log + failure_reason use the actual venue names ("aster"/"lighter")
@@ -224,32 +203,32 @@ class TwoLegExecutor:
         # internal leg-label routing.
         a_name = self.exchanges[a.venue].name
         b_name = self.exchanges[b.venue].name
-        if ack_a.success and not ack_b.success:
+        if a_out.success and not b_out.success:
             _log.error(
                 "[%s] PARTIAL: %s filled, %s failed (%s) — unwinding %s",
-                trade_id, a_name, b_name, ack_b.error_message, a_name,
+                trade_id, a_name, b_name, b_out.error_message, a_name,
             )
             unwind = await self._unwind_leg(
-                a.venue, a.side.opposite, qty, ack_a.avg_price,
+                a.venue, a.side.opposite, qty, a_out.avg_price,
             )
             if unwind is not None:
                 report.legs.append(unwind)
-            report.failure_reason = f"{b_name} leg failed: {ack_b.error_message}"
-        elif ack_b.success and not ack_a.success:
+            report.failure_reason = f"{b_name} leg failed: {b_out.error_message}"
+        elif b_out.success and not a_out.success:
             _log.error(
                 "[%s] PARTIAL: %s filled, %s failed (%s) — unwinding %s",
-                trade_id, b_name, a_name, ack_a.error_message, b_name,
+                trade_id, b_name, a_name, a_out.error_message, b_name,
             )
             unwind = await self._unwind_leg(
-                b.venue, b.side.opposite, qty, ack_b.avg_price,
+                b.venue, b.side.opposite, qty, b_out.avg_price,
             )
             if unwind is not None:
                 report.legs.append(unwind)
-            report.failure_reason = f"{a_name} leg failed: {ack_a.error_message}"
+            report.failure_reason = f"{a_name} leg failed: {a_out.error_message}"
         else:
             _log.warning(
                 "[%s] BOTH FAILED: %s=%s %s=%s",
-                trade_id, a_name, ack_a.error_message, b_name, ack_b.error_message,
+                trade_id, a_name, a_out.error_message, b_name, b_out.error_message,
             )
             report.failure_reason = "both legs failed"
 
@@ -263,46 +242,100 @@ class TwoLegExecutor:
         """Flatten the stranded leg. `expected_price` is the stranded
         fill we are reversing, so the round-trip cost of a partial is
         directly computable offline. Returns `None` in paper mode
-        (paper has no real position to flatten)."""
+        (paper has no real position to flatten).
+
+        Routes through `submit_and_await` so the WS fill data populates
+        the unwind LegReport — `place_market_order` alone leaves
+        lighter unwinds with no realized_price (lighter's REST carries
+        no fill data; only WS does)."""
         if self._is_paper:
             return None
         ex = self.exchanges[venue]
         mkt = self.markets[venue]
+        unwind_cid = self._next_cid()
         unwind_send_ts = now_ms()
         try:
-            ack = await ex.place_market_order(mkt, side, qty, reduce_only=True)
-            if not ack.success:
-                _log.error("unwind on %s FAILED: %s", venue, ack.error_message)
+            out = await ex.submit_and_await(
+                mkt, side, qty, client_id=unwind_cid,
+                timeout_s=self.fill_wait_timeout_s, reduce_only=True,
+            )
+            if not out.success:
+                _log.error("unwind on %s FAILED: %s", venue, out.error_message)
         except Exception as e:  # noqa: BLE001
             _log.exception("unwind on %s raised: %s", venue, e)
-            ack = OrderResult(
+            out = LegOutcome(
                 success=False, side=side, requested_qty=qty,
                 error_message=f"unwind raised: {e}",
             )
-        return LegReport.build(
-            venue=ex.name, side=side, qty=qty, expected=cost_basis, ack=ack,
-            send_ts_ms=unwind_send_ts,
-            kind=LegKind.UNWIND,
+        return LegReport.from_outcome(
+            venue=ex.name, outcome=out, expected_price=cost_basis,
+            send_ts_ms=unwind_send_ts, kind=LegKind.UNWIND,
         )
 
     # ----- paper-mode synth -----
 
-    def _paper_fill_one(self, leg: LegIntent, qty: Decimal, cid: str) -> OrderResult:
-        """Synthesize a single-leg paper fill from the current book VWAP
+    def _paper_outcome(self, leg: LegIntent, qty: Decimal, cid: str) -> LegOutcome:
+        """Synthesize a single-leg paper outcome from the current book VWAP
         on the opposite side (a BUY fills against asks, SELL against
-        bids)."""
+        bids). Bypasses both the REST place ack and the WS tracker."""
         ex = self.exchanges[leg.venue]
         mkt = self.markets[leg.venue]
         book = ex.order_book(mkt)
-        assert book is not None
+        # Explicit raises (not asserts) — asserts are stripped under
+        # `python -O` / PYTHONOPTIMIZE, and the next attribute access
+        # would surface as a cryptic AttributeError.
+        if book is None:
+            raise RuntimeError(f"paper mode: no order book cached for {leg.venue}")
         levels = book.bids if leg.side is Side.SELL else book.asks
         vwap, _ = vwap_fill(levels, qty, max_levels=self.max_levels)
-        assert vwap is not None
-        return OrderResult(
+        if vwap is None:
+            raise RuntimeError(
+                f"paper mode: empty {('bids' if leg.side is Side.SELL else 'asks')} "
+                f"on {leg.venue}",
+            )
+        return LegOutcome(
             success=True,
             client_id=cid,
             side=leg.side,
             requested_qty=qty,
+            status=OrderStatus.FILLED,
             filled_qty=qty,
-            avg_price=vwap,
+            weighted_price_sum=vwap * qty,
         )
+
+
+def _coerce_outcome(
+    result: LegOutcome | BaseException,
+    side: Side,
+    qty: Decimal,
+) -> LegOutcome:
+    """Convert a `gather(return_exceptions=True)` slot into a LegOutcome.
+    Re-raise CancelledError (cooperative cancellation must propagate);
+    convert any other exception into a `success=False` outcome so the
+    partial-failure / unwind path can run."""
+    if isinstance(result, asyncio.CancelledError):
+        raise result
+    if isinstance(result, BaseException):
+        return LegOutcome(
+            success=False, side=side, requested_qty=qty,
+            error_message=f"submit_and_await raised: {type(result).__name__}: {result}",
+        )
+    return result
+
+
+def _spread_log(
+    a_intent: LegIntent, b_intent: LegIntent,
+    a_out: LegOutcome, b_out: LegOutcome,
+) -> str:
+    """Format the per-leg sign-encoded prices + net spread for the
+    FILLED log line. Sign convention: sell → +price (cash in), buy →
+    -price (cash out). Sum = per-unit net cash captured pre-fees."""
+    ap = a_out.avg_price
+    bp = b_out.avg_price
+    if ap is None or bp is None:
+        # Keep key=value structure so log parsers don't misinterpret the
+        # middle field as a price/spread report.
+        return f"a={ap} b={bp}"
+    ap_s = ap if a_intent.side is Side.SELL else -ap
+    bp_s = bp if b_intent.side is Side.SELL else -bp
+    return f"a={ap_s} b={bp_s} spread={ap_s + bp_s}"

@@ -115,24 +115,6 @@ class Quote:
 
 
 @dataclass(slots=True)
-class OrderResult:
-    """Return value of place_market_order — the synchronous place ack."""
-
-    success: bool
-    client_id: str | None = None
-    side: Side | None = None
-    requested_qty: Decimal | None = None
-    filled_qty: Decimal | None = None
-    avg_price: Decimal | None = None
-    status: OrderStatus = OrderStatus.UNKNOWN
-    error_message: str | None = None
-    latency_ms: int | None = None
-    # Exchange-server clock (e.g. aster's `transactTime`). NOT our local
-    # time — joinable to venue UIs / external trade logs.
-    exchange_ts_ms: int | None = None
-
-
-@dataclass(slots=True)
 class OrderSnapshot:
     """Cumulative order-state observation: poll-style snapshot or per-order WS event
     (lighter `account_market.orders`).
@@ -188,20 +170,35 @@ class Position:
 
 
 @dataclass(slots=True)
-class TerminalFill:
-    """Per-`client_id` aggregate of WS fill events, the canonical "what
-    actually filled" view that callers see.
+class LegOutcome:
+    """Unified post-execution state for one venue leg.
 
-    Absorbs two event types with different semantics:
+    Combines what was previously two types (`OrderResult` for the
+    synchronous place-ack and `TerminalFill` for the WS-aggregated fill).
+    Drivers populate ack-side fields from `place_market_order`; the WS
+    fill tracker accumulates fill-side fields via `add()`; the
+    `submit_and_await` wrapper merges any WS data on top of the REST
+    fallback. Callers downstream of `submit_and_await` see one type with
+    the final view.
 
-      * `OrderSnapshot` — cumulative running totals (lighter
-        `account_market.orders`); OVERWRITES filled_qty + weighted_price_sum.
-      * `FillDelta` — per-fill event (aster `l`/`L`); ACCUMULATES qty * price.
+    `last_status` is taken from any terminal-status signal so
+    `is_complete` can short-circuit the wait the moment the venue
+    confirms the parent order is settled
+    (FILLED / CANCELED / REJECTED / EXPIRED)."""
 
-    `last_status` is taken from any terminal-status signal so `is_complete`
-    can short-circuit the wait the moment the venue confirms the parent
-    order is settled (FILLED / CANCELED / REJECTED / EXPIRED)."""
+    # ack-side — populated by driver.place_market_order
+    client_id: str | None = None
+    side: Side | None = None
+    requested_qty: Decimal | None = None
+    success: bool = False
+    status: OrderStatus = OrderStatus.UNKNOWN
+    error_message: str | None = None
+    # Exchange-server clock for the place-ack (aster's `transactTime`).
+    # NOT our local time — joinable to venue UIs / external trade logs.
+    exchange_ts_ms: int | None = None
+    latency_ms: int | None = None
 
+    # fill-side — WS accumulator OR REST fallback (driver writes either)
     filled_qty: Decimal = Decimal("0")
     weighted_price_sum: Decimal = Decimal("0")
     last_ts_ms: int = 0
@@ -212,16 +209,24 @@ class TerminalFill:
     total_fee: Decimal = Decimal("0")
 
     def add(self, event: OrderSnapshot | FillDelta) -> None:
+        """Absorb a WS event. `OrderSnapshot` (lighter cumulative state)
+        OVERWRITES filled_qty + weighted_price_sum; `FillDelta` (aster
+        per-fill) ACCUMULATES qty * price * fee."""
         if event.ts_ms:
             self.last_ts_ms = max(self.last_ts_ms, event.ts_ms)
         match event:
             case OrderSnapshot():
                 if event.status.terminal:
                     self.last_status = event.status
-                if event.filled_qty > 0:
+                # Atomic: only commit qty + price together. A snapshot
+                # with filled_qty>0 but no realized_price is an
+                # intermediate state — committing only filled_qty would
+                # leave the accumulator with qty>0 / price_sum=0 and
+                # `avg_price` would return Decimal('0') (fabricated $0
+                # fill price) instead of None.
+                if event.filled_qty > 0 and event.realized_price is not None:
                     self.filled_qty = event.filled_qty
-                    if event.realized_price is not None:
-                        self.weighted_price_sum = event.filled_qty * event.realized_price
+                    self.weighted_price_sum = event.filled_qty * event.realized_price
             case FillDelta():
                 if event.terminal_status is not None:
                     self.last_status = event.terminal_status
@@ -229,6 +234,11 @@ class TerminalFill:
                 self.filled_qty += event.qty
                 self.weighted_price_sum += event.qty * event.price
                 self.total_fee += event.fee
+            case _:
+                # Fail fast on unhandled event subtypes — silent fall-through
+                # would leave fill-side fields zeroed, indistinguishable from
+                # a WS timeout. New event types must opt in explicitly.
+                raise TypeError(f"LegOutcome.add: unhandled event type {type(event).__name__}")
 
     def is_complete(self, requested_qty: Decimal) -> bool:
         # Terminal status = no more fills coming (filled / canceled /
@@ -245,17 +255,9 @@ class TerminalFill:
             return None
         return self.weighted_price_sum / self.filled_qty
 
-
-@dataclass(slots=True)
-class OrderOutcome:
-    """Driver-layer return: synchronous place-ack + WS-tracked terminal fill.
-
-    `ack` is whatever `place_market_order` returned — for aster this comes
-    from an HTTP REST POST, for lighter from a signed WS tx ack; both are
-    just "the venue acknowledged the submit" from the caller's POV.
-
-    `fill is None` when the place ack failed (no point awaiting) OR the
-    tracker timed out before any event arrived."""
-
-    ack: OrderResult
-    fill: TerminalFill | None
+    @property
+    def fill_ts_ms(self) -> int | None:
+        """Best timestamp for the actual fill on the venue's clock —
+        prefer the WS last-event ts, fall back to the place-ack
+        `exchange_ts_ms` when WS never delivered (REST-only fallback)."""
+        return self.last_ts_ms or self.exchange_ts_ms

@@ -5,7 +5,7 @@ fill aggregator that succeeds the old strategy-level `_on_fill` +
 Tests pin three invariants:
   * Unknown `client_id`s are silently dropped (whitelist semantics).
   * `OrderSnapshot` overwrite vs `FillDelta` accumulate semantics are
-    preserved (inherited from `TerminalFill.add`).
+    preserved (inherited from `LegOutcome.add`).
   * `await_terminal` short-circuits on terminal-status OR completed qty;
     otherwise returns whatever landed by the timeout.
 """
@@ -98,7 +98,7 @@ async def test_timeout_returns_partial() -> None:
 
 @pytest.mark.asyncio
 async def test_snapshot_overwrite_vs_delta_accumulate() -> None:
-    """Mixed-stream behaviour matches TerminalFill.add: snapshot overwrites
+    """Mixed-stream behaviour matches LegOutcome.add: snapshot overwrites
     qty, delta accumulates qty. Order shouldn't matter to final state."""
     tr = _PerCidFillTracker()
     tr.register("cid-1")

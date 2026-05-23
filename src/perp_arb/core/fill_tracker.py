@@ -3,7 +3,7 @@
 Drivers fan WS fill events into `on_event`. Callers (the execution layer)
 pre-register a `client_id` before submitting the order, then `await
 await_terminal(cid, qty, timeout_s)` to receive the aggregated
-`TerminalFill` once the venue settles the parent order — or whatever
+`LegOutcome` once the venue settles the parent order — or whatever
 landed by the timeout.
 
 Pre-registration is a deliberate whitelist: events for unknown cids are
@@ -15,6 +15,11 @@ stretch as the order submit — there is no `await` between them, so a fast
 fill (fills can land before the place ack returns on some venues) cannot
 arrive before its slot exists. Callers who break this invariant will
 silently drop fast fills.
+
+The tracker only populates the *fill-side* fields of LegOutcome
+(filled_qty, weighted_price_sum, last_ts_ms, last_status, total_fee);
+ack-side fields stay at defaults. The driver overlays ack-side fields
+separately via `submit_and_await`.
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ from __future__ import annotations
 import asyncio
 from decimal import Decimal
 
-from .types import FillDelta, OrderSnapshot, TerminalFill
+from .types import FillDelta, LegOutcome, OrderSnapshot
 
 
 class _PerCidFillTracker:
@@ -30,7 +35,7 @@ class _PerCidFillTracker:
 
     def __init__(self) -> None:
         self._events: dict[str, asyncio.Event] = {}
-        self._fills: dict[str, TerminalFill] = {}
+        self._fills: dict[str, LegOutcome] = {}
 
     def register(self, client_id: str) -> None:
         """Whitelist `client_id` so subsequent `on_event(ev)` matching this
@@ -48,7 +53,7 @@ class _PerCidFillTracker:
         cid = event.client_id
         if not cid or cid not in self._events:
             return
-        self._fills.setdefault(cid, TerminalFill()).add(event)
+        self._fills.setdefault(cid, LegOutcome()).add(event)
         self._events[cid].set()
 
     async def await_terminal(
@@ -56,7 +61,7 @@ class _PerCidFillTracker:
         client_id: str,
         requested_qty: Decimal,
         timeout_s: float,
-    ) -> TerminalFill | None:
+    ) -> LegOutcome | None:
         """Wait up to `timeout_s` for the fill aggregate to reach
         `requested_qty` or a terminal status. Returns whatever landed
         (None if no events at all)."""

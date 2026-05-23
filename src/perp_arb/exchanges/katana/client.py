@@ -22,9 +22,9 @@ from ...core.exchange import (
     QuoteCallback,
 )
 from ...core.types import (
+    LegOutcome,
     MarketInfo,
     OrderBook,
-    OrderResult,
     Position,
     Quote,
     Side,
@@ -146,7 +146,7 @@ class KatanaClient(BaseExchange):
         *,
         reduce_only: bool = False,
         client_id: str | None = None,
-    ) -> OrderResult:
+    ) -> LegOutcome:
         raise RuntimeError(_PUBLIC_ONLY)
 
     async def get_position(self, market: MarketInfo) -> Position:
