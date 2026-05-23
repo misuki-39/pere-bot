@@ -323,3 +323,33 @@ def test_inventory_skew_widens_growing_direction_narrows_flattening() -> None:
     d2 = assess_reversion(p, inp_short)
     # A grows → skew_A = +2 * (-5 * -1) / 10 = +1 bps. Effective threshold 2 bps > 1.5.
     assert d2 is None, "A should be blocked: growing |pos| and edge below skewed threshold"
+
+
+def test_position_cap_returns_none_not_blocked_risk() -> None:
+    """Position-cap hit is not a risk event — the cap is doing its job. The pure
+    function drops the tick (returns None) instead of emitting a BLOCKED_RISK
+    Decision; this prevents per-tick log spam while the strategy waits for a
+    reverse-direction signal."""
+    # Sanity: book has a +1.5 bps A-edge and at flat position it fires.
+    flat = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000")
+    p = _params()
+    assert assess_reversion(p, flat).outcome is Outcome.FIRED
+
+    # Direction A: post_left = pos_left + 1*(-1), post_right = pos_right + 1*(+1).
+    # At pos_left=-10, pos_right=+10 the fire would push |pos|=11 > max_qty=10.
+    growing = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000",
+                      pos_left="-10", pos_right="10")
+    assert assess_reversion(p, growing) is None
+
+
+def test_position_cap_allows_flattening_fire() -> None:
+    """Reverse-direction exits MUST still pass when current |pos| is already at
+    the cap — that's how the strategy unwinds."""
+    # Same book (A-edge) but position flipped so a Direction-A fire shrinks
+    # |pos|: pos_left=+10 → post_left = 10 - 1 = 9; pos_right=-10 → post_right
+    # = -10 + 1 = -9. max(9, 9) ≤ max_qty=10.
+    flattening = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000",
+                         pos_left="10", pos_right="-10")
+    p = _params()
+    d = assess_reversion(p, flattening)
+    assert d is not None and d.outcome is Outcome.FIRED and d.direction is Direction.A

@@ -96,7 +96,7 @@ class TakerTakerArbitrage(BaseStrategy):
         self._recorder: ExecutionRecorder | None = None
         self._evaluating = False
         self._position = SyntheticPosition()
-        self._risk = RiskManager(s.risk, max_qty=s.max_qty)
+        self._risk = RiskManager(s.risk)
         self._last_heartbeat_ms = 0
         self._heartbeat_interval_ms = 60_000  # liveness only; trades go to CSV
         self._risk_blocked = False
@@ -307,19 +307,12 @@ class TakerTakerArbitrage(BaseStrategy):
                         f"direction {d.direction.value}"
                     )
 
-        # The RiskManager gate runs on the (possibly already-blocked-by-cap)
-        # decision. If the cap already rewrote to BLOCKED_RISK we still let
-        # RiskManager observe the FIRED-intent state via the position math —
-        # but we must not overwrite the cap's reason. Guard with the outcome.
+        # Operational risk gate: halted / consec-failures / daily-loss cap.
+        # Position-cap is enforced upstream in the pure function.
         if d is not None and d.outcome is Outcome.FIRED:
             assert d.direction is not None
             d.timeline.mark(Phase.DECISION)
-            qty = self.cfg.strategy.qty
-            post_a = self._position.leg_a + qty * Decimal(left_side(d.direction).sign)
-            post_b = self._position.leg_b + qty * Decimal(right_side(d.direction).sign)
-            ok, reason = self._risk.can_trade(
-                post_trade_abs_position=max(abs(post_a), abs(post_b)),
-            )
+            ok, reason = self._risk.can_trade()
             if not ok:
                 if not self._risk_blocked:
                     self._risk_blocked = True

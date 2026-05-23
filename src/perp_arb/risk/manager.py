@@ -23,20 +23,19 @@ class RiskState:
 
 
 class RiskManager:
-    def __init__(self, cfg: RiskCfg, *, max_qty: Decimal) -> None:
+    def __init__(self, cfg: RiskCfg) -> None:
         self.cfg = cfg
-        self.max_qty = max_qty
         self.state = RiskState()
 
     # ---- gates ----
 
-    def can_trade(self, *, post_trade_abs_position: Decimal) -> tuple[bool, str | None]:
-        """Direction-aware gate.
+    def can_trade(self) -> tuple[bool, str | None]:
+        """Operational gates: halted, consecutive failures, daily loss cap.
 
-        Caller computes the post-trade |position| on each venue and passes the
-        max. This lets reverse-direction exits through even when current
-        exposure is already at the cap.
-        """
+        Position-cap enforcement lives in the pure decision function
+        (`strategy.reversion_signal.assess_reversion`), which drops the tick
+        before it reaches here — so cap-hit ticks never become BLOCKED_RISK
+        rows."""
         self._rollover_day()
         if self.state.halted:
             return False, f"halted: {self.state.halt_reason}"
@@ -44,11 +43,6 @@ class RiskManager:
             return False, f"too many consecutive failures ({self.state.consecutive_failures})"
         if self.state.realised_pnl_today <= -self.cfg.daily_loss_cap_usd:
             return False, f"daily loss cap breached ({self.state.realised_pnl_today})"
-        if post_trade_abs_position > self.max_qty:
-            return False, (
-                f"position cap: post-trade |pos|={post_trade_abs_position} > "
-                f"max_qty={self.max_qty}"
-            )
         return True, None
 
     # ---- mutation ----

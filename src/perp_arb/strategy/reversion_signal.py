@@ -167,9 +167,13 @@ def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
     post_left  = x.position_left  + qty * Decimal(left_side(direction).sign)
     post_right = x.position_right + qty * Decimal(right_side(direction).sign)
     if max(abs(post_left), abs(post_right)) > p.max_qty:
-        return new(Outcome.BLOCKED_RISK,
-                   f"post-trade abs position {max(abs(post_left), abs(post_right))} > max_qty {p.max_qty}",
-                   bias=x.bias, edge_bps=edge_bps, direction=direction, vwaps=vw)
+        # Position-cap hit is not a risk event — the cap is doing its job; the
+        # trade simply can't grow |pos| further. Drop the tick so it doesn't
+        # flood the decisions log with identical "0.X > max_qty" rows while
+        # we wait for a reverse-direction signal to flatten. Reverse-direction
+        # exits naturally pass this same check (post-trade |pos| <= max_qty)
+        # and proceed to FIRED.
+        return None
 
     # NOTE: caller marks Phase.DECISION — live uses `mark()` (mono_ms), backtest
     # uses `mark_at(snap.ts_ms)`. Keeping it out of the pure fn avoids clock-source
