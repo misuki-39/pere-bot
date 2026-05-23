@@ -65,8 +65,8 @@ _FRESH_MS = 8000
 class SpreadMonitor(BaseStrategy):
     name = "spread_monitor"
 
-    def __init__(self, cfg, exchanges, markets) -> None:
-        super().__init__(cfg, exchanges, markets)
+    def __init__(self, cfg, exchanges, markets, session) -> None:
+        super().__init__(cfg, exchanges, markets, session)
         self._writer: RotatingParquetWriter | None = None
         self._spread = SpreadModel(
             center_half_life_s=cfg.strategy.bias_halflife_s,

@@ -15,9 +15,10 @@ import sys
 
 from dotenv import load_dotenv
 
-from .core.config import AppCfg, RunMode, load_app_config, require_live_creds
+from .core.config import AppCfg, RunMode, load_app_config
 from .core.exchange import BaseExchange
 from .core.logging import setup_logging
+from .core.session import LiveSession, PaperSession, Session
 from .core.types import MarketInfo
 from .exchanges.factory import build_exchanges, required_legs
 from .strategy.base import BaseStrategy
@@ -50,6 +51,7 @@ def _build_strategy(
     cfg: AppCfg,
     exchanges: dict[str, BaseExchange],
     markets: dict[str, MarketInfo],
+    session: Session,
 ) -> BaseStrategy:
     try:
         cls = _STRATEGIES[cfg.strategy.strategy]
@@ -58,7 +60,7 @@ def _build_strategy(
         raise ValueError(
             f"unknown strategy {cfg.strategy.strategy!r}. known: {known}"
         ) from None
-    return cls(cfg, exchanges, markets)
+    return cls(cfg, exchanges, markets, session)
 
 
 async def _async_main(cfg: AppCfg) -> int:
@@ -69,8 +71,13 @@ async def _async_main(cfg: AppCfg) -> int:
         cfg.strategy.qty, cfg.strategy.max_qty,
     )
 
-    if cfg.strategy.mode is RunMode.LIVE:
-        require_live_creds(cfg)
+    # Single mode dispatch: every other strategy-runtime divergence
+    # (creds preflight, executor synth, position seeding) is answered by
+    # the session, not by inspecting `mode` again.
+    session: Session = (
+        LiveSession() if cfg.strategy.mode is RunMode.LIVE else PaperSession()
+    )
+    await session.preflight(cfg)
 
     exchanges = build_exchanges(cfg)
     try:
@@ -87,7 +94,7 @@ async def _async_main(cfg: AppCfg) -> int:
                 leg, exchanges[leg].name, m.symbol.raw, m.tick_size, m.lot_size,
             )
 
-        strategy = _build_strategy(cfg, exchanges, markets)
+        strategy = _build_strategy(cfg, exchanges, markets, session)
 
         loop = asyncio.get_running_loop()
         stop_evt = asyncio.Event()
@@ -106,11 +113,21 @@ async def _async_main(cfg: AppCfg) -> int:
                 loop.add_signal_handler(sig, _on_signal, sig)
 
         strat_task = asyncio.create_task(strategy.run(), name="strategy")
-        await stop_evt.wait()
-        await strategy.stop()
-        strat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await strat_task
+        # A crash in strategy.run() (e.g. snapshot_position raising at startup)
+        # must unblock the main wait so the exception surfaces — without this
+        # callback, stop_evt is only set by a signal and the bot would hang
+        # silently on a dead task.
+        strat_task.add_done_callback(lambda _t: stop_evt.set())
+        try:
+            await stop_evt.wait()
+        finally:
+            await strategy.stop()
+            if not strat_task.done():
+                strat_task.cancel()
+            # CancelledError is the normal shutdown path; any real exception
+            # re-raises out of _async_main → asyncio.run → non-zero exit.
+            with contextlib.suppress(asyncio.CancelledError):
+                await strat_task
     finally:
         for ex in exchanges.values():
             with contextlib.suppress(Exception):

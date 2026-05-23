@@ -150,4 +150,6 @@ class KatanaClient(BaseExchange):
         raise RuntimeError(_PUBLIC_ONLY)
 
     async def get_position(self, market: MarketInfo) -> Position:
-        raise RuntimeError(_PUBLIC_ONLY)
+        raise NotImplementedError(
+            "katana is a public market-data driver; positions are not exposed"
+        )

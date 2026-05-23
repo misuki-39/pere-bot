@@ -80,7 +80,7 @@ class TwoLegExecutor:
     ) -> None:
         self.exchanges = exchanges
         self.markets = markets
-        self.is_paper = is_paper
+        self._is_paper = is_paper
         self.max_levels = max_levels
         self.fill_wait_timeout_s = fill_wait_timeout_s
         # cid is a venue-protocol detail; the executor owns the counter.
@@ -110,7 +110,7 @@ class TwoLegExecutor:
         timeline.mark(Phase.SEND)
         send_ts_ms = now_ms()
 
-        if self.is_paper:
+        if self._is_paper:
             ack_a = self._paper_fill_one(a_intent, qty, cid)
             ack_b = self._paper_fill_one(b_intent, qty, cid)
             a_fill: TerminalFill | None = None
@@ -257,7 +257,7 @@ class TwoLegExecutor:
         fill we are reversing, so the round-trip cost of a partial is
         directly computable offline. Returns `None` in paper mode
         (paper has no real position to flatten)."""
-        if self.is_paper:
+        if self._is_paper:
             return None
         ex = self.exchanges[venue]
         mkt = self.markets[venue]

@@ -188,6 +188,11 @@ class AsterClient(BaseExchange):
         )
 
     async def get_position(self, market: MarketInfo) -> Position:
+        # Assumes the account is in one-way (non-hedge) position mode:
+        # `positionAmt` is already signed (long > 0, short < 0). Hedge
+        # mode is not supported — it would split into LONG/SHORT rows
+        # with non-negative `positionAmt` + a `positionSide` field, and
+        # the seed path would silently take the wrong sign.
         rows = await self.rest.get_position_risk(str(market.contract_id))
         pos = Position(symbol=market.symbol, size=Decimal("0"))
         for row in rows:

@@ -10,6 +10,7 @@ from decimal import Decimal
 
 from ..core.config import AppCfg
 from ..core.exchange import BaseExchange
+from ..core.session import Session
 from ..core.types import MarketInfo
 from ..utils.precision import BPS
 
@@ -32,10 +33,12 @@ class BaseStrategy(ABC):
         cfg: AppCfg,
         exchanges: dict[str, BaseExchange],
         markets: dict[str, MarketInfo],
+        session: Session,
     ) -> None:
         self.cfg = cfg
         self.exchanges = exchanges
         self.markets = markets
+        self.session = session
         self._stop = asyncio.Event()
 
     @abstractmethod

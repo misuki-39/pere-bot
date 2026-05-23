@@ -47,7 +47,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from ..core.config import RunMode
 from ..core.exec_record import (
     Decision,
     Direction,
@@ -85,8 +84,8 @@ class SyntheticPosition:
 class TakerTakerArbitrage(BaseStrategy):
     name = "taker_taker"
 
-    def __init__(self, cfg, exchanges, markets) -> None:
-        super().__init__(cfg, exchanges, markets)
+    def __init__(self, cfg, exchanges, markets, session) -> None:
+        super().__init__(cfg, exchanges, markets, session)
         s = cfg.strategy
         self._spread = SpreadModel(
             center_half_life_s=s.bias_halflife_s,
@@ -167,7 +166,7 @@ class TakerTakerArbitrage(BaseStrategy):
         # sees strategy-internal concepts.
         self._executor = TwoLegExecutor(
             exchanges, markets,
-            is_paper=(s.mode is RunMode.PAPER),
+            is_paper=session.is_paper,
             max_levels=s.max_levels,
         )
 
@@ -197,8 +196,21 @@ class TakerTakerArbitrage(BaseStrategy):
     async def run(self) -> None:
         ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         self._recorder = ExecutionRecorder(self.cfg.runtime.log_dir, ts)
+        mode_label = "paper" if self.session.is_paper else "live"
         _log.info("taker_taker mode=%s recording to %s",
-                  self.cfg.strategy.mode, self.cfg.runtime.log_dir)
+                  mode_label, self.cfg.runtime.log_dir)
+
+        # Seed the bot-local position tracker from venue truth before any
+        # FIRE evaluates. After a restart with real inventory, this is the
+        # only way max_qty stays meaningful. Paper returns 0. Failure
+        # (REST error, venue unreachable) propagates and aborts startup —
+        # we refuse to trade with unknown inventory.
+        self._position.leg_a, self._position.leg_b = await asyncio.gather(
+            self.session.snapshot_position(self._leg_a(), self._leg_a_market()),
+            self.session.snapshot_position(self._leg_b(), self._leg_b_market()),
+        )
+        _log.info("seeded position: leg_a=%s leg_b=%s",
+                  self._position.leg_a, self._position.leg_b)
 
         self._leg_a().subscribe_book(self._leg_a_market(), lambda _b: self._schedule_eval())
         self._leg_b().subscribe_book(self._leg_b_market(), lambda _b: self._schedule_eval())
