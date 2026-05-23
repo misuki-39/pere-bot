@@ -51,10 +51,9 @@ class Session(ABC):
 
 
 class LiveSession(Session):
-    # Class-var override clears the abstract `is_paper` property — CPython
-    # accepts any attribute (incl. plain value) as satisfying an abstract
-    # property slot on subclasses.
-    is_paper = False
+    @property
+    def is_paper(self) -> bool:
+        return False
 
     async def preflight(self, cfg: AppCfg) -> None:
         if cfg.strategy.mode is not RunMode.LIVE:
@@ -72,7 +71,9 @@ class LiveSession(Session):
 
 
 class PaperSession(Session):
-    is_paper = True
+    @property
+    def is_paper(self) -> bool:
+        return True
 
     async def preflight(self, cfg: AppCfg) -> None:
         if cfg.strategy.mode is not RunMode.PAPER:
