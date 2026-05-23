@@ -102,9 +102,13 @@ class EngineSummary:
             self.realised_pnl * Decimal(86_400_000) / Decimal(self.duration_ms)
             if self.duration_ms > 0 else Decimal(0)
         )
-        per_pair = (
-            self.realised_pnl / Decimal(self.decisions_emitted)
-            if self.decisions_emitted > 0 else Decimal(0)
+        # PnL comes from filled pairs only; dividing by `decisions_emitted`
+        # would deflate the figure with BLOCKED/aborted decisions that
+        # never contributed PnL. Use the fired-pair count instead.
+        filled_pairs = self.fires_dir_a + self.fires_dir_b
+        per_filled = (
+            self.realised_pnl / Decimal(filled_pairs)
+            if filled_pairs > 0 else Decimal(0)
         )
         pin_lines = []
         for venue, n in self.ticks_pinned.items():
@@ -116,7 +120,7 @@ class EngineSummary:
             f"  duration:       {dur_h}h {dur_m}m  ({self.duration_ms} ms, {self.rows_processed} rows)\n"
             f"  intents:        {self.intents_emitted}  (filled {self.fills_succeeded}, rejected {self.fills_rejected})\n"
             f"  pairs:          {self.decisions_emitted}  (A={self.fires_dir_a} B={self.fires_dir_b})\n"
-            f"  pnl:            {self.realised_pnl:.4f}  (${per_day:.3f}/day, ${per_pair:.4f}/pair)\n"
+            f"  pnl:            {self.realised_pnl:.4f}  (${per_day:.3f}/day, ${per_filled:.4f}/filled-pair)\n"
             f"  final pos:      {final_pos}  (cap=±{self.max_qty})\n"
             f"  pinned ticks:   {'  '.join(pin_lines) if pin_lines else '(none)'}\n"
             f"  outages:        {self.outage_count}  (max {self.outage_max_ms} ms)"
@@ -270,6 +274,8 @@ class Engine:
                 self._maybe_emit(p.intent.decision_id, recorder)
 
     def run(self, recorder: ExecutionRecorder) -> EngineSummary:
+        if not self.rows:
+            return self.summary
         for row in self.rows:
             self.summary.rows_processed += 1
             if row.gap_ms > _OUTAGE_THRESHOLD_MS:

@@ -257,7 +257,7 @@ def test_summary_pretty_smoke() -> None:
     assert "backtest done" in text
     assert "A=7" in text and "B=3" in text
     assert "1.2345" in text
-    assert "/day" in text and "/pair" in text
+    assert "/day" in text and "/filled-pair" in text
     assert "lighter=100/1000" in text                   # pin row
     assert "lighter=-3" in text and "aster=3" in text   # final pos row
     assert "cap=±10" in text
