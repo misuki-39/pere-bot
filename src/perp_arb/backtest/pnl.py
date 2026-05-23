@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
 
+from ..core.pnl import pair_pnl
 from ..core.types import Side
 
 
@@ -31,16 +32,16 @@ class SyntheticPositions:
         """Apply both legs atomically. Returns the leg-pair realised PnL in
         quote units.
 
-        Per-leg PnL = side.sign * price * qty  (sell=+revenue, buy=−cost),
-        minus the per-leg fee (bps of leg notional). The pair's net PnL is the
-        sum across legs; positions update accordingly.
+        Cash-flow PnL via the shared `core.pnl.pair_pnl` primitive; backtest
+        synthesizes per-leg fees from a uniform bps knob, while live reads
+        absolute fees from the WS stream. Same formula, different fee source.
         """
-        # cash flow per leg (sell brings cash in, buy sends it out)
-        left_cash = -Decimal(left_side.sign) * left_price * qty
-        right_cash = -Decimal(right_side.sign) * right_price * qty
         fees = (left_price + right_price) * qty * fee_bps_per_leg / Decimal(10_000)
-        leg_pnl = left_cash + right_cash - fees
-
+        leg_pnl = pair_pnl(
+            left_side, left_price,
+            right_side, right_price,
+            qty, fees,
+        )
         self.sizes[left_venue] = self.sizes.get(left_venue, Decimal("0")) + qty * Decimal(left_side.sign)
         self.sizes[right_venue] = self.sizes.get(right_venue, Decimal("0")) + qty * Decimal(right_side.sign)
         self.realised_pnl += leg_pnl

@@ -360,9 +360,10 @@ class TakerTakerArbitrage(BaseStrategy):
         else:
             edge_str = "no-edge"
         _log.info(
-            "tick: mid_a=%.2f mid_b=%.2f bias=%.4f %s pos_a=%s pos_b=%s",
+            "tick: mid_a=%.2f mid_b=%.2f bias=%.4f %s pos_a=%s pos_b=%s pnl=%s",
             mid_left, mid_right, bias, edge_str,
             self._position.leg_a, self._position.leg_b,
+            self._position.realised_pnl,
         )
 
     # ---- order firing ----
@@ -406,6 +407,15 @@ class TakerTakerArbitrage(BaseStrategy):
                 self._position.leg_b += qty * Decimal(b_side.sign)
                 self._risk.record_success(leg_latency_ms=report.latency_ms or 0)
 
+                # Cash-flow realized PnL: feeds the dormant daily-loss-cap
+                # gate (RiskManager.can_trade) and surfaces in heartbeat +
+                # decisions_*.csv. Mirrors backtest pnl.apply_pair so live
+                # and backtest numbers reconcile by construction.
+                if report.realised_pnl is not None:
+                    self._position.realised_pnl += report.realised_pnl
+                    self._risk.record_pnl(report.realised_pnl)
+                    d.realised_pnl = report.realised_pnl
+
                 # Seed throttle bump only on confirmed FILLED — a partial /
                 # both-fail consumed no edge.
                 if self._throttle_enabled:
@@ -413,9 +423,10 @@ class TakerTakerArbitrage(BaseStrategy):
                     target.bump(self._throttle_bump_bps, now_ms())
 
                 _log.info(
-                    "[%s] pos_a=%s pos_b=%s",
+                    "[%s] pos_a=%s pos_b=%s pnl_total=%s",
                     d.decision_id,
                     self._position.leg_a, self._position.leg_b,
+                    self._position.realised_pnl,
                 )
             else:
                 self._risk.record_failure(report.failure_reason or "unknown")

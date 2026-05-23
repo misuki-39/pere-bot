@@ -172,6 +172,56 @@ async def test_both_legs_succeed_no_unwind() -> None:
     assert lighter.submit_calls[0]["client_id"] == str(_TEST_CID_SEED)
     # send_ts_ms populated on report so the caller can stamp its own record
     assert report.send_ts_ms > 0
+    # Cash-flow pair PnL: sell 100.05, buy 100.07, no fees → -0.02.
+    assert report.realised_pnl == Decimal("-0.02")
+
+
+@pytest.mark.asyncio
+async def test_realised_pnl_includes_ws_fees() -> None:
+    """Aster's WS leg supplies a per-fill commission via `TerminalFill.total_fee`;
+    the executor's pair PnL subtracts it. Lighter is zero-fee."""
+    qty = Decimal("1.0")
+    aster = _StubExchange(
+        name="aster",
+        submit_result=_ok(venue="aster", side=Side.SELL, qty=qty, avg="100.00"),
+        fill_result=TerminalFill(
+            filled_qty=Decimal("1.0"),
+            weighted_price_sum=Decimal("100.10"),  # WS price overrides REST
+            last_ts_ms=1_700_000_000_500,
+            last_status=OrderStatus.FILLED,
+            total_fee=Decimal("0.03"),
+        ),
+    )
+    lighter = _StubExchange(
+        name="lighter",
+        submit_result=_ok(venue="lighter", side=Side.BUY, qty=qty, avg="100.00"),
+    )
+    ex = _executor(aster, lighter)
+    report = await ex.execute(
+        trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
+    )
+    # gross = +100.10 (sell) - 100.00 (buy) = +0.10; fees = 0.03 → +0.07.
+    assert report.success is True
+    assert report.realised_pnl == Decimal("0.07")
+    assert report.legs[0].fee == Decimal("0.03")
+    assert report.legs[1].fee == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_failed_trade_has_no_realised_pnl() -> None:
+    qty = Decimal("1.0")
+    aster = _StubExchange(
+        name="aster", submit_result=_bad(side=Side.SELL, qty=qty, msg="A down"),
+    )
+    lighter = _StubExchange(
+        name="lighter", submit_result=_bad(side=Side.BUY, qty=qty, msg="L down"),
+    )
+    ex = _executor(aster, lighter)
+    report = await ex.execute(
+        trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
+    )
+    assert report.success is False
+    assert report.realised_pnl is None
 
 
 # ---- live partial-failure quadrants --------------------------------------

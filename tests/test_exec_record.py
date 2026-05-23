@@ -39,10 +39,12 @@ def test_headers_are_derived_from_dataclasses() -> None:
     assert "timeline" not in dh and "legs" not in dh
     assert dh[:2] == ["decision_id", "ts_ms"]
     assert dh[-1] == "lat_decision_send_ms"
+    assert "realised_pnl" in dh
     lh = _leg_header()
     assert lh[:2] == ["decision_id", "ts_ms"]
     assert "expected_price" in lh and "realized_price" in lh
     assert "latency_ms" in lh and "fill_ts_ms" in lh
+    assert "fee" in lh
 
 
 def _read(path):
@@ -62,6 +64,7 @@ def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkey
         vwap_left_buy=Decimal("100.02"), vwap_right_sell=Decimal("100.04"),
         vwap_right_buy=Decimal("100.06"), edge_bps=Decimal("2.5"),
         direction=Direction.B, outcome=Outcome.FIRED,
+        realised_pnl=Decimal("0.012"),
     )
     clock["t"] = 5
     d.timeline.mark(Phase.DECISION)
@@ -69,7 +72,8 @@ def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkey
     d.timeline.mark(Phase.SEND)
     d.legs = [
         LegReport("aster", "buy", Decimal("0.6"), Decimal("0.6"),
-                  Decimal("100.02"), Decimal("100.03"), "filled", True),
+                  Decimal("100.02"), Decimal("100.03"), "filled", True,
+                  fee=Decimal("0.018")),
         LegReport("lighter", "sell", Decimal("0.6"), Decimal("0.6"),
                   Decimal("100.04"), Decimal("100.038"), "filled", True),
     ]
@@ -84,13 +88,17 @@ def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkey
     assert row["decision_id"] == "d-abc"
     assert row["outcome"] == "FIRED"
     assert row["lat_decision_send_ms"] == "7"
+    assert row["realised_pnl"] == "0.012"
 
     assert legs[0] == _leg_header()
     assert len(legs) == 3  # header + 2 legs
     l0 = dict(zip(legs[0], legs[1], strict=True))
     assert l0["decision_id"] == "d-abc" and l0["exchange"] == "aster"
     assert l0["expected_price"] == "100.02" and l0["realized_price"] == "100.03"
+    assert l0["fee"] == "0.018"
     assert l0["kind"] == LegKind.ENTRY  # StrEnum serialises to its value
+    l1 = dict(zip(legs[0], legs[2], strict=True))
+    assert l1["exchange"] == "lighter" and l1["fee"] == "0"
 
 
 def test_abort_decision_emits_row_with_no_legs(tmp_path) -> None:

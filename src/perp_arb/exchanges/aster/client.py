@@ -232,6 +232,11 @@ class AsterClient(BaseExchange):
         if last_qty <= 0:
             return
         status = _ASTER_STATUS_MAP.get(o["X"], OrderStatus.UNKNOWN)
+        # `n` is the per-fill commission (Binance-fork ORDER_TRADE_UPDATE);
+        # `N` is the asset (USDT on aster perp markets, treated as ≈ USD for
+        # cash-flow PnL math). Absent on non-fill events but we've already
+        # short-circuited those above.
+        fee = Decimal(o["n"]) if o.get("n") else Decimal("0")
         delta = FillDelta(
             qty=last_qty,
             price=Decimal(o["L"]),
@@ -240,6 +245,7 @@ class AsterClient(BaseExchange):
             side=Side.BUY if o["S"] == "BUY" else Side.SELL,
             client_id=o.get("c"),
             terminal_status=status if status.terminal else None,
+            fee=fee,
         )
         # Internal: feed the per-cid tracker (submit_and_await's awaitable).
         # Must precede the per-symbol fan-out: once the strategy stops

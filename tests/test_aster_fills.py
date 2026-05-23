@@ -30,9 +30,11 @@ _MARKET = MarketInfo(
 
 def _trade_evt(*, last_qty: str, last_price: str, cum_qty: str,
                status: str = "PARTIALLY_FILLED", q: str = "10",
-               trade_time: int = 1_700_000_000_500) -> dict:
+               trade_time: int = 1_700_000_000_500,
+               commission: str = "0") -> dict:
     """Skeleton ORDER_TRADE_UPDATE — only the fields `_handle_order_trade_update`
-    actually reads. `l`/`L` are per-fill deltas; `z` would be cumulative."""
+    actually reads. `l`/`L` are per-fill deltas; `z` would be cumulative.
+    `n` is the per-fill commission, `N` its asset (USDT on aster perps)."""
     return {
         "e": "ORDER_TRADE_UPDATE", "E": trade_time,
         "T": trade_time,
@@ -41,6 +43,7 @@ def _trade_evt(*, last_qty: str, last_price: str, cum_qty: str,
             "i": 12345, "q": q, "p": "0",
             "X": status,
             "l": last_qty, "L": last_price, "z": cum_qty, "ap": "0",
+            "n": commission, "N": "USDT",
         },
     }
 
@@ -115,3 +118,32 @@ def test_aster_terminal_status_propagates_on_filled() -> None:
     ))
     assert received[0].terminal_status is not None
     assert received[0].terminal_status.value == "filled"
+
+
+def test_aster_parses_commission_into_fill_delta_fee() -> None:
+    """`o.n` is the per-fill commission (Binance-fork). Adapter promotes
+    it onto `FillDelta.fee`; accumulator sums into `TerminalFill.total_fee`."""
+    c, received = _make_client_with_market()
+    c._handle_order_trade_update(_trade_evt(
+        last_qty="0.4", last_price="100.00", cum_qty="0.4", commission="0.04",
+    ))
+    c._handle_order_trade_update(_trade_evt(
+        last_qty="0.6", last_price="100.10", cum_qty="1.0", status="FILLED",
+        commission="0.06",
+    ))
+    assert [d.fee for d in received] == [Decimal("0.04"), Decimal("0.06")]
+    acc = _FillAccumulator()
+    for d in received:
+        acc.add(d)
+    assert acc.total_fee == Decimal("0.10")
+
+
+def test_aster_missing_commission_field_defaults_to_zero() -> None:
+    """Robust to commission being absent on the payload (defensive)."""
+    c, received = _make_client_with_market()
+    evt = _trade_evt(
+        last_qty="1.0", last_price="100.00", cum_qty="1.0", status="FILLED",
+    )
+    del evt["o"]["n"]
+    c._handle_order_trade_update(evt)
+    assert received[0].fee == Decimal("0")

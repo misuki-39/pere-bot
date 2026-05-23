@@ -99,7 +99,11 @@ class LegReport:
     success: bool
     error: str | None = None
     client_id: str | None = None
-    fee: Decimal | None = None
+    # Per-leg commission in quote-currency units. Aster fills carry it on
+    # `ORDER_TRADE_UPDATE.o.n`; lighter is zero-fee; paper-mode synth has
+    # no real fee. Defaults to 0 rather than None so the CSV column stays
+    # numeric for downstream PnL analysis.
+    fee: Decimal = Decimal("0")
     # End-to-end fill latency: local SEND timestamp → venue matching-engine
     # fill timestamp (`fill_ts_ms - send_ts_ms`). Mixed-clock, so carries
     # NTP skew; in practice that's ms-scale and well below the budget
@@ -130,6 +134,7 @@ class LegReport:
             filled_qty = ack.filled_qty
             realized_price = ack.avg_price
             fill_ts_ms = ack.exchange_ts_ms
+        fee = fill.total_fee if fill is not None else Decimal("0")
         latency_ms = fill_ts_ms - send_ts_ms if fill_ts_ms is not None else None
         return cls(
             exchange=venue,
@@ -142,7 +147,7 @@ class LegReport:
             success=ack.success,
             error=ack.error_message,
             client_id=ack.client_id,
-            fee=None,
+            fee=fee,
             latency_ms=latency_ms,
             fill_ts_ms=fill_ts_ms,
             kind=kind,
@@ -173,6 +178,9 @@ class Decision:
     # Our local clock at SEND (epoch ms). Pair with `LegReport.fill_ts_ms`
     # (exchange clock) for end-to-end submit→fill latency, modulo NTP skew.
     send_ts_ms: int | None = None
+    # Cash-flow realized PnL for this two-leg trade, net of fees. None on
+    # non-FIRED outcomes or partial-failure unwinds (success=False).
+    realised_pnl: Decimal | None = None
     timeline: Timeline = field(default_factory=Timeline)
     legs: list[LegReport] = field(default_factory=list)
 

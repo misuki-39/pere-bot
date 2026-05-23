@@ -27,6 +27,7 @@ from ..utils.precision import vwap_fill
 from ..utils.time import now_ms
 from .exchange import BaseExchange
 from .exec_record import LegKind, LegReport, Phase, Timeline
+from .pnl import pair_pnl_from_legs
 from .types import MarketInfo, OrderResult, Side, TerminalFill
 
 _log = logging.getLogger(__name__)
@@ -61,6 +62,9 @@ class TradeReport:
     failure_reason: str | None = None
     latency_ms: int | None = None
     send_ts_ms: int = 0
+    # Cash-flow PnL of the two entry legs net of fees. Set only when
+    # `success=True` and both legs carry realized price + filled qty.
+    realised_pnl: Decimal | None = None
 
 
 class TwoLegExecutor:
@@ -149,6 +153,7 @@ class TwoLegExecutor:
 
         if ack_a.success and ack_b.success:
             report.success = True
+            report.realised_pnl = pair_pnl_from_legs(legs_out[0], legs_out[1])
             # Sign-encode by cash flow: sell → +price (cash in), buy →
             # -price (cash out). Sum is then the per-unit net cash
             # received — positive = profit captured pre-fees, negative
@@ -164,11 +169,11 @@ class TwoLegExecutor:
                 ap_s, bp_s = ap, bp
                 spread = ""
             _log.info(
-                "[%s] FILLED %s=%s %s=%s%s latency=%sms",
+                "[%s] FILLED %s=%s %s=%s%s pnl=%s latency=%sms",
                 trade_id,
                 self.exchanges[a_intent.venue].name, ap_s,
                 self.exchanges[b_intent.venue].name, bp_s,
-                spread, latency,
+                spread, report.realised_pnl, latency,
             )
             return report
 

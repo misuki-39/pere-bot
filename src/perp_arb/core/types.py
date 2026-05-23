@@ -168,6 +168,9 @@ class FillDelta:
     # confirms the parent order is settled (FILLED / CANCELED / REJECTED /
     # EXPIRED). None when this delta isn't terminal.
     terminal_status: OrderStatus | None = None
+    # Per-fill commission in quote-currency units (aster `o.n`). 0 for
+    # venues that don't surface a per-fill fee on the WS stream (lighter).
+    fee: Decimal = Decimal("0")
 
 
 @dataclass(slots=True)
@@ -203,6 +206,10 @@ class TerminalFill:
     weighted_price_sum: Decimal = Decimal("0")
     last_ts_ms: int = 0
     last_status: OrderStatus | None = None
+    # Sum of per-fill commission across all FillDelta events for this cid
+    # (quote-currency units). Snapshot-based venues (lighter) don't feed
+    # this; it stays 0 — lighter is structurally zero-fee.
+    total_fee: Decimal = Decimal("0")
 
     def add(self, event: OrderSnapshot | FillDelta) -> None:
         if event.ts_ms:
@@ -221,6 +228,7 @@ class TerminalFill:
                 # FillDelta adapter invariant: qty > 0 (non-fills dropped at source).
                 self.filled_qty += event.qty
                 self.weighted_price_sum += event.qty * event.price
+                self.total_fee += event.fee
 
     def is_complete(self, requested_qty: Decimal) -> bool:
         # Terminal status = no more fills coming (filled / canceled /
