@@ -58,6 +58,7 @@ class TakerTakerBT(BacktestStrategy):
             max_qty=ctx.max_qty,
             markout=markout,
             inventory_skew_bps=ctx.inventory_skew_bps,
+            inventory_skew_close_bps=ctx.inventory_skew_close_bps,
         )
         # Same-direction throttle: each FIRED on direction X bumps that
         # direction's threshold by `throttle_bump_bps`; the bump decays back

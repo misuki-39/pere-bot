@@ -43,6 +43,9 @@ class AssessParams:
                |position|/max_qty, raise the entry threshold by κ bps when
                the trade GROWS |position|, lower it by κ bps when it FLATTENS.
                κ=0 = current binary max_qty gate only.
+      inventory_skew_close_bps: optional separate κ for the FLATTEN side. None
+               (default) = symmetric (use `inventory_skew_bps` for both sides).
+               Set to 0 to disable exit-easing while keeping entry-tightening.
     """
     qty: Decimal
     fees_bps: Decimal
@@ -51,6 +54,7 @@ class AssessParams:
     max_qty: Decimal
     markout: MarkoutTable = MarkoutTable.disabled()
     inventory_skew_bps: Decimal = Decimal(0)
+    inventory_skew_close_bps: Decimal | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,10 +145,15 @@ def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
     raw_edge_B_bps = raw_edge_B / ref_mid * BPS
     markout_A_bps = p.markout.markout_bps(direction_a=True,  raw_edge_bps=raw_edge_A_bps)
     markout_B_bps = p.markout.markout_bps(direction_a=False, raw_edge_bps=raw_edge_B_bps)
+    kappa_close = (p.inventory_skew_close_bps
+                   if p.inventory_skew_close_bps is not None
+                   else p.inventory_skew_bps)
     skew_A_bps = _inventory_skew_bps(
-        p.inventory_skew_bps, x.position_left, left_side(Direction.A).sign, p.max_qty)
+        p.inventory_skew_bps, kappa_close, x.position_left,
+        left_side(Direction.A).sign, p.max_qty)
     skew_B_bps = _inventory_skew_bps(
-        p.inventory_skew_bps, x.position_left, left_side(Direction.B).sign, p.max_qty)
+        p.inventory_skew_bps, kappa_close, x.position_left,
+        left_side(Direction.B).sign, p.max_qty)
 
     total_thresh_A_bps = fee_bps + markout_A_bps + skew_A_bps + x.bump_a_bps
     total_thresh_B_bps = fee_bps + markout_B_bps + skew_B_bps + x.bump_b_bps
@@ -180,7 +189,8 @@ def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
 
 
 def _inventory_skew_bps(
-    kappa_bps: Decimal,
+    kappa_open_bps: Decimal,
+    kappa_close_bps: Decimal,
     position_left: Decimal,
     delta_sign: int,
     max_qty: Decimal,
@@ -192,17 +202,26 @@ def _inventory_skew_bps(
     |position|/max_qty and signed by whether the trade grows or shrinks
     |position|:
 
-      skew = kappa_bps * (position_left * delta_sign) / max_qty
+      growing = position_left * delta_sign / max_qty
+      skew    = kappa_open  * growing   if growing > 0   (raise threshold)
+              = kappa_close * growing   if growing < 0   (lower threshold; growing<0)
 
     With `delta_sign = left_side(direction).sign` (sell=−1, buy=+1):
       - If `position_left` and `delta_sign` AGREE in sign  → growing |pos|
         → positive skew (raise threshold; require stronger edge to add more).
       - If they DISAGREE                                   → shrinking |pos|
         → negative skew (lower threshold; reward flattening).
-      - At `|position_left| = max_qty`, |skew| = kappa_bps (full strength).
+      - At `|position_left| = max_qty`, |skew| = the relevant κ (full strength).
 
-    κ=0 disables the skew (same as binary max_qty gate downstream).
+    Asymmetric usage: pass kappa_close_bps=0 to disable exit-easing while
+    keeping entry-tightening (the "raise threshold for adding" intuition).
+    Symmetric is recovered by kappa_close_bps == kappa_open_bps.
     """
-    if kappa_bps == 0 or max_qty == 0:
+    if max_qty == 0:
         return Decimal(0)
-    return kappa_bps * (position_left * Decimal(delta_sign)) / max_qty
+    growing = position_left * Decimal(delta_sign) / max_qty
+    if growing > 0:
+        return kappa_open_bps * growing
+    if growing < 0:
+        return kappa_close_bps * growing
+    return Decimal(0)
