@@ -38,7 +38,6 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from perp_arb.core.logging import setup_logging  # noqa: E402
 from perp_arb.core.types import MarketInfo, Side  # noqa: E402
 from perp_arb.exchanges.lighter.client import (  # noqa: E402
     LighterClient,
@@ -172,7 +171,7 @@ async def run(symbol: str, qty: Decimal, iters: int, side: Side) -> int:
 
 
 def main() -> int:
-    setup_logging()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s: %(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", default="ETH")
     parser.add_argument("--qty", type=Decimal, default=Decimal("0.005"))
