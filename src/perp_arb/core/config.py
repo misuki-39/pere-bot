@@ -66,9 +66,10 @@ class OptimisationsCfg(BaseModel):
     `AssessParams` / `AssessInputs` fields, so the live wiring is just
     plumbing.
 
-    `inventory_skew_bps` is intentionally NOT exposed here — the backtest
-    sweep showed it is alone-bad / combined-good with markout; rolling
-    markout calibration must stabilise first.
+    `inventory_skew_bps` / `inventory_skew_close_bps` widen the entry
+    threshold as |position| grows (κ_open) and narrow it as |position|
+    shrinks (κ_close). Default 0 / None = off. See
+    docs/inventory_skew_wti_2026-05-24.md for BT-derived recommendations.
     """
     # Per-(direction, edge-bucket) adverse-selection table built offline by
     # `scripts/build_markout_table.py`. None ⇒ MarkoutTable.disabled().
@@ -90,6 +91,17 @@ class OptimisationsCfg(BaseModel):
 
     # Edge-persistence confirmation gate. Disabled by default.
     persistence_confirm: PersistenceConfirmCfg = PersistenceConfirmCfg()
+
+    # Avellaneda-Stoikov-style inventory skew (κ in bps per unit of
+    # |position|/max_qty). κ_open raises the entry threshold when the trade
+    # GROWS |position|; κ_close lowers it when the trade FLATTENS. κ_open=0
+    # disables the widener entirely. κ_close=None recovers symmetric behaviour
+    # (uses κ_open for both sides); =0 disables exit-easing while keeping
+    # entry-tightening. BT-recommended on WTI: κ_open=15, κ_close=5
+    # (regime-conditional: +22% on drift, slight loss on calm — capacity-bound
+    # tool). See docs/inventory_skew_wti_2026-05-24.md.
+    inventory_skew_bps: Decimal = Decimal("0")
+    inventory_skew_close_bps: Decimal | None = None
 
 
 class StrategyCfg(BaseModel):

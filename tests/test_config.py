@@ -134,6 +134,23 @@ def test_optimisations_defaults_when_block_absent() -> None:
     assert opt.throttle_bump_bps == Decimal("0")
     assert opt.throttle_halflife_s == 3.0
     assert opt.in_flight_cap_per_direction == 0
+    # inventory skew default-off: κ_open=0 disables widener; κ_close=None
+    # means "symmetric — fall back to κ_open" rather than "explicitly 0".
+    assert opt.inventory_skew_bps == Decimal("0")
+    assert opt.inventory_skew_close_bps is None
+
+
+def test_optimisations_inventory_skew_round_trips() -> None:
+    """The live boundary that the stale 'intentionally NOT exposed' comment
+    used to gate. Catches regression of the config → AssessParams plumbing."""
+    raw = yaml.safe_load(SAMPLE_YAML)
+    raw["optimisations"] = {
+        "inventory_skew_bps": "15",
+        "inventory_skew_close_bps": "5",
+    }
+    cfg = StrategyCfg.model_validate(raw)
+    assert cfg.optimisations.inventory_skew_bps == Decimal("15")
+    assert cfg.optimisations.inventory_skew_close_bps == Decimal("5")
 
 
 def test_optimisations_block_fully_populated(tmp_path: Path) -> None:

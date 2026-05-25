@@ -122,9 +122,12 @@ class TakerTakerArbitrage(BaseStrategy):
             max_stale_ms=s.max_stale_ms,
             max_qty=Decimal(str(s.max_qty)),
             markout=markout,
-            # inventory_skew_bps intentionally left at default 0; not
-            # exposed in OptimisationsCfg until rolling markout calibration
-            # is stable.
+            inventory_skew_bps=Decimal(str(opt.inventory_skew_bps)),
+            inventory_skew_close_bps=(
+                Decimal(str(opt.inventory_skew_close_bps))
+                if opt.inventory_skew_close_bps is not None
+                else None
+            ),
         )
 
         # Same-direction throttle: each FILLED on direction X bumps that
@@ -193,6 +196,19 @@ class TakerTakerArbitrage(BaseStrategy):
                 "persistence-confirm enabled: t_confirm=%dms n_confirm=%d "
                 "drift_max=%s bps",
                 pc.t_confirm_ms, pc.n_confirm, pc.drift_max_bps,
+            )
+        if opt.inventory_skew_bps > 0 or (
+            opt.inventory_skew_close_bps is not None
+            and opt.inventory_skew_close_bps > 0
+        ):
+            close_repr = (
+                f"{opt.inventory_skew_close_bps}"
+                if opt.inventory_skew_close_bps is not None
+                else f"{opt.inventory_skew_bps} (symmetric)"
+            )
+            _log.info(
+                "inventory skew enabled: κ_open=%s bps κ_close=%s bps",
+                opt.inventory_skew_bps, close_repr,
             )
 
     async def run(self) -> None:
