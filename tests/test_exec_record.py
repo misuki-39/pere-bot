@@ -11,14 +11,13 @@ from perp_arb.core.exec_record import (
     Decision,
     Direction,
     ExecutionRecorder,
-    LegKind,
-    LegReport,
     Outcome,
     Phase,
     Timeline,
     _decision_header,
     _leg_header,
 )
+from perp_arb.core.types import LegKind, LegOutcome, OrderStatus, Side
 
 
 def test_timeline_span_none_until_both_marks(monkeypatch) -> None:
@@ -43,7 +42,8 @@ def test_headers_are_derived_from_dataclasses() -> None:
     lh = _leg_header()
     assert lh[:2] == ["decision_id", "ts_ms"]
     assert "expected_price" in lh and "realized_price" in lh
-    assert "latency_ms" in lh and "fill_ts_ms" in lh
+    assert "send_ts_ms" in lh and "fill_ts_ms" in lh
+    assert "latency_ms" not in lh   # legacy mixed-clock derived column dropped
     assert "fee" in lh
 
 
@@ -71,11 +71,23 @@ def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkey
     clock["t"] = 12
     d.timeline.mark(Phase.SEND)
     d.legs = [
-        LegReport("aster", "buy", Decimal("0.6"), Decimal("0.6"),
-                  Decimal("100.02"), Decimal("100.03"), "filled", True,
-                  fee=Decimal("0.018")),
-        LegReport("lighter", "sell", Decimal("0.6"), Decimal("0.6"),
-                  Decimal("100.04"), Decimal("100.038"), "filled", True),
+        LegOutcome(
+            client_id="x", side=Side.BUY, requested_qty=Decimal("0.6"),
+            success=True, status=OrderStatus.FILLED,
+            filled_qty=Decimal("0.6"),
+            weighted_price_sum=Decimal("0.6") * Decimal("100.03"),
+            total_fee=Decimal("0.018"),
+            venue="aster", expected_price=Decimal("100.02"),
+            send_ts_ms=1_700_000_000_000, last_ts_ms=1_700_000_000_120,
+        ),
+        LegOutcome(
+            client_id="y", side=Side.SELL, requested_qty=Decimal("0.6"),
+            success=True, status=OrderStatus.FILLED,
+            filled_qty=Decimal("0.6"),
+            weighted_price_sum=Decimal("0.6") * Decimal("100.038"),
+            venue="lighter", expected_price=Decimal("100.04"),
+            send_ts_ms=1_700_000_000_000, last_ts_ms=1_700_000_000_330,
+        ),
     ]
     rec.emit(d)
     rec.close()

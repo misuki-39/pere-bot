@@ -24,7 +24,6 @@ from perp_arb.core.exec_record import (
     Decision,
     Direction,
     ExecutionRecorder,
-    LegReport,
     Outcome,
     _decision_header,
     _leg_header,
@@ -184,7 +183,6 @@ def _ack_ok(*, avg_price: str = "100.00", exchange_ts: int | None = None,
         side=Side.BUY,
         requested_qty=Decimal("1.0"),
         status=OrderStatus.FILLED,
-        latency_ms=50,
         exchange_ts_ms=exchange_ts,
         filled_qty=f,
         weighted_price_sum=f * Decimal(avg_price),
@@ -196,7 +194,7 @@ def _ack_lighter_open() -> LegOutcome:
     stream is the only realized-data source."""
     return LegOutcome(
         success=True, client_id="x", side=Side.SELL,
-        requested_qty=Decimal("1.0"), status=OrderStatus.OPEN, latency_ms=200,
+        requested_qty=Decimal("1.0"), status=OrderStatus.OPEN,
     )
 
 
@@ -355,49 +353,6 @@ def test_legoutcome_add_snapshot_without_price_no_op() -> None:
     assert acc.last_status is OrderStatus.FILLED  # terminal status still tracked
 
 
-# ---- LegReport.from_outcome ------------------------------------------
-
-_SEND_TS = 1_699_999_999_900   # reference SEND for from_outcome tests
-
-
-def test_from_outcome_copies_fill_data() -> None:
-    """Outcome already merged — `from_outcome` is a pure field copy."""
-    out = LegOutcome(
-        success=True, client_id="x", side=Side.BUY,
-        requested_qty=Decimal("1.0"), status=OrderStatus.FILLED, latency_ms=50,
-        exchange_ts_ms=1_700_000_000_000,
-        filled_qty=Decimal("1.0"),
-        weighted_price_sum=Decimal("100.05"),
-        last_ts_ms=1_700_000_000_500,
-        total_fee=Decimal("0.02"),
-    )
-    leg = LegReport.from_outcome(
-        venue="aster", outcome=out,
-        expected_price=Decimal("99.95"), send_ts_ms=_SEND_TS,
-    )
-    assert leg.realized_price == Decimal("100.05")
-    assert leg.filled_qty == Decimal("1.0")
-    assert leg.fill_ts_ms == 1_700_000_000_500          # WS ts wins via fill_ts_ms property
-    assert leg.latency_ms == 600
-    assert leg.fee == Decimal("0.02")
-    assert leg.client_id == "x"
-
-
-def test_from_outcome_latency_none_when_no_ts() -> None:
-    """No WS ts AND no exchange_ts_ms (e.g. lighter pre-fill): fill_ts_ms
-    and latency_ms both None — we don't fabricate a fill latency."""
-    out = LegOutcome(
-        success=True, client_id="x", side=Side.SELL,
-        requested_qty=Decimal("1.0"), status=OrderStatus.OPEN, latency_ms=200,
-    )
-    leg = LegReport.from_outcome(
-        venue="lighter", outcome=out,
-        expected_price=Decimal("100.25"), send_ts_ms=_SEND_TS,
-    )
-    assert leg.fill_ts_ms is None
-    assert leg.latency_ms is None
-
-
 # ---- recorder CSV header contains the new columns ---------------------
 
 def test_decision_header_contains_send_ts_ms() -> None:
@@ -409,8 +364,8 @@ def test_leg_header_contains_fill_ts_ms() -> None:
 
 
 def test_recorder_writes_send_ts_ms_to_csv(tmp_path: Path) -> None:
-    """End-to-end: a FIRED Decision with send_ts_ms + a LegReport with
-    fill_ts_ms should round-trip through the CSV writer."""
+    """End-to-end: a FIRED Decision with send_ts_ms + a LegOutcome with
+    fill timestamps should round-trip through the CSV writer."""
     rec = ExecutionRecorder(tmp_path, run_ts="TEST", strategy_id="taker_taker")
     d = Decision(
         decision_id="d-test",
@@ -422,12 +377,14 @@ def test_recorder_writes_send_ts_ms_to_csv(tmp_path: Path) -> None:
         outcome=Outcome.FIRED,
         send_ts_ms=1_700_000_000_010,
     )
-    d.legs.append(LegReport(
-        exchange="aster", side="buy",
+    d.legs.append(LegOutcome(
+        venue="aster", side=Side.BUY,
         requested_qty=Decimal("1.0"), filled_qty=Decimal("1.0"),
-        expected_price=Decimal("100"), realized_price=Decimal("100.05"),
-        status="filled", success=True,
-        fill_ts_ms=1_700_000_000_050,
+        weighted_price_sum=Decimal("100.05"),
+        expected_price=Decimal("100"),
+        status=OrderStatus.FILLED, success=True,
+        send_ts_ms=1_700_000_000_010,
+        last_ts_ms=1_700_000_000_050,
     ))
     rec.emit(d)
     rec.close()

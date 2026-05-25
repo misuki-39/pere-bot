@@ -6,17 +6,20 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from perp_arb.core.exec_record import LegReport
 from perp_arb.core.pnl import leg_cash_flow, pair_pnl, pair_pnl_from_legs
-from perp_arb.core.types import Side
+from perp_arb.core.types import LegOutcome, OrderStatus, Side
 
 
-def _leg(*, exchange: str, side: Side, qty: str, price: str, fee: str = "0") -> LegReport:
-    return LegReport(
-        exchange=exchange, side=side.value,
-        requested_qty=Decimal(qty), filled_qty=Decimal(qty),
-        expected_price=Decimal(price), realized_price=Decimal(price),
-        status="filled", success=True, fee=Decimal(fee),
+def _leg(*, exchange: str, side: Side, qty: str, price: str, fee: str = "0") -> LegOutcome:
+    q = Decimal(qty)
+    p = Decimal(price)
+    return LegOutcome(
+        venue=exchange, side=side,
+        requested_qty=q, filled_qty=q,
+        weighted_price_sum=q * p,
+        expected_price=p,
+        status=OrderStatus.FILLED, success=True,
+        total_fee=Decimal(fee),
     )
 
 
@@ -63,8 +66,10 @@ def test_pair_pnl_from_legs_happy_path() -> None:
 
 
 def test_pair_pnl_from_legs_returns_none_when_realized_price_missing() -> None:
+    # avg_price returns None when filled_qty=0 — zero out the left leg's fill.
     left = _leg(exchange="aster", side=Side.SELL, qty="1", price="100")
-    left.realized_price = None
+    left.filled_qty = Decimal("0")
+    left.weighted_price_sum = Decimal("0")
     right = _leg(exchange="lighter", side=Side.BUY, qty="1", price="100")
     assert pair_pnl_from_legs(left, right) is None
 

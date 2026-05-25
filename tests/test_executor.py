@@ -19,10 +19,11 @@ from typing import Any
 
 import pytest
 
-from perp_arb.core.exec_record import LegKind, Phase, Timeline
+from perp_arb.core.exec_record import Phase, Timeline
 from perp_arb.core.executor import LegIntent, TwoLegExecutor
 from perp_arb.core.types import (
     BookLevel,
+    LegKind,
     LegOutcome,
     MarketInfo,
     OrderBook,
@@ -36,7 +37,7 @@ _SYM_L = Symbol(exchange="lighter", raw="ETH", base="ETH", quote="USD")
 # Stub fixture binds leg_a -> aster, leg_b -> lighter. Strategy-layer code
 # only sees the leg labels; the actual venue identity ("aster"/"lighter")
 # is what each stub instance reports via its `.name` field and what the
-# executor stamps into LegReport.exchange.
+# executor stamps into LegOutcome.venue.
 _MARKETS = {
     "leg_a": MarketInfo(
         symbol=_SYM_A, tick_size=Decimal("0.01"), lot_size=Decimal("0.001"),
@@ -113,7 +114,6 @@ def _ok(*, side: Side, qty: Decimal, avg: str = "100.00",
         side=side,
         requested_qty=qty,
         status=OrderStatus.FILLED,
-        latency_ms=10,
         exchange_ts_ms=exchange_ts,
         filled_qty=qty,
         weighted_price_sum=Decimal(avg) * qty,
@@ -173,7 +173,7 @@ async def test_both_legs_succeed_no_unwind() -> None:
     assert report.success is True
     assert report.failure_reason is None
     assert [leg.kind for leg in report.legs] == [LegKind.ENTRY, LegKind.ENTRY]
-    assert [leg.exchange for leg in report.legs] == ["aster", "lighter"]
+    assert [leg.venue for leg in report.legs] == ["aster", "lighter"]
     # executor allocates one cid per leg — defends against a future
     # same-venue strategy where a shared cid would alias accumulator
     # state and the first finishing leg's release would wipe the other.
@@ -205,8 +205,8 @@ async def test_realised_pnl_subtracts_fees() -> None:
     )
     assert report.success is True
     assert report.realised_pnl == Decimal("0.07")
-    assert report.legs[0].fee == Decimal("0.03")
-    assert report.legs[1].fee == Decimal("0")
+    assert report.legs[0].total_fee == Decimal("0.03")
+    assert report.legs[1].total_fee == Decimal("0")
 
 
 @pytest.mark.asyncio
@@ -250,7 +250,7 @@ async def test_aster_ok_lighter_fail_unwinds_aster() -> None:
     # unwind leg appended: aster reduce-only on the OPPOSITE side
     assert len(report.legs) == 3
     assert report.legs[2].kind is LegKind.UNWIND
-    assert report.legs[2].exchange == "aster"
+    assert report.legs[2].venue == "aster"
     # Second aster call is the unwind (via place_market_order):
     # opposite side + reduce_only
     assert len(aster.submit_calls) == 2
@@ -279,7 +279,7 @@ async def test_lighter_ok_aster_fail_unwinds_lighter() -> None:
     assert "aster leg failed" in (report.failure_reason or "")
     assert len(report.legs) == 3
     assert report.legs[2].kind is LegKind.UNWIND
-    assert report.legs[2].exchange == "lighter"
+    assert report.legs[2].venue == "lighter"
     unwind_call = lighter.submit_calls[1]
     assert unwind_call["reduce_only"] is True
     assert unwind_call["side"] is Side.SELL  # opposite of BUY entry
@@ -321,8 +321,8 @@ async def test_paper_synth_uses_book_vwap() -> None:
     )
 
     assert report.success is True
-    assert report.legs[0].realized_price == Decimal("100.00")  # aster bid (SELL)
-    assert report.legs[1].realized_price == Decimal("100.06")  # lighter ask (BUY)
+    assert report.legs[0].avg_price == Decimal("100.00")  # aster bid (SELL)
+    assert report.legs[1].avg_price == Decimal("100.06")  # lighter ask (BUY)
     # No driver calls — paper short-circuits
     assert aster.submit_calls == [] and lighter.submit_calls == []
 
@@ -383,7 +383,7 @@ async def test_unexpected_exception_coerced_to_failure_outcome() -> None:
     # Unwind appended (we use submit_and_await for the unwind too)
     assert len(report.legs) == 3
     assert report.legs[2].kind is LegKind.UNWIND
-    assert report.legs[2].exchange == "aster"
+    assert report.legs[2].venue == "aster"
 
 
 # ---- side flip works through LegIntent ----------------------------------
@@ -418,7 +418,7 @@ async def test_legs_with_opposite_sides() -> None:
 @pytest.mark.asyncio
 async def test_timeline_send_mark_set() -> None:
     """The executor stamps SEND so `lat_decision_send_ms` is computable.
-    All other latencies live on per-leg LegReport (fill_ts_ms - send_ts_ms)."""
+    All other latencies derive from per-leg LegOutcome (fill_ts_ms - send_ts_ms)."""
     qty = Decimal("1.0")
     aster = _StubExchange(
         name="aster",

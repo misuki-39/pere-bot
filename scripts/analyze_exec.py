@@ -58,8 +58,13 @@ print(f"  fired: both-legs-filled={(fp == 2).sum()}  "
       f"one-leg-only(partial)={(fp == 1).sum()}")
 
 print("\n=== inter-leg fill skew (the naked-exposure window) ===")
+# Latency = fill_ts_ms − send_ts_ms (mixed clock: venue match vs local send;
+# NTP skew is ms-scale, well below the interesting signal here).
+entry["fill_ts_ms"] = pd.to_numeric(entry["fill_ts_ms"], errors="coerce")
+entry["send_ts_ms"] = pd.to_numeric(entry["send_ts_ms"], errors="coerce")
+entry["_latency_ms"] = entry["fill_ts_ms"] - entry["send_ts_ms"]
 lat = entry.pivot_table(index="decision_id", columns="exchange",
-                        values="latency_ms", aggfunc="first")
+                        values="_latency_ms", aggfunc="first")
 if {"aster", "lighter"}.issubset(lat.columns):
     lat = lat.dropna(subset=["aster", "lighter"])
     skew = (lat["aster"] - lat["lighter"]).abs()
@@ -71,7 +76,7 @@ if {"aster", "lighter"}.issubset(lat.columns):
     u, c = np.unique(led, return_counts=True)
     print(f"  leg that filled first: {dict(zip(u, c, strict=True))}")
 else:
-    print("  (need both venues' latency_ms — paper or single-venue run)")
+    print("  (need both venues' fill timestamps — paper or single-venue run)")
 
 print("\n=== unwind legs (partial-fill flattens — the tail cost) ===")
 if len(unwind):

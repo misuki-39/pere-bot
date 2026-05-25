@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from collections import defaultdict
 from decimal import Decimal
 
@@ -149,7 +148,6 @@ class AsterClient(BaseExchange):
     ) -> LegOutcome:
         if self.public_only:
             raise RuntimeError("aster is in public_only mode — cannot place orders")
-        t0 = time.monotonic()
         try:
             resp = await self.rest.place_order(
                 symbol=str(market.contract_id),
@@ -167,7 +165,6 @@ class AsterClient(BaseExchange):
                 side=side,
                 requested_qty=qty,
                 error_message=str(e),
-                latency_ms=int((time.monotonic() - t0) * 1000),
             )
         # `transactTime` (Binance-fork convention) is the exchange-server
         # millisecond timestamp of the order action. Aster's REST also
@@ -198,7 +195,6 @@ class AsterClient(BaseExchange):
             side=side,
             requested_qty=qty,
             status=_ASTER_STATUS_MAP.get(resp["status"], OrderStatus.UNKNOWN),
-            latency_ms=int((time.monotonic() - t0) * 1000),
             exchange_ts_ms=int(resp["transactTime"]) if resp.get("transactTime") else None,
             filled_qty=filled_qty,
             weighted_price_sum=weighted_price_sum,

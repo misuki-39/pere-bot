@@ -65,8 +65,8 @@ async def _round_trip(
     res = await client.place_market_order(
         market, side, qty, reduce_only=reduce_only, client_id=cid,
     )
-    _log.info("REST result: success=%s order_id=%s latency=%dms err=%s",
-              res.success, res.order_id, res.latency_ms or -1, res.error_message)
+    _log.info("REST result: success=%s client_id=%s status=%s err=%s",
+              res.success, res.client_id, res.status.value, res.error_message)
     if not res.success:
         raise RuntimeError(f"{label}: order rejected: {res.error_message}")
 

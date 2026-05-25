@@ -8,7 +8,8 @@ decisions and resolves them into venue-side intents) and **driver**
 `vwap_*`, or any strategy-internal field. The caller hands it concrete
 `LegIntent`s (venue, side, expected_price) and a `Timeline` writeback
 target; the executor owns cid generation, handles `gather`, partial-
-failure unwind, paper-fill synth, and `LegReport` assembly.
+failure unwind, paper-fill synth, and stamps presentation fields onto
+each `LegOutcome` so the recorder can serialize them directly.
 
 Paper mode is a single branch inside `execute()` rather than a separate
 `PaperExecutor` because paper and live share 100% of the orchestration
@@ -26,9 +27,9 @@ from decimal import Decimal
 from ..utils.precision import vwap_fill
 from ..utils.time import now_ms
 from .exchange import BaseExchange
-from .exec_record import LegKind, LegReport, Phase, Timeline
+from .exec_record import Phase, Timeline
 from .pnl import pair_pnl_from_legs
-from .types import LegOutcome, MarketInfo, OrderStatus, Side
+from .types import LegKind, LegOutcome, MarketInfo, OrderStatus, Side
 
 _log = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ class LegIntent:
 
     venue: str               # leg-label key into the executor's `exchanges` dict (e.g. "leg_a")
     side: Side
-    expected_price: Decimal  # decision-time VWAP / cost basis — informational, passed through to LegReport
+    expected_price: Decimal  # decision-time VWAP / cost basis — stamped onto LegOutcome
 
 
 @dataclass
@@ -49,17 +50,18 @@ class TradeReport:
     """Result the executor returns to the caller.
 
     `success=True` iff both entry legs' place acks returned success.
-    Per-leg WS fill data lives on `legs[*]` via `LegReport.from_outcome`.
+    Per-leg ack + WS fill data live on `legs[*]` as `LegOutcome`s with
+    presentation fields (venue, expected_price, send_ts_ms, kind) already
+    stamped by the executor — the recorder serializes them directly.
 
     A partial-failure unwind appears as an additional leg with
     `kind=UNWIND`. Both-fail leaves `success` False with a populated
     `failure_reason`. `send_ts_ms` is the wall-clock moment the SEND
     timeline mark was stamped — caller copies it into its own record."""
 
-    legs: list[LegReport] = field(default_factory=list)
+    legs: list[LegOutcome] = field(default_factory=list)
     success: bool = False
     failure_reason: str | None = None
-    latency_ms: int | None = None
     send_ts_ms: int = 0
     # Cash-flow PnL of the two entry legs net of fees. Set only when
     # `success=True` and both legs carry realized price + filled qty.
@@ -144,40 +146,23 @@ class TwoLegExecutor:
             a_out = _coerce_outcome(results[0], a_intent.side, qty)
             b_out = _coerce_outcome(results[1], b_intent.side, qty)
 
-        # CSV `exchange` column = actual venue ("aster"/"lighter") via
+        # Stamp presentation fields onto each outcome so they're recorder-
+        # ready. `venue` = actual driver name ("aster"/"lighter") via
         # BaseExchange.name, not the leg label key ("leg_a") — keeps audit
         # traces joinable to venue-side records.
-        legs_out = [
-            LegReport.from_outcome(
-                venue=self.exchanges[a_intent.venue].name,
-                outcome=a_out,
-                expected_price=a_intent.expected_price,
-                send_ts_ms=send_ts_ms,
-            ),
-            LegReport.from_outcome(
-                venue=self.exchanges[b_intent.venue].name,
-                outcome=b_out,
-                expected_price=b_intent.expected_price,
-                send_ts_ms=send_ts_ms,
-            ),
-        ]
-        # Trade-level latency = worst per-leg fill latency. Same metric
-        # the risk manager budgets against — "did the slow leg blow our
-        # max_leg_latency_ms?".
-        leg_latencies = [leg.latency_ms for leg in legs_out if leg.latency_ms is not None]
-        latency = max(leg_latencies) if leg_latencies else None
-        report = TradeReport(
-            legs=legs_out, latency_ms=latency, send_ts_ms=send_ts_ms,
-        )
+        self._stamp(a_out, a_intent, send_ts_ms, LegKind.ENTRY)
+        self._stamp(b_out, b_intent, send_ts_ms, LegKind.ENTRY)
+
+        report = TradeReport(legs=[a_out, b_out], send_ts_ms=send_ts_ms)
 
         if a_out.success and b_out.success:
             report.success = True
-            report.realised_pnl = pair_pnl_from_legs(legs_out[0], legs_out[1])
+            report.realised_pnl = pair_pnl_from_legs(a_out, b_out)
             _log.info(
-                "[%s] FILLED %s pnl=%s latency=%sms",
+                "[%s] FILLED %s pnl=%s",
                 trade_id,
                 _spread_log(a_intent, b_intent, a_out, b_out),
-                report.realised_pnl, latency,
+                report.realised_pnl,
             )
             return report
 
@@ -238,16 +223,16 @@ class TwoLegExecutor:
         side: Side,
         qty: Decimal,
         cost_basis: Decimal | None,
-    ) -> LegReport | None:
-        """Flatten the stranded leg. `expected_price` is the stranded
-        fill we are reversing, so the round-trip cost of a partial is
-        directly computable offline. Returns `None` in paper mode
-        (paper has no real position to flatten).
+    ) -> LegOutcome | None:
+        """Flatten the stranded leg. `cost_basis` is the stranded fill
+        we are reversing — stamped as `expected_price` so the round-trip
+        cost of a partial is directly computable offline. Returns `None`
+        in paper mode (paper has no real position to flatten).
 
         Routes through `submit_and_await` so the WS fill data populates
-        the unwind LegReport — `place_market_order` alone leaves
-        lighter unwinds with no realized_price (lighter's REST carries
-        no fill data; only WS does)."""
+        the unwind outcome — `place_market_order` alone leaves lighter
+        unwinds with no realized_price (lighter's REST carries no fill
+        data; only WS does)."""
         if self._is_paper:
             return None
         ex = self.exchanges[venue]
@@ -267,10 +252,28 @@ class TwoLegExecutor:
                 success=False, side=side, requested_qty=qty,
                 error_message=f"unwind raised: {e}",
             )
-        return LegReport.from_outcome(
-            venue=ex.name, outcome=out, expected_price=cost_basis,
-            send_ts_ms=unwind_send_ts, kind=LegKind.UNWIND,
-        )
+        out.venue = ex.name
+        out.expected_price = cost_basis
+        out.send_ts_ms = unwind_send_ts
+        out.kind = LegKind.UNWIND
+        return out
+
+    # ----- presentation field stamping -----
+
+    def _stamp(
+        self,
+        outcome: LegOutcome,
+        intent: LegIntent,
+        send_ts_ms: int,
+        kind: LegKind,
+    ) -> None:
+        """Fill in the four presentation fields the recorder + analysis
+        need. Drivers only know ack + fill data; venue label / expected
+        price / send timestamp / leg kind are executor concerns."""
+        outcome.venue = self.exchanges[intent.venue].name
+        outcome.expected_price = intent.expected_price
+        outcome.send_ts_ms = send_ts_ms
+        outcome.kind = kind
 
     # ----- paper-mode synth -----
 

@@ -12,11 +12,13 @@ from the dataclass fields so header and row cannot drift.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 from ..utils.time import mono_ms
 from .logging import CsvWriter
@@ -31,11 +33,6 @@ class Outcome(StrEnum):
     BLOCKED_RISK = "BLOCKED_RISK"
 
 
-class LegKind(StrEnum):
-    ENTRY = "entry"
-    UNWIND = "unwind"
-
-
 class Direction(StrEnum):
     A = "A"   # sell leg_a, buy leg_b
     B = "B"   # reverse
@@ -45,9 +42,9 @@ class Phase(StrEnum):
     """Canonical Timeline checkpoints `latencies()` derives columns from. The
     recorder depends only on these — the strategy owns any other marks.
 
-    No RESULT phase: end-to-end latency lives on per-leg LegReport
-    (fill_ts_ms - send_ts_ms), which is the only measurement that
-    reflects actual execution time on a single clock-comparable basis."""
+    No RESULT phase: end-to-end latency is derived at analysis time from
+    `LegOutcome.fill_ts_ms - LegOutcome.send_ts_ms` (mixed clock — local
+    epoch vs venue matching-engine clock; NTP skew is ms-scale)."""
 
     DECISION = "decision"
     SEND = "send"
@@ -78,88 +75,35 @@ class Timeline:
 
     def latencies(self) -> dict[str, int | None]:
         """One derived latency column: decision-compute → fire. Pure
-        local-clock CPU/wait. End-to-end execution latency is on
-        LegReport, not here."""
+        local-clock CPU/wait. End-to-end execution latency is derived at
+        analysis time from LegOutcome.fill_ts_ms - LegOutcome.send_ts_ms."""
         return {
             "lat_decision_send_ms": self.span(Phase.DECISION, Phase.SEND),
         }
 
 
-@dataclass
-class LegReport:
-    """One venue leg of a fired decision — always produced, success or not."""
-
-    exchange: str
-    side: str
-    requested_qty: Decimal
-    filled_qty: Decimal | None
-    expected_price: Decimal | None   # decision-time VWAP / unwind cost basis
-    realized_price: Decimal | None
-    status: str
-    success: bool
-    error: str | None = None
-    client_id: str | None = None
-    # Per-leg commission in quote-currency units. Aster fills carry it on
-    # `ORDER_TRADE_UPDATE.o.n`; lighter is zero-fee; paper-mode synth has
-    # no real fee. Defaults to 0 rather than None so the CSV column stays
-    # numeric for downstream PnL analysis.
-    fee: Decimal = Decimal("0")
-    # End-to-end fill latency: local SEND timestamp → venue matching-engine
-    # fill timestamp (`fill_ts_ms - send_ts_ms`). Mixed-clock, so carries
-    # NTP skew; in practice that's ms-scale and well below the budget
-    # threshold the risk manager checks.
-    latency_ms: int | None = None
-    # Matching-engine fill instant on the venue's clock (aster `transactTime`,
-    # lighter `transaction_time`). Kept raw for cross-venue audits.
-    fill_ts_ms: int | None = None
-    kind: LegKind = LegKind.ENTRY
-
-    @classmethod
-    def from_outcome(
-        cls, *, venue: str, outcome: LegOutcome,
-        expected_price: Decimal | None,
-        send_ts_ms: int, kind: LegKind = LegKind.ENTRY,
-    ) -> LegReport:
-        """Pure field copy. The ack/WS merge already happened upstream in
-        `BaseExchange.submit_and_await`; this is just a projection from
-        the unified `LegOutcome` shape onto the recorder's row shape.
-
-        `side` is required (no defensive "" coercion) so a downstream
-        `Side(row['side'])` can never get an empty string. A successful
-        outcome with `filled_qty == 0` (e.g. cancel-on-place) preserves
-        the zero; only outright failure (`success=False`) records None.
-        """
-        assert outcome.side is not None, (
-            "LegOutcome must carry side for recording — drivers always set it; "
-            "an unset side means a bug at the construction site."
-        )
-        if outcome.requested_qty is None:
-            raise ValueError(
-                "LegOutcome.requested_qty is None at recorder boundary — "
-                "drivers must populate it from the LegIntent."
-            )
-        fill_ts = outcome.fill_ts_ms
-        latency_ms = fill_ts - send_ts_ms if fill_ts is not None else None
-        # filled_qty=None signals "no fill information" (failed ack);
-        # Decimal('0') signals "ack succeeded but zero qty filled" (a
-        # distinct, recordable outcome — e.g. cancel-on-place).
-        filled_qty = outcome.filled_qty if outcome.success else None
-        return cls(
-            exchange=venue,
-            side=outcome.side.value,
-            requested_qty=outcome.requested_qty,
-            filled_qty=filled_qty,
-            expected_price=expected_price,
-            realized_price=outcome.avg_price,
-            status=outcome.status.value,
-            success=outcome.success,
-            error=outcome.error_message,
-            client_id=outcome.client_id,
-            fee=outcome.total_fee,
-            latency_ms=latency_ms,
-            fill_ts_ms=fill_ts,
-            kind=kind,
-        )
+# CSV column order for legs_*.csv. Each entry: (column_name, accessor).
+# Accessor pulls the value out of a LegOutcome — handles enum→str, the
+# avg_price property, fee/error renaming, and the "filled_qty is None on
+# failure" rule.
+_LEG_CSV_COLUMNS: list[tuple[str, Callable[[LegOutcome], Any]]] = [
+    ("exchange",       lambda o: o.venue),
+    ("side",           lambda o: o.side.value if o.side is not None else ""),
+    ("requested_qty",  lambda o: o.requested_qty),
+    # filled_qty=None on failure (no fill info); Decimal('0') means
+    # "ack succeeded but zero qty filled" — both are recordable outcomes.
+    ("filled_qty",     lambda o: o.filled_qty if o.success else None),
+    ("expected_price", lambda o: o.expected_price),
+    ("realized_price", lambda o: o.avg_price),
+    ("status",         lambda o: o.status.value),
+    ("success",        lambda o: o.success),
+    ("error",          lambda o: o.error_message),
+    ("client_id",      lambda o: o.client_id),
+    ("fee",            lambda o: o.total_fee),
+    ("send_ts_ms",     lambda o: o.send_ts_ms),
+    ("fill_ts_ms",     lambda o: o.fill_ts_ms),
+    ("kind",           lambda o: o.kind.value),
+]
 
 
 @dataclass
@@ -183,14 +127,14 @@ class Decision:
     direction: Direction | None = None
     outcome: Outcome = Outcome.PENDING
     abort_reason: str | None = None
-    # Our local clock at SEND (epoch ms). Pair with `LegReport.fill_ts_ms`
+    # Our local clock at SEND (epoch ms). Pair with `LegOutcome.fill_ts_ms`
     # (exchange clock) for end-to-end submit→fill latency, modulo NTP skew.
     send_ts_ms: int | None = None
     # Cash-flow realized PnL for this two-leg trade, net of fees. None on
     # non-FIRED outcomes or partial-failure unwinds (success=False).
     realised_pnl: Decimal | None = None
     timeline: Timeline = field(default_factory=Timeline)
-    legs: list[LegReport] = field(default_factory=list)
+    legs: list[LegOutcome] = field(default_factory=list)
 
 
 _DECISION_SKIP = {"timeline", "legs"}
@@ -202,7 +146,7 @@ def _decision_header() -> list[str]:
 
 
 def _leg_header() -> list[str]:
-    return ["decision_id", "ts_ms"] + [f.name for f in fields(LegReport)]
+    return ["decision_id", "ts_ms"] + [name for name, _ in _LEG_CSV_COLUMNS]
 
 
 class ExecutionRecorder:
@@ -237,9 +181,8 @@ class ExecutionRecorder:
         row["bias"] = _quantize_to_price_scale(d.bias, d.mid_left)
         self._dec.write([row[h] for h in self._dec.header])
         for leg in d.legs:
-            lrow = {"decision_id": d.decision_id, "ts_ms": d.ts_ms}
-            lrow |= {f.name: getattr(leg, f.name) for f in fields(leg)}
-            self._legs.write([lrow[h] for h in self._legs.header])
+            base = [d.decision_id, d.ts_ms]
+            self._legs.write(base + [accessor(leg) for _, accessor in _LEG_CSV_COLUMNS])
 
     def close(self) -> None:
         self._dec.close()

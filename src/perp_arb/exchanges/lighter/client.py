@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import time
 from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal
@@ -249,21 +248,18 @@ class LighterClient(BaseExchange):
         # SDK type stub declares tx_type as `str | None`, but the runtime
         # value (when `err is None`) is the L2-tx-type int constant our
         # `send_tx` serializes — cast at the boundary.
-        t0 = time.monotonic()
         try:
             reply = await self._user_ws.send_tx(cast(int, tx_type), cast(str, tx_info))
         except (TimeoutError, TxSubmitError) as e:
             return LegOutcome(
                 success=False, client_id=client_id, side=side,
                 requested_qty=qty, error_message=str(e),
-                latency_ms=int((time.monotonic() - t0) * 1000),
             )
         ok, err_msg = _sendtx_outcome(reply)
         if not ok:
             return LegOutcome(
                 success=False, client_id=client_id, side=side,
                 requested_qty=qty, error_message=err_msg,
-                latency_ms=int((time.monotonic() - t0) * 1000),
             )
         # Lighter sendtx returns no fill data — the fill arrives later via
         # the account_market WS stream; `submit_and_await` overlays it.
@@ -273,7 +269,6 @@ class LighterClient(BaseExchange):
             side=side,
             requested_qty=qty,
             status=OrderStatus.OPEN,
-            latency_ms=int((time.monotonic() - t0) * 1000),
         )
 
     async def get_position(self, market: MarketInfo) -> Position:

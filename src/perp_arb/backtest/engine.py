@@ -8,7 +8,7 @@ strategy for new intents; (3) schedules each intent's arrival.
 Atomic-pair semantics: a `Decision` is emitted to the recorder only once
 ALL its legs have resolved. Position is updated only when EVERY leg
 succeeded — any single-leg reject leaves the position untouched and the
-Decision still emits with `LegReport.success=False` legs (Outcome stays
+Decision still emits with `LegOutcome.success=False` legs (Outcome stays
 FIRED — the strategy did fire; the venue just didn't fill).
 """
 
@@ -25,11 +25,9 @@ from ..core.exec_record import (
     Decision,
     Direction,
     ExecutionRecorder,
-    LegKind,
-    LegReport,
     Phase,
 )
-from ..core.types import LegOutcome, OrderStatus, Side
+from ..core.types import LegKind, LegOutcome, OrderStatus
 from .base import BacktestStrategy, EngineView, StrategyContext
 from .dataset import BBORow
 from .fills import FillModelKind, VenueSide, fill_model_for
@@ -191,9 +189,9 @@ class Engine:
         d = self.in_flight[fill.decision_id]
         # Mirror live: the outcome carries the venue-side fill instant as
         # `exchange_ts_ms`. In backtest, that's the simulated arrival ts
-        # (= submit ts + venue latency). LegReport.from_outcome computes
-        # latency_ms = fill_ts_ms - send_ts_ms (= the venue latency the
-        # user dialled in, modulo NTP skew which is 0 in backtest).
+        # (= submit ts + venue latency). Recorder derives latency from
+        # `fill_ts_ms - send_ts_ms` — both stamped here on the outcome
+        # so the backtest CSV is shape-identical to live.
         # Atomic: filled_qty + weighted_price_sum must be committed together.
         # A fill with qty>0 but no realized_price would otherwise leave
         # avg_price returning Decimal('0') (fabricated $0 fill) instead of
@@ -216,12 +214,12 @@ class Engine:
             exchange_ts_ms=fill.arrival_ts_ms,
             filled_qty=bt_filled,
             weighted_price_sum=bt_wp_sum,
-        )
-        d.legs.append(LegReport.from_outcome(
-            venue=fill.venue, outcome=out,
+            venue=fill.venue,
             expected_price=intent.expected_price,
-            send_ts_ms=intent.sim_ts_ms, kind=LegKind.ENTRY,
-        ))
+            send_ts_ms=intent.sim_ts_ms,
+            kind=LegKind.ENTRY,
+        )
+        d.legs.append(out)
         if fill.success:
             self.summary.fills_succeeded += 1
         else:
@@ -237,12 +235,13 @@ class Engine:
         del self.remaining_legs[decision_id]
         all_success = bool(d.legs) and all(leg.success for leg in d.legs)
         if all_success and len(d.legs) == 2:
-            left_leg = next((lg for lg in d.legs if lg.exchange == self.ctx.left_venue), None)
-            right_leg = next((lg for lg in d.legs if lg.exchange == self.ctx.right_venue), None)
+            left_leg = next((lg for lg in d.legs if lg.venue == self.ctx.left_venue), None)
+            right_leg = next((lg for lg in d.legs if lg.venue == self.ctx.right_venue), None)
             assert left_leg is not None and right_leg is not None
+            assert left_leg.side is not None and right_leg.side is not None
             self.positions.apply_pair(
-                self.ctx.left_venue, Side(left_leg.side), left_leg.realized_price or Decimal(0),
-                self.ctx.right_venue, Side(right_leg.side), right_leg.realized_price or Decimal(0),
+                self.ctx.left_venue, left_leg.side, left_leg.avg_price or Decimal(0),
+                self.ctx.right_venue, right_leg.side, right_leg.avg_price or Decimal(0),
                 left_leg.filled_qty or Decimal(0),
                 self.cfg.fee_bps_per_leg,
             )

@@ -9,8 +9,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from .exec_record import LegReport
-from .types import Side
+from .types import LegOutcome, Side
 
 
 def leg_cash_flow(side: Side, price: Decimal, qty: Decimal) -> Decimal:
@@ -32,21 +31,23 @@ def pair_pnl(
     )
 
 
-def pair_pnl_from_legs(left: LegReport, right: LegReport) -> Decimal | None:
-    """Live-side wrapper: build pair PnL from two filled `LegReport`s.
+def pair_pnl_from_legs(left: LegOutcome, right: LegOutcome) -> Decimal | None:
+    """Live-side wrapper: build pair PnL from two filled `LegOutcome`s.
 
     Each leg's cash flow uses its own `filled_qty` so partial-fill asymmetry
     flows through correctly. Returns None if either leg lacks a realized
     price or fill — caller should not record PnL in that case.
     """
+    left_price = left.avg_price
+    right_price = right.avg_price
     if (
-        left.realized_price is None or left.filled_qty is None
-        or right.realized_price is None or right.filled_qty is None
+        left_price is None or left.filled_qty == 0 or left.side is None
+        or right_price is None or right.filled_qty == 0 or right.side is None
     ):
         return None
-    fees = (left.fee or Decimal("0")) + (right.fee or Decimal("0"))
+    fees = left.total_fee + right.total_fee
     return (
-        leg_cash_flow(Side(left.side), left.realized_price, left.filled_qty)
-        + leg_cash_flow(Side(right.side), right.realized_price, right.filled_qty)
+        leg_cash_flow(left.side, left_price, left.filled_qty)
+        + leg_cash_flow(right.side, right_price, right.filled_qty)
         - fees
     )

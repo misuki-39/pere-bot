@@ -405,7 +405,15 @@ class TakerTakerArbitrage(BaseStrategy):
             if report.success:
                 self._position.leg_a += qty * Decimal(a_side.sign)
                 self._position.leg_b += qty * Decimal(b_side.sign)
-                self._risk.record_success(leg_latency_ms=report.latency_ms or 0)
+                # Derive per-leg latency on the fly from the two timestamps
+                # the recorder also persists. Mixed clock (local send vs
+                # venue match), NTP-skew-sensitive at ms scale — acceptable
+                # given `max_leg_latency_ms` is typically 500 ms.
+                worst = 0
+                for leg in report.legs:
+                    if leg.fill_ts_ms is not None and leg.send_ts_ms is not None:
+                        worst = max(worst, leg.fill_ts_ms - leg.send_ts_ms)
+                self._risk.record_success(leg_latency_ms=worst)
 
                 # Cash-flow realized PnL: feeds the dormant daily-loss-cap
                 # gate (RiskManager.can_trade) and surfaces in heartbeat +

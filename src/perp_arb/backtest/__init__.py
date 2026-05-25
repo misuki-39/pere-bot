@@ -3,7 +3,7 @@
 Replays Parquet captures (one row per tick, both venues' BBO + capture-qty
 VWAP, per-leg source timestamps) and simulates order placement with per-venue
 submit-delay. Strategies are pure Python — no asyncio, no exchange clients —
-and produce the same `Decision`/`LegReport` output as live so the existing
+and produce the same `Decision`/`LegOutcome` output as live so the existing
 analyze_exec.py script works on either.
 """
 

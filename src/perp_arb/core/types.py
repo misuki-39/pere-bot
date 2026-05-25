@@ -40,6 +40,11 @@ class OrderStatus(StrEnum):
         )
 
 
+class LegKind(StrEnum):
+    ENTRY = "entry"
+    UNWIND = "unwind"
+
+
 @dataclass(frozen=True, slots=True)
 class Symbol:
     """Cross-venue symbol identity. `raw` is the venue-specific ticker string."""
@@ -173,13 +178,14 @@ class Position:
 class LegOutcome:
     """Unified post-execution state for one venue leg.
 
-    Combines what was previously two types (`OrderResult` for the
-    synchronous place-ack and `TerminalFill` for the WS-aggregated fill).
-    Drivers populate ack-side fields from `place_market_order`; the WS
-    fill tracker accumulates fill-side fields via `add()`; the
-    `submit_and_await` wrapper merges any WS data on top of the REST
-    fallback. Callers downstream of `submit_and_await` see one type with
-    the final view.
+    Single leg-level dataclass used end-to-end: drivers populate ack-side
+    fields from `place_market_order`; the WS fill tracker accumulates
+    fill-side fields via `add()`; `submit_and_await` merges any WS data
+    on top of the REST fallback; the executor stamps presentation fields
+    (venue, expected_price, send_ts_ms, kind) after gather; the recorder
+    serializes this directly to CSV. There is no separate "report"
+    projection — what drivers / strategies / recorder see is the same
+    object.
 
     `last_status` is taken from any terminal-status signal so
     `is_complete` can short-circuit the wait the moment the venue
@@ -196,7 +202,6 @@ class LegOutcome:
     # Exchange-server clock for the place-ack (aster's `transactTime`).
     # NOT our local time — joinable to venue UIs / external trade logs.
     exchange_ts_ms: int | None = None
-    latency_ms: int | None = None
 
     # fill-side — WS accumulator OR REST fallback (driver writes either)
     filled_qty: Decimal = Decimal("0")
@@ -207,6 +212,12 @@ class LegOutcome:
     # (quote-currency units). Snapshot-based venues (lighter) don't feed
     # this; it stays 0 — lighter is structurally zero-fee.
     total_fee: Decimal = Decimal("0")
+
+    # presentation-side — stamped by executor after gather, used by recorder + analysis
+    venue: str = ""                         # leg-label key into executor's `exchanges` dict
+    expected_price: Decimal | None = None   # decision-time VWAP / unwind cost basis
+    send_ts_ms: int | None = None           # local epoch ms at SEND mark (executor stamps)
+    kind: LegKind = LegKind.ENTRY
 
     def add(self, event: OrderSnapshot | FillDelta) -> None:
         """Absorb a WS event. `OrderSnapshot` (lighter cumulative state)
