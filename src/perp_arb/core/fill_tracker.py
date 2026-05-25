@@ -17,7 +17,7 @@ arrive before its slot exists. Callers who break this invariant will
 silently drop fast fills.
 
 The tracker only populates the *fill-side* fields of LegOutcome
-(filled_qty, weighted_price_sum, last_ts_ms, last_status, total_fee);
+(filled_qty, _weighted_price_sum, last_ts_ms, last_status, total_fee);
 ack-side fields stay at defaults. The driver overlays ack-side fields
 separately via `submit_and_await`.
 """

@@ -220,11 +220,11 @@ def test_adverse_selection_lookup_picks_book_at_arrival(tmp_path) -> None:
     text = legs_file.read_text().splitlines()
     header = text[0].split(",")
     leg_rows = [dict(zip(header, line.split(","), strict=True)) for line in text[1:]]
-    right_leg = next(r for r in leg_rows if r["exchange"] == "aster")
+    right_leg = next(r for r in leg_rows if r["venue"] == "aster")
     # BUY right hit the MOVED ask (100.50) — proves the lookup found the post-arrival book
     assert Decimal(right_leg["realized_price"]) == Decimal("100.50")
     # SELL left arrived at the same ts (0 delay) → fills against original bid
-    left_leg = next(r for r in leg_rows if r["exchange"] == "lighter")
+    left_leg = next(r for r in leg_rows if r["venue"] == "lighter")
     assert Decimal(left_leg["realized_price"]) == Decimal("100.00")
     assert summary.decisions_emitted == 1
 

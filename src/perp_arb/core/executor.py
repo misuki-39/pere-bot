@@ -1,5 +1,5 @@
 """Two-leg execution: gathers `submit_and_await` outcomes on both venues,
-unwinds the stranded leg on partial failure, returns a `TradeReport`.
+unwinds the stranded leg on partial failure, returns an `ExecutionResult`.
 
 Layering: the executor sits between **strategy** (signal — produces
 decisions and resolves them into venue-side intents) and **driver**
@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
 
 from ..utils.precision import vwap_fill
@@ -45,31 +45,19 @@ class LegIntent:
     expected_price: Decimal  # decision-time VWAP / cost basis — stamped onto LegOutcome
 
 
-@dataclass
-class TradeReport:
-    """Result the executor returns to the caller.
+@dataclass(frozen=True, slots=True)
+class ExecutionResult:
+    """What `TwoLegExecutor.execute()` returns. `legs` carries entries
+    + any UNWIND leg (kind-tagged). Strategy derives success / PnL /
+    send_ts from the legs themselves — only the failure narrative
+    needs executor-side context (venue names, error text)."""
 
-    `success=True` iff both entry legs' place acks returned success.
-    Per-leg ack + WS fill data live on `legs[*]` as `LegOutcome`s with
-    presentation fields (venue, expected_price, send_ts_ms, kind) already
-    stamped by the executor — the recorder serializes them directly.
-
-    A partial-failure unwind appears as an additional leg with
-    `kind=UNWIND`. Both-fail leaves `success` False with a populated
-    `failure_reason`. `send_ts_ms` is the wall-clock moment the SEND
-    timeline mark was stamped — caller copies it into its own record."""
-
-    legs: list[LegOutcome] = field(default_factory=list)
-    success: bool = False
+    legs: list[LegOutcome]
     failure_reason: str | None = None
-    send_ts_ms: int = 0
-    # Cash-flow PnL of the two entry legs net of fees. Set only when
-    # `success=True` and both legs carry realized price + filled qty.
-    realised_pnl: Decimal | None = None
 
 
 class TwoLegExecutor:
-    """Maps `(trade_id, legs, qty, timeline)` → `TradeReport`.
+    """Maps `(trade_id, legs, qty, timeline)` → `ExecutionResult`.
 
     Stateless across calls. Holds the venue handles and paper-mode flag."""
 
@@ -108,7 +96,7 @@ class TwoLegExecutor:
         legs: tuple[LegIntent, LegIntent],
         qty: Decimal,
         timeline: Timeline,
-    ) -> TradeReport:
+    ) -> ExecutionResult:
         a_intent, b_intent = legs
         # Per-leg cids. cids are per-driver scoped (each driver has its
         # own _fill_tracker), so they don't collide cross-venue today —
@@ -153,23 +141,20 @@ class TwoLegExecutor:
         self._stamp(a_out, a_intent, send_ts_ms, LegKind.ENTRY)
         self._stamp(b_out, b_intent, send_ts_ms, LegKind.ENTRY)
 
-        report = TradeReport(legs=[a_out, b_out], send_ts_ms=send_ts_ms)
-
+        legs_out: list[LegOutcome] = [a_out, b_out]
         if a_out.success and b_out.success:
-            report.success = True
-            report.realised_pnl = pair_pnl_from_legs(a_out, b_out)
             _log.info(
                 "[%s] FILLED %s pnl=%s",
                 trade_id,
                 _spread_log(a_intent, b_intent, a_out, b_out),
-                report.realised_pnl,
+                pair_pnl_from_legs(a_out, b_out),
             )
-            return report
+            return ExecutionResult(legs=legs_out)
 
-        await self._handle_partial_failure(
-            trade_id, a_intent, b_intent, qty, a_out, b_out, report,
+        failure_reason = await self._handle_partial_failure(
+            trade_id, a_intent, b_intent, qty, a_out, b_out, legs_out,
         )
-        return report
+        return ExecutionResult(legs=legs_out, failure_reason=failure_reason)
 
     # ----- partial-failure recovery -----
 
@@ -181,8 +166,8 @@ class TwoLegExecutor:
         qty: Decimal,
         a_out: LegOutcome,
         b_out: LegOutcome,
-        report: TradeReport,
-    ) -> None:
+        legs: list[LegOutcome],
+    ) -> str:
         # Log + failure_reason use the actual venue names ("aster"/"lighter")
         # — these strings are surfaced to operators, not to the strategy's
         # internal leg-label routing.
@@ -197,9 +182,9 @@ class TwoLegExecutor:
                 a.venue, a.side.opposite, qty, a_out.avg_price,
             )
             if unwind is not None:
-                report.legs.append(unwind)
-            report.failure_reason = f"{b_name} leg failed: {b_out.error_message}"
-        elif b_out.success and not a_out.success:
+                legs.append(unwind)
+            return f"{b_name} leg failed: {b_out.error_message}"
+        if b_out.success and not a_out.success:
             _log.error(
                 "[%s] PARTIAL: %s filled, %s failed (%s) — unwinding %s",
                 trade_id, b_name, a_name, a_out.error_message, b_name,
@@ -208,14 +193,13 @@ class TwoLegExecutor:
                 b.venue, b.side.opposite, qty, b_out.avg_price,
             )
             if unwind is not None:
-                report.legs.append(unwind)
-            report.failure_reason = f"{a_name} leg failed: {a_out.error_message}"
-        else:
-            _log.warning(
-                "[%s] BOTH FAILED: %s=%s %s=%s",
-                trade_id, a_name, a_out.error_message, b_name, b_out.error_message,
-            )
-            report.failure_reason = "both legs failed"
+                legs.append(unwind)
+            return f"{a_name} leg failed: {a_out.error_message}"
+        _log.warning(
+            "[%s] BOTH FAILED: %s=%s %s=%s",
+            trade_id, a_name, a_out.error_message, b_name, b_out.error_message,
+        )
+        return "both legs failed"
 
     async def _unwind_leg(
         self,
@@ -296,15 +280,15 @@ class TwoLegExecutor:
                 f"paper mode: empty {('bids' if leg.side is Side.SELL else 'asks')} "
                 f"on {leg.venue}",
             )
-        return LegOutcome(
+        out = LegOutcome(
             success=True,
             client_id=cid,
             side=leg.side,
             requested_qty=qty,
             status=OrderStatus.FILLED,
-            filled_qty=qty,
-            weighted_price_sum=vwap * qty,
         )
+        out.set_fill(qty, vwap)
+        return out
 
 
 def _coerce_outcome(

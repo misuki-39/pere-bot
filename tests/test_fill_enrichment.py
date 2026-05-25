@@ -3,7 +3,7 @@
   - `LegOutcome.add` aggregates `FillDelta` + `OrderSnapshot` events;
   - `BaseExchange.submit_and_await` merges the synchronous REST/WS-tx
     place ack with the WS fill aggregate, preferring WS for
-    filled_qty / weighted_price_sum / last_ts_ms / total_fee;
+    filled_qty / _weighted_price_sum / last_ts_ms / total_fee;
   - The recorder writes the new `send_ts_ms` + `fill_ts_ms` columns.
 
 These tests do not exercise the asyncio await loop directly — the loop
@@ -30,6 +30,7 @@ from perp_arb.core.exec_record import (
 )
 from perp_arb.core.types import (
     FillDelta,
+    LegKind,
     LegOutcome,
     MarketInfo,
     OrderBook,
@@ -78,7 +79,7 @@ def test_accumulator_single_delta() -> None:
     acc = _FillAccumulator()
     acc.add(_delta("1.0", "100.00", ts=1000))
     assert acc.filled_qty == Decimal("1.0")
-    assert acc.weighted_price_sum / acc.filled_qty == Decimal("100.00")
+    assert acc.avg_price == Decimal("100.00")
     assert acc.last_ts_ms == 1000
 
 
@@ -89,7 +90,7 @@ def test_accumulator_aggregates_partial_deltas() -> None:
     acc.add(_delta("0.6", "100.10", ts=1050))
     assert acc.filled_qty == Decimal("1.0")
     # (0.4 * 100.00 + 0.6 * 100.10) / 1.0 = 100.06
-    assert acc.weighted_price_sum / acc.filled_qty == Decimal("100.06")
+    assert acc.avg_price == Decimal("100.06")
     assert acc.last_ts_ms == 1050
 
 
@@ -126,7 +127,7 @@ def test_accumulator_snapshot_overwrites_delta() -> None:
     acc.add(_delta("0.4", "100.00", ts=1000))
     acc.add(_snapshot(filled="1.0", avg="100.06", status=OrderStatus.FILLED))
     assert acc.filled_qty == Decimal("1.0")
-    assert acc.weighted_price_sum / acc.filled_qty == Decimal("100.06")
+    assert acc.avg_price == Decimal("100.06")
     assert acc.last_ts_ms == 1000
 
 
@@ -176,17 +177,16 @@ def _ack_ok(*, avg_price: str = "100.00", exchange_ts: int | None = None,
             filled: str = "1.0") -> LegOutcome:
     """The shape aster's REST returns: ack fields + executedQty/avgPrice
     folded into the fill-side fields as a fallback before WS arrives."""
-    f = Decimal(filled)
-    return LegOutcome(
+    out = LegOutcome(
         success=True,
         client_id="x",
         side=Side.BUY,
         requested_qty=Decimal("1.0"),
         status=OrderStatus.FILLED,
         exchange_ts_ms=exchange_ts,
-        filled_qty=f,
-        weighted_price_sum=f * Decimal(avg_price),
     )
+    out.set_fill(Decimal(filled), Decimal(avg_price))
+    return out
 
 
 def _ack_lighter_open() -> LegOutcome:
@@ -201,7 +201,7 @@ def _ack_lighter_open() -> LegOutcome:
 @pytest.mark.asyncio
 async def test_submit_and_await_ws_fill_overrides_rest() -> None:
     """WS fill is the matching-engine's authoritative view — its
-    filled_qty / weighted_price_sum / last_ts_ms / total_fee overwrite the
+    filled_qty / _weighted_price_sum / last_ts_ms / total_fee overwrite the
     REST-reported placeholders. Ack-side fields (status, client_id,
     error_message, exchange_ts_ms) are not touched."""
     ex = _FakeExchange(_ack_ok(avg_price="100.00", exchange_ts=1_700_000_000_000))
@@ -328,7 +328,9 @@ async def test_submit_and_await_promotes_ws_terminal_status() -> None:
     )
     await feed
     assert outcome.status is OrderStatus.FILLED
-    assert outcome.last_status is OrderStatus.FILLED
+    # last_status is the WS accumulator's intermediate signal; once
+    # submit_and_await has promoted it onto `status` it's cleared.
+    assert outcome.last_status is None
 
 
 def test_legoutcome_add_rejects_unknown_event_type() -> None:
@@ -377,15 +379,16 @@ def test_recorder_writes_send_ts_ms_to_csv(tmp_path: Path) -> None:
         outcome=Outcome.FIRED,
         send_ts_ms=1_700_000_000_010,
     )
-    d.legs.append(LegOutcome(
-        venue="aster", side=Side.BUY,
-        requested_qty=Decimal("1.0"), filled_qty=Decimal("1.0"),
-        weighted_price_sum=Decimal("100.05"),
+    leg = LegOutcome(
+        venue="aster", side=Side.BUY, kind=LegKind.ENTRY,
+        requested_qty=Decimal("1.0"),
         expected_price=Decimal("100"),
         status=OrderStatus.FILLED, success=True,
         send_ts_ms=1_700_000_000_010,
         last_ts_ms=1_700_000_000_050,
-    ))
+    )
+    leg.set_fill(Decimal("1.0"), Decimal("100.05"))
+    d.legs.append(leg)
     rec.emit(d)
     rec.close()
 

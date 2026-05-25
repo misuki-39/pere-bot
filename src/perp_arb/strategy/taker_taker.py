@@ -10,7 +10,7 @@ per tick (via `compute_taker_fills` + `assess_reversion`) and hands fired
 decisions to
 `TwoLegExecutor`, which owns cid generation, the two-leg gather, WS
 fill tracking, partial-failure unwind, and paper-mode synth. The
-strategy only feeds `TradeReport` back into position / risk /
+strategy only feeds `ExecutionResult` back into position / risk /
 throttle / heartbeat state — it never sees place acks or WS fills.
 
 Modes (passed through to the executor at construction time):
@@ -55,6 +55,8 @@ from ..core.exec_record import (
     Phase,
 )
 from ..core.executor import LegIntent, TwoLegExecutor
+from ..core.pnl import pair_pnl_from_legs
+from ..core.types import LegKind
 from ..risk.manager import RiskManager
 from ..utils.time import now_ms
 from .base import BaseStrategy, SpreadModel, TimeEwma
@@ -370,7 +372,7 @@ class TakerTakerArbitrage(BaseStrategy):
 
     async def _fire(self, d: Decision) -> None:
         """Resolve Direction → venue-side intents, delegate execution,
-        then apply the TradeReport to position / risk / throttle.
+        then apply the ExecutionResult to position / risk / throttle.
 
         Strategy owns the Direction→Side resolution because Direction is
         a strategy concept; the executor only sees concrete `Side`s.
@@ -390,7 +392,7 @@ class TakerTakerArbitrage(BaseStrategy):
         if self._inflight_cap > 0:
             self._inflight_dir[d.decision_id] = d.direction
         try:
-            report = await self._executor.execute(
+            result = await self._executor.execute(
                 trade_id=d.decision_id,
                 legs=(
                     LegIntent(venue="leg_a", side=a_side, expected_price=a_exp),
@@ -399,10 +401,13 @@ class TakerTakerArbitrage(BaseStrategy):
                 qty=qty,
                 timeline=d.timeline,
             )
-            d.legs = report.legs
-            d.send_ts_ms = report.send_ts_ms
+            d.legs = result.legs
+            entry_legs = [lg for lg in result.legs if lg.kind is LegKind.ENTRY]
+            assert len(entry_legs) == 2
+            d.send_ts_ms = entry_legs[0].send_ts_ms
 
-            if report.success:
+            success = result.failure_reason is None
+            if success:
                 self._position.leg_a += qty * Decimal(a_side.sign)
                 self._position.leg_b += qty * Decimal(b_side.sign)
                 # Derive per-leg latency on the fly from the two timestamps
@@ -410,7 +415,7 @@ class TakerTakerArbitrage(BaseStrategy):
                 # venue match), NTP-skew-sensitive at ms scale — acceptable
                 # given `max_leg_latency_ms` is typically 500 ms.
                 worst = 0
-                for leg in report.legs:
+                for leg in entry_legs:
                     if leg.fill_ts_ms is not None and leg.send_ts_ms is not None:
                         worst = max(worst, leg.fill_ts_ms - leg.send_ts_ms)
                 self._risk.record_success(leg_latency_ms=worst)
@@ -419,10 +424,11 @@ class TakerTakerArbitrage(BaseStrategy):
                 # gate (RiskManager.can_trade) and surfaces in heartbeat +
                 # decisions_*.csv. Mirrors backtest pnl.apply_pair so live
                 # and backtest numbers reconcile by construction.
-                if report.realised_pnl is not None:
-                    self._position.realised_pnl += report.realised_pnl
-                    self._risk.record_pnl(report.realised_pnl)
-                    d.realised_pnl = report.realised_pnl
+                pnl = pair_pnl_from_legs(entry_legs[0], entry_legs[1])
+                if pnl is not None:
+                    self._position.realised_pnl += pnl
+                    self._risk.record_pnl(pnl)
+                    d.realised_pnl = pnl
 
                 # Seed throttle bump only on confirmed FILLED — a partial /
                 # both-fail consumed no edge.
@@ -437,7 +443,7 @@ class TakerTakerArbitrage(BaseStrategy):
                     self._position.realised_pnl,
                 )
             else:
-                self._risk.record_failure(report.failure_reason or "unknown")
+                self._risk.record_failure(result.failure_reason or "unknown")
         finally:
             if self._inflight_cap > 0:
                 self._inflight_dir.pop(d.decision_id, None)

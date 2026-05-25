@@ -202,19 +202,16 @@ class BaseExchange(ABC):
                 market, side, qty,
                 reduce_only=reduce_only, client_id=client_id,
             )
-            if not outcome.success:
-                return outcome
-            ws = await self.await_fill(client_id, qty, timeout_s)
-            if ws is not None:
-                if ws.filled_qty >= outcome.filled_qty and ws.filled_qty > 0:
-                    outcome.filled_qty = ws.filled_qty
-                    outcome.weighted_price_sum = ws.weighted_price_sum
-                    outcome.last_ts_ms = ws.last_ts_ms
-                    outcome.total_fee = ws.total_fee
-                if ws.last_status is not None:
-                    outcome.last_status = ws.last_status
-                    if ws.last_status.terminal:
-                        outcome.status = ws.last_status
+            if outcome.success:
+                ws = await self.await_fill(client_id, qty, timeout_s)
+                if ws is not None:
+                    if ws.filled_qty >= outcome.filled_qty and ws.filled_qty > 0:
+                        outcome.merge_fill_from(ws)
+                    if ws.last_status is not None:
+                        outcome.last_status = ws.last_status
+                        if ws.last_status.terminal:
+                            outcome.status = ws.last_status
+            outcome._clear_accumulator_status()
             return outcome
         finally:
             self.release_fill_slot(client_id)

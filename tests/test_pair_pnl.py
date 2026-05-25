@@ -13,14 +13,15 @@ from perp_arb.core.types import LegOutcome, OrderStatus, Side
 def _leg(*, exchange: str, side: Side, qty: str, price: str, fee: str = "0") -> LegOutcome:
     q = Decimal(qty)
     p = Decimal(price)
-    return LegOutcome(
+    out = LegOutcome(
         venue=exchange, side=side,
-        requested_qty=q, filled_qty=q,
-        weighted_price_sum=q * p,
+        requested_qty=q,
         expected_price=p,
         status=OrderStatus.FILLED, success=True,
         total_fee=Decimal(fee),
     )
+    out.set_fill(q, p)
+    return out
 
 
 def test_leg_cash_flow_sell_in_buy_out() -> None:
@@ -69,7 +70,6 @@ def test_pair_pnl_from_legs_returns_none_when_realized_price_missing() -> None:
     # avg_price returns None when filled_qty=0 — zero out the left leg's fill.
     left = _leg(exchange="aster", side=Side.SELL, qty="1", price="100")
     left.filled_qty = Decimal("0")
-    left.weighted_price_sum = Decimal("0")
     right = _leg(exchange="lighter", side=Side.BUY, qty="1", price="100")
     assert pair_pnl_from_legs(left, right) is None
 

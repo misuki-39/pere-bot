@@ -12,13 +12,11 @@ from the dataclass fields so header and row cannot drift.
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
 
 from ..utils.time import mono_ms
 from .logging import CsvWriter
@@ -82,30 +80,6 @@ class Timeline:
         }
 
 
-# CSV column order for legs_*.csv. Each entry: (column_name, accessor).
-# Accessor pulls the value out of a LegOutcome — handles enum→str, the
-# avg_price property, fee/error renaming, and the "filled_qty is None on
-# failure" rule.
-_LEG_CSV_COLUMNS: list[tuple[str, Callable[[LegOutcome], Any]]] = [
-    ("exchange",       lambda o: o.venue),
-    ("side",           lambda o: o.side.value if o.side is not None else ""),
-    ("requested_qty",  lambda o: o.requested_qty),
-    # filled_qty=None on failure (no fill info); Decimal('0') means
-    # "ack succeeded but zero qty filled" — both are recordable outcomes.
-    ("filled_qty",     lambda o: o.filled_qty if o.success else None),
-    ("expected_price", lambda o: o.expected_price),
-    ("realized_price", lambda o: o.avg_price),
-    ("status",         lambda o: o.status.value),
-    ("success",        lambda o: o.success),
-    ("error",          lambda o: o.error_message),
-    ("client_id",      lambda o: o.client_id),
-    ("fee",            lambda o: o.total_fee),
-    ("send_ts_ms",     lambda o: o.send_ts_ms),
-    ("fill_ts_ms",     lambda o: o.fill_ts_ms),
-    ("kind",           lambda o: o.kind.value),
-]
-
-
 @dataclass
 class Decision:
     """One evaluated opportunity. `outcome` is terminal; `legs` is populated
@@ -146,7 +120,7 @@ def _decision_header() -> list[str]:
 
 
 def _leg_header() -> list[str]:
-    return ["decision_id", "ts_ms"] + [name for name, _ in _LEG_CSV_COLUMNS]
+    return ["decision_id", "ts_ms", *LegOutcome.csv_header()]
 
 
 class ExecutionRecorder:
@@ -181,8 +155,7 @@ class ExecutionRecorder:
         row["bias"] = _quantize_to_price_scale(d.bias, d.mid_left)
         self._dec.write([row[h] for h in self._dec.header])
         for leg in d.legs:
-            base = [d.decision_id, d.ts_ms]
-            self._legs.write(base + [accessor(leg) for _, accessor in _LEG_CSV_COLUMNS])
+            self._legs.write([d.decision_id, d.ts_ms, *leg.to_csv_row()])
 
     def close(self) -> None:
         self._dec.close()

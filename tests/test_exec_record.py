@@ -44,7 +44,8 @@ def test_headers_are_derived_from_dataclasses() -> None:
     assert "expected_price" in lh and "realized_price" in lh
     assert "send_ts_ms" in lh and "fill_ts_ms" in lh
     assert "latency_ms" not in lh   # legacy mixed-clock derived column dropped
-    assert "fee" in lh
+    assert "total_fee" in lh
+    assert "venue" in lh and "error_message" in lh
 
 
 def _read(path):
@@ -70,25 +71,22 @@ def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkey
     d.timeline.mark(Phase.DECISION)
     clock["t"] = 12
     d.timeline.mark(Phase.SEND)
-    d.legs = [
-        LegOutcome(
-            client_id="x", side=Side.BUY, requested_qty=Decimal("0.6"),
-            success=True, status=OrderStatus.FILLED,
-            filled_qty=Decimal("0.6"),
-            weighted_price_sum=Decimal("0.6") * Decimal("100.03"),
-            total_fee=Decimal("0.018"),
-            venue="aster", expected_price=Decimal("100.02"),
-            send_ts_ms=1_700_000_000_000, last_ts_ms=1_700_000_000_120,
-        ),
-        LegOutcome(
-            client_id="y", side=Side.SELL, requested_qty=Decimal("0.6"),
-            success=True, status=OrderStatus.FILLED,
-            filled_qty=Decimal("0.6"),
-            weighted_price_sum=Decimal("0.6") * Decimal("100.038"),
-            venue="lighter", expected_price=Decimal("100.04"),
-            send_ts_ms=1_700_000_000_000, last_ts_ms=1_700_000_000_330,
-        ),
-    ]
+    leg_a = LegOutcome(
+        client_id="x", side=Side.BUY, requested_qty=Decimal("0.6"),
+        success=True, status=OrderStatus.FILLED,
+        total_fee=Decimal("0.018"),
+        venue="aster", kind=LegKind.ENTRY, expected_price=Decimal("100.02"),
+        send_ts_ms=1_700_000_000_000, last_ts_ms=1_700_000_000_120,
+    )
+    leg_a.set_fill(Decimal("0.6"), Decimal("100.03"))
+    leg_b = LegOutcome(
+        client_id="y", side=Side.SELL, requested_qty=Decimal("0.6"),
+        success=True, status=OrderStatus.FILLED,
+        venue="lighter", kind=LegKind.ENTRY, expected_price=Decimal("100.04"),
+        send_ts_ms=1_700_000_000_000, last_ts_ms=1_700_000_000_330,
+    )
+    leg_b.set_fill(Decimal("0.6"), Decimal("100.038"))
+    d.legs = [leg_a, leg_b]
     rec.emit(d)
     rec.close()
 
@@ -105,12 +103,12 @@ def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkey
     assert legs[0] == _leg_header()
     assert len(legs) == 3  # header + 2 legs
     l0 = dict(zip(legs[0], legs[1], strict=True))
-    assert l0["decision_id"] == "d-abc" and l0["exchange"] == "aster"
+    assert l0["decision_id"] == "d-abc" and l0["venue"] == "aster"
     assert l0["expected_price"] == "100.02" and l0["realized_price"] == "100.03"
-    assert l0["fee"] == "0.018"
+    assert l0["total_fee"] == "0.018"
     assert l0["kind"] == LegKind.ENTRY  # StrEnum serialises to its value
     l1 = dict(zip(legs[0], legs[2], strict=True))
-    assert l1["exchange"] == "lighter" and l1["fee"] == "0"
+    assert l1["venue"] == "lighter" and l1["total_fee"] == "0"
 
 
 def test_abort_decision_emits_row_with_no_legs(tmp_path) -> None:

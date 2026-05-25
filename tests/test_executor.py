@@ -21,6 +21,7 @@ import pytest
 
 from perp_arb.core.exec_record import Phase, Timeline
 from perp_arb.core.executor import LegIntent, TwoLegExecutor
+from perp_arb.core.pnl import pair_pnl_from_legs
 from perp_arb.core.types import (
     BookLevel,
     LegKind,
@@ -108,17 +109,17 @@ class _StubExchange:
 def _ok(*, side: Side, qty: Decimal, avg: str = "100.00",
         fee: str = "0", exchange_ts: int | None = None) -> LegOutcome:
     """Build a successful merged outcome (ack + WS already reconciled)."""
-    return LegOutcome(
+    out = LegOutcome(
         success=True,
         client_id="cid",
         side=side,
         requested_qty=qty,
         status=OrderStatus.FILLED,
         exchange_ts_ms=exchange_ts,
-        filled_qty=qty,
-        weighted_price_sum=Decimal(avg) * qty,
         total_fee=Decimal(fee),
     )
+    out.set_fill(qty, Decimal(avg))
+    return out
 
 
 def _bad(*, side: Side, qty: Decimal, msg: str) -> LegOutcome:
@@ -170,7 +171,6 @@ async def test_both_legs_succeed_no_unwind() -> None:
         trade_id="t-1", legs=_legs(), qty=qty, timeline=timeline,
     )
 
-    assert report.success is True
     assert report.failure_reason is None
     assert [leg.kind for leg in report.legs] == [LegKind.ENTRY, LegKind.ENTRY]
     assert [leg.venue for leg in report.legs] == ["aster", "lighter"]
@@ -179,10 +179,10 @@ async def test_both_legs_succeed_no_unwind() -> None:
     # state and the first finishing leg's release would wipe the other.
     assert aster.submit_calls[0]["client_id"] == str(_TEST_CID_SEED)
     assert lighter.submit_calls[0]["client_id"] == str(_TEST_CID_SEED + 1)
-    # send_ts_ms populated on report so the caller can stamp its own record
-    assert report.send_ts_ms > 0
+    # send_ts_ms stamped onto each leg so the caller can derive its own record
+    assert report.legs[0].send_ts_ms is not None and report.legs[0].send_ts_ms > 0
     # Cash-flow pair PnL: sell 100.05, buy 100.07, no fees → -0.02.
-    assert report.realised_pnl == Decimal("-0.02")
+    assert pair_pnl_from_legs(report.legs[0], report.legs[1]) == Decimal("-0.02")
 
 
 @pytest.mark.asyncio
@@ -203,8 +203,8 @@ async def test_realised_pnl_subtracts_fees() -> None:
     report = await ex.execute(
         trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
     )
-    assert report.success is True
-    assert report.realised_pnl == Decimal("0.07")
+    assert report.failure_reason is None
+    assert pair_pnl_from_legs(report.legs[0], report.legs[1]) == Decimal("0.07")
     assert report.legs[0].total_fee == Decimal("0.03")
     assert report.legs[1].total_fee == Decimal("0")
 
@@ -222,8 +222,9 @@ async def test_failed_trade_has_no_realised_pnl() -> None:
     report = await ex.execute(
         trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
     )
-    assert report.success is False
-    assert report.realised_pnl is None
+    assert report.failure_reason is not None
+    # Both legs failed → no fills → derived PnL is None.
+    assert pair_pnl_from_legs(report.legs[0], report.legs[1]) is None
 
 
 # ---- live partial-failure quadrants --------------------------------------
@@ -244,7 +245,7 @@ async def test_aster_ok_lighter_fail_unwinds_aster() -> None:
         trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
     )
 
-    assert report.success is False
+    assert report.failure_reason is not None
     assert "lighter leg failed" in (report.failure_reason or "")
     assert "sequencer rejected" in (report.failure_reason or "")
     # unwind leg appended: aster reduce-only on the OPPOSITE side
@@ -275,7 +276,7 @@ async def test_lighter_ok_aster_fail_unwinds_lighter() -> None:
         trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
     )
 
-    assert report.success is False
+    assert report.failure_reason is not None
     assert "aster leg failed" in (report.failure_reason or "")
     assert len(report.legs) == 3
     assert report.legs[2].kind is LegKind.UNWIND
@@ -299,7 +300,7 @@ async def test_both_legs_fail_no_unwind() -> None:
         trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
     )
 
-    assert report.success is False
+    assert report.failure_reason is not None
     assert report.failure_reason == "both legs failed"
     # No unwind leg — nothing to flatten
     assert all(leg.kind is LegKind.ENTRY for leg in report.legs)
@@ -320,7 +321,7 @@ async def test_paper_synth_uses_book_vwap() -> None:
         trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
     )
 
-    assert report.success is True
+    assert report.failure_reason is None
     assert report.legs[0].avg_price == Decimal("100.00")  # aster bid (SELL)
     assert report.legs[1].avg_price == Decimal("100.06")  # lighter ask (BUY)
     # No driver calls — paper short-circuits
@@ -377,7 +378,7 @@ async def test_unexpected_exception_coerced_to_failure_outcome() -> None:
         trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
     )
     # gather still resolved; partial-failure logic unwound aster
-    assert report.success is False
+    assert report.failure_reason is not None
     assert "lighter leg failed" in (report.failure_reason or "")
     assert "ws crashed" in (report.failure_reason or "")
     # Unwind appended (we use submit_and_await for the unwind too)
@@ -408,7 +409,7 @@ async def test_legs_with_opposite_sides() -> None:
         qty=qty, timeline=Timeline(),
     )
 
-    assert report.success is True
+    assert report.failure_reason is None
     assert aster.submit_calls[0]["side"] is Side.BUY
     assert lighter.submit_calls[0]["side"] is Side.SELL
 

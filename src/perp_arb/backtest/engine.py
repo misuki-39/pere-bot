@@ -192,19 +192,10 @@ class Engine:
         # (= submit ts + venue latency). Recorder derives latency from
         # `fill_ts_ms - send_ts_ms` — both stamped here on the outcome
         # so the backtest CSV is shape-identical to live.
-        # Atomic: filled_qty + weighted_price_sum must be committed together.
-        # A fill with qty>0 but no realized_price would otherwise leave
-        # avg_price returning Decimal('0') (fabricated $0 fill) instead of
-        # None, blowing up downstream PnL math.
-        if (
-            fill.success and fill.filled_qty is not None
-            and fill.realized_price is not None and fill.filled_qty > 0
-        ):
-            bt_filled = fill.filled_qty
-            bt_wp_sum = fill.filled_qty * fill.realized_price
-        else:
-            bt_filled = Decimal("0")
-            bt_wp_sum = Decimal("0")
+        # Atomic: filled_qty + _weighted_price_sum must be committed together
+        # via set_fill(). A fill with qty>0 but no realized_price would
+        # otherwise leave avg_price returning Decimal('0') (fabricated $0
+        # fill) instead of None, blowing up downstream PnL math.
         out = LegOutcome(
             success=fill.success,
             side=fill.side,
@@ -212,13 +203,16 @@ class Engine:
             status=OrderStatus.FILLED if fill.success else OrderStatus.REJECTED,
             error_message=fill.error,
             exchange_ts_ms=fill.arrival_ts_ms,
-            filled_qty=bt_filled,
-            weighted_price_sum=bt_wp_sum,
             venue=fill.venue,
             expected_price=intent.expected_price,
             send_ts_ms=intent.sim_ts_ms,
             kind=LegKind.ENTRY,
         )
+        if (
+            fill.success and fill.filled_qty is not None
+            and fill.realized_price is not None and fill.filled_qty > 0
+        ):
+            out.set_fill(fill.filled_qty, fill.realized_price)
         d.legs.append(out)
         if fill.success:
             self.summary.fills_succeeded += 1

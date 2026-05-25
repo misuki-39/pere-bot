@@ -63,7 +63,7 @@ print("\n=== inter-leg fill skew (the naked-exposure window) ===")
 entry["fill_ts_ms"] = pd.to_numeric(entry["fill_ts_ms"], errors="coerce")
 entry["send_ts_ms"] = pd.to_numeric(entry["send_ts_ms"], errors="coerce")
 entry["_latency_ms"] = entry["fill_ts_ms"] - entry["send_ts_ms"]
-lat = entry.pivot_table(index="decision_id", columns="exchange",
+lat = entry.pivot_table(index="decision_id", columns="venue",
                         values="_latency_ms", aggfunc="first")
 if {"aster", "lighter"}.issubset(lat.columns):
     lat = lat.dropna(subset=["aster", "lighter"])
@@ -98,7 +98,7 @@ f["realized_price"] = pd.to_numeric(f["realized_price"], errors="coerce")
 f = f.dropna(subset=["expected_price", "realized_price"])
 sign = np.where(f["side"] == "buy", 1.0, -1.0)
 f["slip_bps"] = sign * (f["realized_price"] - f["expected_price"]) / f["expected_price"] * 1e4
-for venue, g in f.groupby("exchange"):
+for venue, g in f.groupby("venue"):
     q = g["slip_bps"].quantile([.5, .95, .99])
     print(f"  {venue:<8} n={len(g):>5} mean={g.slip_bps.mean():+7.3f} "
           f"p50={q.iloc[0]:+7.3f} p95={q.iloc[1]:+7.3f} p99={q.iloc[2]:+7.3f} "

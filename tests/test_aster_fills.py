@@ -84,7 +84,7 @@ def test_aster_accumulator_round_trips_to_requested_qty() -> None:
         acc.add(d)
     assert acc.filled_qty == Decimal("1.0")
     # size-weighted: (0.4 * 100.00 + 0.6 * 100.10) / 1.0 = 100.06
-    assert acc.weighted_price_sum / acc.filled_qty == Decimal("100.06")
+    assert acc.avg_price == Decimal("100.06")
 
 
 def test_aster_drops_non_fill_events_at_source() -> None:

@@ -174,31 +174,26 @@ class AsterClient(BaseExchange):
         # data on top when it does.
         #
         # Only populate the fill-side fields when BOTH executedQty>0 AND
-        # avgPrice>0 are present — otherwise weighted_price_sum=qty*0=0
+        # avgPrice>0 are present — otherwise _weighted_price_sum=qty*0=0
         # would fabricate a `realized_price=0` (via the avg_price property)
         # downstream, blowing up PnL math with a $0 fill price. `is not None`
         # over `or`-fallback because Decimal('0') is falsy in Python.
         rest_filled = _dec(resp.get("executedQty"))
         rest_avg = _dec(resp.get("avgPrice"))
-        if (
-            rest_filled is not None and rest_avg is not None
-            and rest_filled > 0 and rest_avg > 0
-        ):
-            filled_qty = rest_filled
-            weighted_price_sum = rest_filled * rest_avg
-        else:
-            filled_qty = Decimal("0")
-            weighted_price_sum = Decimal("0")
-        return LegOutcome(
+        outcome = LegOutcome(
             success=True,
             client_id=client_id,
             side=side,
             requested_qty=qty,
             status=_ASTER_STATUS_MAP.get(resp["status"], OrderStatus.UNKNOWN),
             exchange_ts_ms=int(resp["transactTime"]) if resp.get("transactTime") else None,
-            filled_qty=filled_qty,
-            weighted_price_sum=weighted_price_sum,
         )
+        if (
+            rest_filled is not None and rest_avg is not None
+            and rest_filled > 0 and rest_avg > 0
+        ):
+            outcome.set_fill(rest_filled, rest_avg)
+        return outcome
 
     async def get_position(self, market: MarketInfo) -> Position:
         # Assumes the account is in one-way (non-hedge) position mode:

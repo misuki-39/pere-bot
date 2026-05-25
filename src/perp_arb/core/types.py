@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
+from typing import Any, ClassVar
 
 
 class Side(StrEnum):
@@ -187,6 +188,9 @@ class LegOutcome:
     projection — what drivers / strategies / recorder see is the same
     object.
 
+    Construct a fill state with `set_fill(qty, avg_price)`; never write
+    `_weighted_price_sum` directly.
+
     `last_status` is taken from any terminal-status signal so
     `is_complete` can short-circuit the wait the moment the venue
     confirms the parent order is settled
@@ -205,7 +209,7 @@ class LegOutcome:
 
     # fill-side — WS accumulator OR REST fallback (driver writes either)
     filled_qty: Decimal = Decimal("0")
-    weighted_price_sum: Decimal = Decimal("0")
+    _weighted_price_sum: Decimal = Decimal("0")
     last_ts_ms: int = 0
     last_status: OrderStatus | None = None
     # Sum of per-fill commission across all FillDelta events for this cid
@@ -214,14 +218,14 @@ class LegOutcome:
     total_fee: Decimal = Decimal("0")
 
     # presentation-side — stamped by executor after gather, used by recorder + analysis
-    venue: str = ""                         # leg-label key into executor's `exchanges` dict
+    venue: str | None = None                # leg-label key into executor's `exchanges` dict
     expected_price: Decimal | None = None   # decision-time VWAP / unwind cost basis
     send_ts_ms: int | None = None           # local epoch ms at SEND mark (executor stamps)
-    kind: LegKind = LegKind.ENTRY
+    kind: LegKind | None = None
 
     def add(self, event: OrderSnapshot | FillDelta) -> None:
         """Absorb a WS event. `OrderSnapshot` (lighter cumulative state)
-        OVERWRITES filled_qty + weighted_price_sum; `FillDelta` (aster
+        OVERWRITES filled_qty + _weighted_price_sum; `FillDelta` (aster
         per-fill) ACCUMULATES qty * price * fee."""
         if event.ts_ms:
             self.last_ts_ms = max(self.last_ts_ms, event.ts_ms)
@@ -237,19 +241,42 @@ class LegOutcome:
                 # fill price) instead of None.
                 if event.filled_qty > 0 and event.realized_price is not None:
                     self.filled_qty = event.filled_qty
-                    self.weighted_price_sum = event.filled_qty * event.realized_price
+                    self._weighted_price_sum = event.filled_qty * event.realized_price
             case FillDelta():
                 if event.terminal_status is not None:
                     self.last_status = event.terminal_status
                 # FillDelta adapter invariant: qty > 0 (non-fills dropped at source).
                 self.filled_qty += event.qty
-                self.weighted_price_sum += event.qty * event.price
+                self._weighted_price_sum += event.qty * event.price
                 self.total_fee += event.fee
             case _:
                 # Fail fast on unhandled event subtypes — silent fall-through
                 # would leave fill-side fields zeroed, indistinguishable from
                 # a WS timeout. New event types must opt in explicitly.
                 raise TypeError(f"LegOutcome.add: unhandled event type {type(event).__name__}")
+
+    def set_fill(self, qty: Decimal, avg_price: Decimal) -> None:
+        """Synthesize a complete fill state from known qty + average price.
+        Use this instead of writing the accumulator sum directly — keeps
+        the internal storage detail (`_weighted_price_sum = qty * price`)
+        in one place."""
+        self.filled_qty = qty
+        self._weighted_price_sum = qty * avg_price
+
+    def merge_fill_from(self, other: LegOutcome) -> None:
+        """Overlay another outcome's fill-side state onto self. Used by
+        `submit_and_await` to promote WS-aggregated fills over REST-only
+        ack data when WS observed at least as many fills."""
+        self.filled_qty = other.filled_qty
+        self._weighted_price_sum = other._weighted_price_sum
+        self.last_ts_ms = other.last_ts_ms
+        self.total_fee = other.total_fee
+
+    def _clear_accumulator_status(self) -> None:
+        """Drop the WS-accumulator's `last_status` signal once the merge
+        in `submit_and_await` has promoted it onto `status`. Keeps the
+        finalized outcome free of intermediate-stage state."""
+        self.last_status = None
 
     def is_complete(self, requested_qty: Decimal) -> bool:
         # Terminal status = no more fills coming (filled / canceled /
@@ -264,7 +291,7 @@ class LegOutcome:
     def avg_price(self) -> Decimal | None:
         if self.filled_qty == 0:
             return None
-        return self.weighted_price_sum / self.filled_qty
+        return self._weighted_price_sum / self.filled_qty
 
     @property
     def fill_ts_ms(self) -> int | None:
@@ -272,3 +299,44 @@ class LegOutcome:
         prefer the WS last-event ts, fall back to the place-ack
         `exchange_ts_ms` when WS never delivered (REST-only fallback)."""
         return self.last_ts_ms or self.exchange_ts_ms
+
+    # ----- CSV projection -----
+    #
+    # Owned here (not in exec_record) so the column set and the
+    # field/property accessors stay in one place. Adding/renaming a
+    # column is a single-file change.
+
+    _CSV_FIELDS: ClassVar[tuple[str, ...]] = (
+        "venue", "side", "requested_qty", "filled_qty",
+        "expected_price", "realized_price", "status", "success",
+        "error_message", "client_id", "total_fee",
+        "send_ts_ms", "fill_ts_ms", "kind",
+    )
+
+    @classmethod
+    def csv_header(cls) -> list[str]:
+        return list(cls._CSV_FIELDS)
+
+    def to_csv_row(self) -> list[Any]:
+        """Project to CSV columns. Assert presentation fields are set —
+        an unstamped outcome reaching the recorder is a bug, not a row."""
+        assert self.venue is not None, "to_csv_row: venue not stamped"
+        assert self.kind is not None, "to_csv_row: kind not stamped"
+        return [
+            self.venue,
+            self.side.value if self.side is not None else "",
+            self.requested_qty,
+            # filled_qty=None on failure preserves the "no fill info"
+            # vs "zero fill" distinction — both are recordable outcomes.
+            self.filled_qty if self.success else None,
+            self.expected_price,
+            self.avg_price,
+            self.status.value,
+            self.success,
+            self.error_message,
+            self.client_id,
+            self.total_fee,
+            self.send_ts_ms,
+            self.fill_ts_ms,
+            self.kind.value,
+        ]
