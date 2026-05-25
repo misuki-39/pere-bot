@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass, field
 
 from perp_arb.core.exchange import BaseExchange
-from perp_arb.core.types import MarketInfo, OrderInfo, OrderStatus, Position
+from perp_arb.core.types import MarketInfo, OrderSnapshot, OrderStatus, Position
 
 _log = logging.getLogger("smoke")
 
@@ -27,16 +27,16 @@ class WsObserver:
     fill_timeout_s: float = 5.0
     position_timeout_s: float = 5.0
 
-    fills: list[OrderInfo] = field(default_factory=list)
+    fills: list[OrderSnapshot] = field(default_factory=list)
     positions: list[Position] = field(default_factory=list)
     _fill_event: asyncio.Event = field(default_factory=asyncio.Event)
     _position_event: asyncio.Event = field(default_factory=asyncio.Event)
 
-    def on_fill(self, info: OrderInfo) -> None:
-        self.fills.append(info)
-        _log.info("WS FILL: order_id=%s status=%s filled=%s avg=%s",
-                  info.order_id, info.status, info.filled_size, info.avg_fill_price)
-        if info.status is OrderStatus.FILLED:
+    def on_fill(self, snap: OrderSnapshot) -> None:
+        self.fills.append(snap)
+        _log.info("WS FILL: cid=%s status=%s filled=%s avg=%s",
+                  snap.client_id, snap.status, snap.filled_qty, snap.realized_price)
+        if snap.status is OrderStatus.FILLED:
             self._fill_event.set()
 
     def on_position(self, pos: Position) -> None:
