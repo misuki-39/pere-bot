@@ -24,6 +24,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from decimal import Decimal
 from pathlib import Path
 
@@ -70,7 +71,12 @@ async def _round_trip(
               label, side.value.upper(), qty, reduce_only, baseline)
 
     obs.arm()
-    res = await client.place_market_order(market, side, qty, reduce_only=reduce_only)
+    # Lighter requires the cid to be int-parseable and fit in 48 bits;
+    # ms-since-epoch is ~1.78e12, well under 2^48 (~2.8e14).
+    cid = str(int(time.time() * 1000))
+    res = await client.place_market_order(
+        market, side, qty, reduce_only=reduce_only, client_id=cid,
+    )
     _log.info("WS sendtx result: success=%s order_id=%s latency=%dms err=%s",
               res.success, res.order_id, res.latency_ms or -1, res.error_message)
     if not res.success:

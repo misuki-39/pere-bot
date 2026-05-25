@@ -62,8 +62,8 @@ class BaseExchange(ABC):
         side: Side,
         qty: Decimal,
         *,
+        client_id: str,
         reduce_only: bool = False,
-        client_id: str | None = None,
     ) -> LegOutcome:
         """Submit a market order and return whatever the venue's synchronous
         response provides — ack fields populated, fill-side populated only
@@ -71,7 +71,9 @@ class BaseExchange(ABC):
         `executedQty`/`avgPrice` for synchronous-fill markets). WS fill
         events arrive separately via the per-cid tracker.
 
-        For end-to-end submit + WS-fill resolution, use `submit_and_await`."""
+        `client_id` is mandatory — the WS fill tracker keys on it, so callers
+        that want fill events to land in the correct slot must control the
+        cid. For end-to-end submit + WS-fill resolution, use `submit_and_await`."""
 
     @abstractmethod
     async def get_position(self, market: MarketInfo) -> Position: ...

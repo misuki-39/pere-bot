@@ -144,8 +144,8 @@ class KatanaClient(BaseExchange):
         side: Side,
         qty: Decimal,
         *,
+        client_id: str,
         reduce_only: bool = False,
-        client_id: str | None = None,
     ) -> LegOutcome:
         raise RuntimeError(_PUBLIC_ONLY)
 

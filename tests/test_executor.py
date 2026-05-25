@@ -88,7 +88,7 @@ class _StubExchange:
 
     async def place_market_order(
         self, market: MarketInfo, side: Side, qty: Decimal,
-        *, reduce_only: bool = False, client_id: str | None = None,
+        *, client_id: str, reduce_only: bool = False,
     ) -> LegOutcome:
         # Used only by the unwind path. Reuse submit_outcome's shape but
         # always return a success-shaped outcome (the unwind doesn't need

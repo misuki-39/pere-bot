@@ -60,8 +60,6 @@ def main(dec_path: Path, legs_path: Path) -> None:
     print("  " + "ALL".ljust(8) + " " + _pct(entry["latency_ms"].dropna()))
 
     # 3) inter-leg skew = |fill_a − fill_l|.  Naked exposure window.
-    piv_lat = entry.pivot_table(index="decision_id", columns="exchange",
-                                values="latency_ms", aggfunc="first")
     piv_fill = entry.pivot_table(index="decision_id", columns="exchange",
                                  values="fill_ts_ms", aggfunc="first")
     if {"aster", "lighter"}.issubset(piv_fill.columns):

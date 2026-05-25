@@ -212,14 +212,11 @@ class LighterClient(BaseExchange):
         side: Side,
         qty: Decimal,
         *,
+        client_id: str,
         reduce_only: bool = False,
-        client_id: str | None = None,
     ) -> LegOutcome:
-        if self.public_only or self._signer is None or self._user_ws is None:
-            raise RuntimeError("lighter is in public_only mode — cannot place orders")
-        meta = self._meta_by_symbol.get(market.symbol.raw)
-        if meta is None:
-            raise RuntimeError("call load_market() before placing orders on lighter")
+        meta = self._meta_by_symbol[market.symbol.raw]
+        assert self._signer is not None and self._user_ws is not None
 
         is_ask = side is Side.SELL
         worst_price = _worst_acceptable_price(self.best_quote(market), is_ask)
@@ -227,16 +224,9 @@ class LighterClient(BaseExchange):
         base_amount = int(qty * meta.base_multiplier)
         # Lighter's `client_order_index` is the on-wire cid; the WS user
         # stream echoes this exact integer as `client_order_id`, so the
-        # tracker key MUST be `str(coi)` for `_fill_tracker.on_event` to
-        # match the slot we registered. Caller supplies it as a numeric
-        # string; fallback only fires for in-driver flows (unwind) that
-        # don't fill-track. Max is Lighter's `2^48 - 10`.
-        if client_id is not None:
-            coi = int(client_id)
-            client_id_str = client_id
-        else:
-            coi = int(time.time()) % (1 << 48)
-            client_id_str = str(coi)
+        # tracker key MUST be `str(int(client_id))` for `_fill_tracker.on_event`
+        # to match the slot we registered. Max is Lighter's `2^48 - 10`.
+        coi = int(client_id)
 
         tx_type, tx_info, _tx_hash, err = self._signer.sign_create_order(
             market_index=meta.market_index,
@@ -252,28 +242,26 @@ class LighterClient(BaseExchange):
         )
         if err is not None:
             return LegOutcome(
-                success=False, client_id=client_id_str, side=side,
+                success=False, client_id=client_id, side=side,
                 requested_qty=qty, error_message=f"sign: {err}",
             )
 
-        # After `err is None`, the SDK's union return guarantees the
-        # other tuple elements are populated. The SDK type stub declares
-        # tx_type as `str | None`, but the runtime value is the L2-tx-type
-        # int constant our `send_tx` serializes — cast at the boundary.
-        assert tx_type is not None and tx_info is not None
+        # SDK type stub declares tx_type as `str | None`, but the runtime
+        # value (when `err is None`) is the L2-tx-type int constant our
+        # `send_tx` serializes — cast at the boundary.
         t0 = time.monotonic()
         try:
-            reply = await self._user_ws.send_tx(cast(int, tx_type), tx_info)
+            reply = await self._user_ws.send_tx(cast(int, tx_type), cast(str, tx_info))
         except (TimeoutError, TxSubmitError) as e:
             return LegOutcome(
-                success=False, client_id=client_id_str, side=side,
+                success=False, client_id=client_id, side=side,
                 requested_qty=qty, error_message=str(e),
                 latency_ms=int((time.monotonic() - t0) * 1000),
             )
         ok, err_msg = _sendtx_outcome(reply)
         if not ok:
             return LegOutcome(
-                success=False, client_id=client_id_str, side=side,
+                success=False, client_id=client_id, side=side,
                 requested_qty=qty, error_message=err_msg,
                 latency_ms=int((time.monotonic() - t0) * 1000),
             )
@@ -281,7 +269,7 @@ class LighterClient(BaseExchange):
         # the account_market WS stream; `submit_and_await` overlays it.
         return LegOutcome(
             success=True,
-            client_id=client_id_str,
+            client_id=client_id,
             side=side,
             requested_qty=qty,
             status=OrderStatus.OPEN,

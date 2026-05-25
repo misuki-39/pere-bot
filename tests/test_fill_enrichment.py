@@ -157,7 +157,7 @@ class _FakeExchange(BaseExchange):
 
     async def place_market_order(
         self, market: MarketInfo, side: Side, qty: Decimal,
-        *, reduce_only: bool = False, client_id: str | None = None,
+        *, client_id: str, reduce_only: bool = False,
     ) -> LegOutcome:
         return self._ack
 

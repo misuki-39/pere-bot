@@ -95,7 +95,7 @@ class _FakeExchange(BaseExchange):
     async def disconnect(self) -> None: raise NotImplementedError
     async def load_market(self, raw_symbol: str) -> MarketInfo: raise NotImplementedError
     async def place_market_order(  # type: ignore[override]
-        self, market, side, qty, *, reduce_only=False, client_id=None,
+        self, market, side, qty, *, client_id: str, reduce_only=False,
     ) -> LegOutcome: raise NotImplementedError
     def subscribe_quotes(self, market: MarketInfo, cb: Callable) -> None: raise NotImplementedError
     def subscribe_book(self, market: MarketInfo, cb: Callable) -> None: raise NotImplementedError

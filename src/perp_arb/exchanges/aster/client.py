@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-import uuid
 from collections import defaultdict
 from decimal import Decimal
 
@@ -145,12 +144,11 @@ class AsterClient(BaseExchange):
         side: Side,
         qty: Decimal,
         *,
+        client_id: str,
         reduce_only: bool = False,
-        client_id: str | None = None,
     ) -> LegOutcome:
         if self.public_only:
             raise RuntimeError("aster is in public_only mode — cannot place orders")
-        client_id = client_id or f"pa-{uuid.uuid4().hex[:16]}"
         t0 = time.monotonic()
         try:
             resp = await self.rest.place_order(
