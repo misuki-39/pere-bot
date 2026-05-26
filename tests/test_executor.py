@@ -230,7 +230,10 @@ async def test_failed_trade_has_no_realised_pnl() -> None:
 # ---- live partial-failure quadrants --------------------------------------
 
 @pytest.mark.asyncio
-async def test_aster_ok_lighter_fail_unwinds_aster() -> None:
+async def test_aster_ok_lighter_fail_no_auto_unwind() -> None:
+    """The executor no longer auto-unwinds on partial failure — strategy
+    owns reconcile via REST snapshot + targeted reduce-only flatten.
+    All the executor does is build the failure_reason narrative."""
     qty = Decimal("1.0")
     aster = _StubExchange(
         name="aster",
@@ -248,20 +251,17 @@ async def test_aster_ok_lighter_fail_unwinds_aster() -> None:
     assert report.failure_reason is not None
     assert "lighter leg failed" in (report.failure_reason or "")
     assert "sequencer rejected" in (report.failure_reason or "")
-    # unwind leg appended: aster reduce-only on the OPPOSITE side
-    assert len(report.legs) == 3
-    assert report.legs[2].kind is LegKind.UNWIND
-    assert report.legs[2].venue == "aster"
-    # Second aster call is the unwind (via place_market_order):
-    # opposite side + reduce_only
-    assert len(aster.submit_calls) == 2
-    unwind_call = aster.submit_calls[1]
-    assert unwind_call["reduce_only"] is True
-    assert unwind_call["side"] is Side.BUY  # opposite of SELL entry
+    # No UNWIND leg — strategy will reconcile from REST truth.
+    assert len(report.legs) == 2
+    assert all(leg.kind is LegKind.ENTRY for leg in report.legs)
+    # Successful leg was called exactly once (the entry) — no follow-up.
+    assert len(aster.submit_calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_lighter_ok_aster_fail_unwinds_lighter() -> None:
+async def test_lighter_ok_aster_fail_no_auto_unwind() -> None:
+    """Mirror of the partial-failure case: lighter filled, aster failed.
+    Strategy will reconcile; executor does not unwind."""
     qty = Decimal("1.0")
     aster = _StubExchange(
         name="aster",
@@ -278,12 +278,9 @@ async def test_lighter_ok_aster_fail_unwinds_lighter() -> None:
 
     assert report.failure_reason is not None
     assert "aster leg failed" in (report.failure_reason or "")
-    assert len(report.legs) == 3
-    assert report.legs[2].kind is LegKind.UNWIND
-    assert report.legs[2].venue == "lighter"
-    unwind_call = lighter.submit_calls[1]
-    assert unwind_call["reduce_only"] is True
-    assert unwind_call["side"] is Side.SELL  # opposite of BUY entry
+    assert len(report.legs) == 2
+    assert all(leg.kind is LegKind.ENTRY for leg in report.legs)
+    assert len(lighter.submit_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -377,14 +374,13 @@ async def test_unexpected_exception_coerced_to_failure_outcome() -> None:
     report = await ex.execute(
         trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
     )
-    # gather still resolved; partial-failure logic unwound aster
+    # gather still resolved; raise was coerced to a fail outcome.
     assert report.failure_reason is not None
     assert "lighter leg failed" in (report.failure_reason or "")
     assert "ws crashed" in (report.failure_reason or "")
-    # Unwind appended (we use submit_and_await for the unwind too)
-    assert len(report.legs) == 3
-    assert report.legs[2].kind is LegKind.UNWIND
-    assert report.legs[2].venue == "aster"
+    # No auto-unwind appended — strategy will reconcile from REST.
+    assert len(report.legs) == 2
+    assert all(leg.kind is LegKind.ENTRY for leg in report.legs)
 
 
 # ---- side flip works through LegIntent ----------------------------------

@@ -56,7 +56,7 @@ from ..core.exec_record import (
 )
 from ..core.executor import LegIntent, TwoLegExecutor
 from ..core.pnl import pair_pnl_from_legs
-from ..core.types import LegKind
+from ..core.types import LegKind, MarketInfo, Side
 from ..risk.manager import RiskManager
 from ..utils.time import now_ms
 from .base import BaseStrategy, SpreadModel, TimeEwma
@@ -76,10 +76,15 @@ _log = logging.getLogger(__name__)
 
 @dataclass
 class SyntheticPosition:
-    """Bot-side position tracker (signed). For paper + live both."""
+    """Realised cash-flow PnL accumulator.
 
-    leg_a: Decimal = Decimal("0")
-    leg_b: Decimal = Decimal("0")
+    Per-venue position is read from `exchange.live_position()` (WS-fed
+    snapshot of venue truth) plus a small `_pending_*` overlay that
+    bridges the gap between order-ack-success and the ACCOUNT_UPDATE
+    landing. WS is the single source of truth for size; this class only
+    carries cumulative realised PnL.
+    """
+
     realised_pnl: Decimal = Decimal("0")
 
 
@@ -97,6 +102,31 @@ class TakerTakerArbitrage(BaseStrategy):
         self._recorder: ExecutionRecorder | None = None
         self._evaluating = False
         self._position = SyntheticPosition()
+        # Provisional overlay: predicted signed delta NOT YET pushed by
+        # the WS account stream. Set on a successful `_fire` as
+        # `delta - (post - pre)` so any portion already absorbed during
+        # the executor await (e.g. ACCOUNT_UPDATE landing during the
+        # aster 400/timeout queryOrder recovery roundtrip) is NOT
+        # double-counted on top of `live_position()`. Cleared on the
+        # next venue position event (subscribed in `run()`). The
+        # `_evaluating` gate ensures only one trade is in flight at a
+        # time, so each overlay slot only ever carries one trade's worth.
+        # Live mode only — paper has no WS account stream.
+        self._pending_a: Decimal = Decimal("0")
+        self._pending_b: Decimal = Decimal("0")
+        # Paper mode synthetic ledger. Paper has no WS account stream and
+        # no real venue inventory, so the strategy keeps its own
+        # accumulator off successful paper fills. Unused in live.
+        self._paper_pos_a: Decimal = Decimal("0")
+        self._paper_pos_b: Decimal = Decimal("0")
+        # Reconcile-after-failure state. When `_fire` fails the strategy
+        # runs sync→balance→cooldown (see plan agile-waddling-beacon). If
+        # the sync or the balance step itself fails, `_reconcile_pending`
+        # is set True and `_reconcile_target` carries the pre-fire snapshot
+        # so the next `_evaluate` (after cooldown expiry) can retry
+        # before any new entry is allowed.
+        self._reconcile_pending: bool = False
+        self._reconcile_target: tuple[Decimal, Decimal] | None = None
         self._risk = RiskManager(s.risk)
         self._last_heartbeat_ms = 0
         self._heartbeat_interval_ms = 60_000  # liveness only; trades go to CSV
@@ -218,17 +248,32 @@ class TakerTakerArbitrage(BaseStrategy):
         _log.info("taker_taker mode=%s recording to %s",
                   mode_label, self.cfg.runtime.log_dir)
 
-        # Seed the bot-local position tracker from venue truth before any
-        # FIRE evaluates. After a restart with real inventory, this is the
-        # only way max_qty stays meaningful. Paper returns 0. Failure
-        # (REST error, venue unreachable) propagates and aborts startup —
-        # we refuse to trade with unknown inventory.
-        self._position.leg_a, self._position.leg_b = await asyncio.gather(
+        # Seed venue position truth before any FIRE evaluates. After a
+        # restart with real inventory, this is the only way max_qty stays
+        # meaningful on the first tick (before WS pushes an ACCOUNT_UPDATE).
+        # `snapshot_position` calls `get_position`, which seeds the driver's
+        # `live_position()` cache via setdefault — so subsequent reads of
+        # `live_position()` return this value until WS overwrites it.
+        # Paper returns 0; the paper synthetic ledger picks up from there.
+        seed_a, seed_b = await asyncio.gather(
             self.session.snapshot_position(self._leg_a(), self._leg_a_market()),
             self.session.snapshot_position(self._leg_b(), self._leg_b_market()),
         )
-        _log.info("seeded position: leg_a=%s leg_b=%s",
-                  self._position.leg_a, self._position.leg_b)
+        self._paper_pos_a, self._paper_pos_b = seed_a, seed_b
+        _log.info("seeded position: leg_a=%s leg_b=%s", seed_a, seed_b)
+
+        # Subscribe to venue position pushes so the overlay clears the
+        # moment WS catches up to a fired trade. The Position callback's
+        # payload is irrelevant — its arrival is the signal. We clear both
+        # eagerly; over-clearing is safe because only one trade is in
+        # flight at a time (gated by `_evaluating`).
+        if not self.session.is_paper:
+            self._leg_a().subscribe_positions(
+                self._leg_a_market(), lambda _p: self._clear_pending_a(),
+            )
+            self._leg_b().subscribe_positions(
+                self._leg_b_market(), lambda _p: self._clear_pending_b(),
+            )
 
         self._leg_a().subscribe_book(self._leg_a_market(), lambda _b: self._schedule_eval())
         self._leg_b().subscribe_book(self._leg_b_market(), lambda _b: self._schedule_eval())
@@ -238,6 +283,155 @@ class TakerTakerArbitrage(BaseStrategy):
         finally:
             if self._recorder:
                 self._recorder.close()
+
+    # ---- position view (WS-truth + pending overlay) ----
+
+    def _live_size_a(self) -> Decimal:
+        """Last WS-pushed signed size on leg A, 0 if no event yet."""
+        live = self._leg_a().live_position(self._leg_a_market())
+        return live.size if live is not None else Decimal("0")
+
+    def _live_size_b(self) -> Decimal:
+        live = self._leg_b().live_position(self._leg_b_market())
+        return live.size if live is not None else Decimal("0")
+
+    def _pos_a(self) -> Decimal:
+        """Effective signed position on leg A.
+
+        Live: WS-fed `live_position()` + provisional pending overlay.
+        Paper: dedicated synthetic ledger (no WS account stream).
+        """
+        if self.session.is_paper:
+            return self._paper_pos_a
+        return self._live_size_a() + self._pending_a
+
+    def _pos_b(self) -> Decimal:
+        if self.session.is_paper:
+            return self._paper_pos_b
+        return self._live_size_b() + self._pending_b
+
+    def _clear_pending_a(self) -> None:
+        self._pending_a = Decimal("0")
+
+    def _clear_pending_b(self) -> None:
+        self._pending_b = Decimal("0")
+
+    # ---- reconcile after failure (sync → balance → cooldown) ----
+
+    async def _reconcile_after_failure(
+        self, target_a: Decimal, target_b: Decimal,
+    ) -> None:
+        """Recover from a partial / total leg failure.
+
+        Flow: REST-snapshot both legs; for any leg whose snap differs
+        from the pre-fire target by at least a dust threshold, place a
+        reduce-only market order on that leg to flatten. On success,
+        zero the WS pending overlay (REST truth is now authoritative
+        until WS catches up).
+
+        Contingency (user-specified flow): if the REST snapshot itself
+        raises, or any rebalance market order fails, **short-circuit
+        immediately** — set `_reconcile_pending=True` and save the
+        target. The next `_evaluate` after cooldown expiry will retry.
+        No in-cycle retries; no recursion. `record_failure` (called by
+        `_fire`) arms the cooldown either way.
+
+        Paper mode: REST returns 0 for both legs and no real venue
+        order can be placed; treat as a no-op.
+        """
+        if self.session.is_paper:
+            self._reconcile_pending = False
+            self._reconcile_target = None
+            return
+
+        try:
+            snap_a, snap_b = await asyncio.gather(
+                self.session.snapshot_position(self._leg_a(), self._leg_a_market()),
+                self.session.snapshot_position(self._leg_b(), self._leg_b_market()),
+            )
+        except Exception as e:  # noqa: BLE001
+            _log.error(
+                "reconcile: REST snapshot failed (%s) — deferring to next "
+                "cycle after cooldown expires",
+                e,
+            )
+            self._reconcile_pending = True
+            self._reconcile_target = (target_a, target_b)
+            return
+
+        diff_a = target_a - snap_a
+        diff_b = target_b - snap_b
+        _log.warning(
+            "reconcile: target=(%s, %s) snap=(%s, %s) diff=(%s, %s)",
+            target_a, target_b, snap_a, snap_b, diff_a, diff_b,
+        )
+
+        ok_a = await self._rebalance_one_leg(
+            self._leg_a(), self._leg_a_market(), diff_a,
+        )
+        ok_b = await self._rebalance_one_leg(
+            self._leg_b(), self._leg_b_market(), diff_b,
+        )
+
+        if ok_a and ok_b:
+            # Both legs reconciled (or already at target). REST is now the
+            # truth; clear the overlay so `_pos_a/b()` reads `live_position`
+            # cleanly without double-counting the just-placed reduce-only.
+            self._reconcile_pending = False
+            self._reconcile_target = None
+            self._pending_a = Decimal("0")
+            self._pending_b = Decimal("0")
+            _log.info("reconcile: complete")
+        else:
+            self._reconcile_pending = True
+            self._reconcile_target = (target_a, target_b)
+
+    async def _rebalance_one_leg(
+        self, exchange, market: MarketInfo, diff: Decimal,
+    ) -> bool:
+        """Flatten `|diff|` on `market` via reduce-only market. Returns
+        True if the leg is settled (either already at target or the
+        reduce-only fill succeeded), False if the leg still needs work.
+
+        Dust threshold: `max(market.min_qty, market.lot_size)` — never
+        submit sub-lot orders. A diff smaller than the dust threshold is
+        treated as "already at target."
+        """
+        dust = max(market.min_qty, market.lot_size)
+        if abs(diff) < dust:
+            return True
+        side = Side.BUY if diff > 0 else Side.SELL
+        qty = abs(diff)
+        # Quantize to lot_size to satisfy the venue's stepSize / amount-
+        # tick filter. The dust threshold above already guarantees qty>0.
+        if market.lot_size > 0:
+            qty = (qty // market.lot_size) * market.lot_size
+            if qty < dust:
+                return True
+        # Reuse the executor's monotonic cid counter so the reconcile
+        # order is guaranteed unique across the run (cids are per-driver
+        # scoped; an old cid could collide if we rolled our own clock-
+        # based string and the bot restarts within a second).
+        cid = self._executor._next_cid()
+        _log.warning(
+            "reconcile: rebalancing %s with %s %s (reduce_only)",
+            exchange.name, side.value, qty,
+        )
+        try:
+            outcome = await exchange.submit_and_await(
+                market, side, qty, client_id=cid,
+                timeout_s=5.0, reduce_only=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            _log.error("reconcile: %s rebalance raised: %s", exchange.name, e)
+            return False
+        if not outcome.success:
+            _log.error(
+                "reconcile: %s rebalance failed: %s",
+                exchange.name, outcome.error_message,
+            )
+            return False
+        return True
 
     # ---- evaluation ----
 
@@ -254,6 +448,25 @@ class TakerTakerArbitrage(BaseStrategy):
             self._evaluating = False
 
     async def _evaluate(self) -> None:
+        # Pending reconcile from a prior failure: when cooldown has
+        # expired, retry the sync→balance flow BEFORE evaluating new
+        # entries. If retry still fails, `_reconcile_after_failure` re-
+        # arms cooldown and we exit this tick. Either way the normal
+        # signal evaluation is suppressed while the reconcile is open.
+        if self._reconcile_pending:
+            ok, _ = self._risk.can_trade()
+            if not ok:
+                return  # still inside cooldown — wait
+            assert self._reconcile_target is not None
+            target_a, target_b = self._reconcile_target
+            await self._reconcile_after_failure(target_a, target_b)
+            if self._reconcile_pending:
+                # Retry didn't complete — re-arm cooldown so we wait
+                # again before the next attempt. record_failure handles
+                # the consecutive-failures ratchet toward halt.
+                self._risk.record_failure("reconcile retry failed")
+            return
+
         a_book = self._leg_a().order_book(self._leg_a_market())
         b_book = self._leg_b().order_book(self._leg_b_market())
         a_q = self._leg_a().best_quote(self._leg_a_market())
@@ -298,8 +511,8 @@ class TakerTakerArbitrage(BaseStrategy):
             left_quote=a_q, right_quote=b_q,
             fills=fills,
             bias=bias, is_warm=self._spread.is_warm,
-            position_left=self._position.leg_a,
-            position_right=self._position.leg_b,
+            position_left=self._pos_a(),
+            position_right=self._pos_b(),
             bump_a_bps=bump_a,
             bump_b_bps=bump_b,
         ))
@@ -380,7 +593,7 @@ class TakerTakerArbitrage(BaseStrategy):
         _log.info(
             "tick: mid_a=%.2f mid_b=%.2f bias=%.4f %s pos_a=%s pos_b=%s pnl=%s",
             mid_left, mid_right, bias, edge_str,
-            self._position.leg_a, self._position.leg_b,
+            self._pos_a(), self._pos_b(),
             self._position.realised_pnl,
         )
 
@@ -407,6 +620,15 @@ class TakerTakerArbitrage(BaseStrategy):
 
         if self._inflight_cap > 0:
             self._inflight_dir[d.decision_id] = d.direction
+        # Snapshot live_position BEFORE the executor await so we can
+        # detect how much of `delta` the WS account stream already
+        # absorbed during execution. Without this, a slow path (e.g. the
+        # aster 400/timeout → queryOrder recovery) lets ACCOUNT_UPDATE
+        # land during the await, `_clear_pending_*` zeros the overlay,
+        # then we bump pending on success and double-count by `delta`
+        # until the *next* trade's ACCOUNT_UPDATE arrives.
+        pre_a = self._live_size_a()
+        pre_b = self._live_size_b()
         try:
             result = await self._executor.execute(
                 trade_id=d.decision_id,
@@ -424,8 +646,24 @@ class TakerTakerArbitrage(BaseStrategy):
 
             success = result.failure_reason is None
             if success:
-                self._position.leg_a += qty * Decimal(a_side.sign)
-                self._position.leg_b += qty * Decimal(b_side.sign)
+                # The trade's predicted signed delta per leg.
+                delta_a = qty * Decimal(a_side.sign)
+                delta_b = qty * Decimal(b_side.sign)
+                if self.session.is_paper:
+                    # Paper has no WS account stream; the ledger IS truth.
+                    self._paper_pos_a += delta_a
+                    self._paper_pos_b += delta_b
+                else:
+                    # Live: bump pending only by the part WS hasn't pushed
+                    # yet. `gap = delta - (post - pre)`. If WS fully caught
+                    # up during the await, post-pre == delta and gap == 0
+                    # (no overlay needed). If WS hasn't arrived yet,
+                    # gap == delta and the overlay carries the prediction
+                    # until `_clear_pending_*` fires.
+                    gap_a = delta_a - (self._live_size_a() - pre_a)
+                    gap_b = delta_b - (self._live_size_b() - pre_b)
+                    self._pending_a += gap_a
+                    self._pending_b += gap_b
                 # Derive per-leg latency on the fly from the two timestamps
                 # the recorder also persists. Mixed clock (local send vs
                 # venue match), NTP-skew-sensitive at ms scale — acceptable
@@ -455,10 +693,16 @@ class TakerTakerArbitrage(BaseStrategy):
                 _log.info(
                     "[%s] pos_a=%s pos_b=%s pnl_total=%s",
                     d.decision_id,
-                    self._position.leg_a, self._position.leg_b,
+                    self._pos_a(), self._pos_b(),
                     self._position.realised_pnl,
                 )
             else:
+                # Failure path: sync → balance → cooldown.
+                # `_reconcile_after_failure` does the first two; if either
+                # step itself fails it sets `_reconcile_pending` so the
+                # next eval after cooldown will retry. `record_failure`
+                # arms the cooldown unconditionally.
+                await self._reconcile_after_failure(pre_a, pre_b)
                 self._risk.record_failure(result.failure_reason or "unknown")
         finally:
             if self._inflight_cap > 0:

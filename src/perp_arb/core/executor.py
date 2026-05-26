@@ -1,5 +1,5 @@
 """Two-leg execution: gathers `submit_and_await` outcomes on both venues,
-unwinds the stranded leg on partial failure, returns an `ExecutionResult`.
+records the per-leg outcome, returns an `ExecutionResult`.
 
 Layering: the executor sits between **strategy** (signal — produces
 decisions and resolves them into venue-side intents) and **driver**
@@ -7,9 +7,16 @@ decisions and resolves them into venue-side intents) and **driver**
 `BaseExchange`). It is strategy-agnostic — it never sees `Direction`,
 `vwap_*`, or any strategy-internal field. The caller hands it concrete
 `LegIntent`s (venue, side, expected_price) and a `Timeline` writeback
-target; the executor owns cid generation, handles `gather`, partial-
-failure unwind, paper-fill synth, and stamps presentation fields onto
-each `LegOutcome` so the recorder can serialize them directly.
+target; the executor owns cid generation, handles `gather`, paper-fill
+synth, and stamps presentation fields onto each `LegOutcome` so the
+recorder can serialize them directly.
+
+On a partial leg failure the executor records the failure_reason and
+returns; it does **not** auto-unwind. The strategy layer owns
+reconcile-and-rebalance via `_reconcile_after_failure` (REST snapshot →
+reduce-only flatten), which is safer than blind unwind in cases where
+the "failed" leg actually executed (e.g. aster 400/timeout). See
+docs/agile-waddling-beacon plan.
 
 Paper mode is a single branch inside `execute()` rather than a separate
 `PaperExecutor` because paper and live share 100% of the orchestration
@@ -156,7 +163,7 @@ class TwoLegExecutor:
         )
         return ExecutionResult(legs=legs_out, failure_reason=failure_reason)
 
-    # ----- partial-failure recovery -----
+    # ----- partial-failure narrative -----
 
     async def _handle_partial_failure(
         self,
@@ -168,79 +175,35 @@ class TwoLegExecutor:
         b_out: LegOutcome,
         legs: list[LegOutcome],
     ) -> str:
-        # Log + failure_reason use the actual venue names ("aster"/"lighter")
-        # — these strings are surfaced to operators, not to the strategy's
-        # internal leg-label routing.
+        """Build the failure_reason string for the strategy's reconcile
+        path. We do NOT auto-unwind here anymore — strategy owns the
+        reconcile-and-rebalance flow (REST snapshot + targeted reduce-only)
+        so the recovery is based on venue truth, not the executor's
+        own success/failure verdict.
+
+        `legs` is left at exactly two entries. `qty` and `a_out`/`b_out`
+        are intentionally retained in the signature so future telemetry
+        (e.g. per-leg latency-on-failure) can be added without churn.
+        """
         a_name = self.exchanges[a.venue].name
         b_name = self.exchanges[b.venue].name
         if a_out.success and not b_out.success:
             _log.error(
-                "[%s] PARTIAL: %s filled, %s failed (%s) — unwinding %s",
-                trade_id, a_name, b_name, b_out.error_message, a_name,
+                "[%s] PARTIAL: %s filled, %s failed (%s) — strategy will reconcile",
+                trade_id, a_name, b_name, b_out.error_message,
             )
-            unwind = await self._unwind_leg(
-                a.venue, a.side.opposite, qty, a_out.avg_price,
-            )
-            if unwind is not None:
-                legs.append(unwind)
             return f"{b_name} leg failed: {b_out.error_message}"
         if b_out.success and not a_out.success:
             _log.error(
-                "[%s] PARTIAL: %s filled, %s failed (%s) — unwinding %s",
-                trade_id, b_name, a_name, a_out.error_message, b_name,
+                "[%s] PARTIAL: %s filled, %s failed (%s) — strategy will reconcile",
+                trade_id, b_name, a_name, a_out.error_message,
             )
-            unwind = await self._unwind_leg(
-                b.venue, b.side.opposite, qty, b_out.avg_price,
-            )
-            if unwind is not None:
-                legs.append(unwind)
             return f"{a_name} leg failed: {a_out.error_message}"
         _log.warning(
             "[%s] BOTH FAILED: %s=%s %s=%s",
             trade_id, a_name, a_out.error_message, b_name, b_out.error_message,
         )
         return "both legs failed"
-
-    async def _unwind_leg(
-        self,
-        venue: str,
-        side: Side,
-        qty: Decimal,
-        cost_basis: Decimal | None,
-    ) -> LegOutcome | None:
-        """Flatten the stranded leg. `cost_basis` is the stranded fill
-        we are reversing — stamped as `expected_price` so the round-trip
-        cost of a partial is directly computable offline. Returns `None`
-        in paper mode (paper has no real position to flatten).
-
-        Routes through `submit_and_await` so the WS fill data populates
-        the unwind outcome — `place_market_order` alone leaves lighter
-        unwinds with no realized_price (lighter's REST carries no fill
-        data; only WS does)."""
-        if self._is_paper:
-            return None
-        ex = self.exchanges[venue]
-        mkt = self.markets[venue]
-        unwind_cid = self._next_cid()
-        unwind_send_ts = now_ms()
-        try:
-            out = await ex.submit_and_await(
-                mkt, side, qty, client_id=unwind_cid,
-                timeout_s=self.fill_wait_timeout_s, reduce_only=True,
-            )
-            if not out.success:
-                _log.error("unwind on %s FAILED: %s", venue, out.error_message)
-        except Exception as e:  # noqa: BLE001
-            _log.exception("unwind on %s raised: %s", venue, e)
-            out = LegOutcome(
-                success=False, side=side, requested_qty=qty,
-                error_message=f"unwind raised: {e}",
-            )
-        out.venue = ex.name
-        out.expected_price = cost_basis
-        out.send_ts_ms = unwind_send_ts
-        out.kind = LegKind.UNWIND
-        return out
 
     # ----- presentation field stamping -----
 

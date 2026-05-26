@@ -44,6 +44,13 @@ class RiskCfg(BaseModel):
     max_leg_latency_ms: int = 500
     daily_loss_cap_usd: Decimal = Decimal("50")
     min_free_margin_usd: Decimal = Decimal("0")
+    # Soft cooldown applied after every `record_failure`. While
+    # `cooldown_until_ms > now`, `can_trade()` blocks new fires; the
+    # strategy's _reconcile_after_failure runs synchronously inside _fire's
+    # failure branch BEFORE this cooldown is armed (see plan
+    # agile-waddling-beacon). max_consecutive_failures remains the hard
+    # backstop — repeated failures still ratchet toward halt.
+    cooldown_s: float = Field(default=60.0, ge=0)
 
 
 class PersistenceConfirmCfg(BaseModel):
