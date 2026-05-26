@@ -150,6 +150,22 @@ class AsterRest:
         # /fapi/v3/positionRisk returns a JSON array.
         return await self._signed("GET", "/fapi/v3/positionRisk", {"symbol": symbol})
 
+    async def query_order(
+        self,
+        symbol: str,
+        *,
+        orig_client_order_id: str,
+    ) -> dict[str, Any]:
+        """Lookup an order by `newClientOrderId` (`origClientOrderId` in the
+        query API). Used to disambiguate `POST /order` 400 timeouts: the
+        server may reject the response while the order is already in the
+        matching engine. Raises AsterRestError when the order is not
+        found (caller treats that as a confirmed non-execution)."""
+        return await self._signed(
+            "GET", "/fapi/v3/order",
+            {"symbol": symbol, "origClientOrderId": orig_client_order_id},
+        )
+
     # ---------------- user data stream ----------------
 
     async def start_user_stream(self) -> str:

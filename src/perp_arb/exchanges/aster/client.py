@@ -158,6 +158,25 @@ class AsterClient(BaseExchange):
                 new_client_order_id=client_id,
             )
         except Exception as e:  # noqa: BLE001
+            # Aster sometimes returns 400 + body `"msg":"The request has timed
+            # out."` for a request that DID reach the matching engine — the
+            # response simply didn't make it back in time. Treating that as a
+            # definitive non-execution causes lighter to unwind a leg that
+            # was correctly hedged (the partial-failure bug we hit on
+            # 2026-05-25). Disambiguate via `queryOrder by clientOrderId`:
+            # if the order exists, surface it as a real LegOutcome; only
+            # treat as fail when the lookup confirms the order is unknown.
+            if _is_aster_request_timeout(e):
+                recovered = await self._try_recover_timed_out_order(
+                    market, side, qty, client_id,
+                )
+                if recovered is not None:
+                    _log.warning(
+                        "aster place 400/timeout RECOVERED via queryOrder: "
+                        "cid=%s status=%s filled=%s",
+                        client_id, recovered.status, recovered.filled_qty,
+                    )
+                    return recovered
             _log.warning("aster order failed: %s", e)
             return LegOutcome(
                 success=False,
@@ -166,34 +185,77 @@ class AsterClient(BaseExchange):
                 requested_qty=qty,
                 error_message=str(e),
             )
-        # `transactTime` (Binance-fork convention) is the exchange-server
-        # millisecond timestamp of the order action. Aster's REST also
-        # returns `executedQty`/`avgPrice` for market orders (fills are
-        # synchronous), which we store as a fallback in case the WS
-        # ORDER_TRADE_UPDATE never lands; `submit_and_await` overlays WS
-        # data on top when it does.
-        #
-        # Only populate the fill-side fields when BOTH executedQty>0 AND
-        # avgPrice>0 are present — otherwise _weighted_price_sum=qty*0=0
-        # would fabricate a `realized_price=0` (via the avg_price property)
-        # downstream, blowing up PnL math with a $0 fill price. `is not None`
-        # over `or`-fallback because Decimal('0') is falsy in Python.
-        rest_filled = _dec(resp.get("executedQty"))
-        rest_avg = _dec(resp.get("avgPrice"))
+        return self._build_outcome_from_order_resp(resp, side, qty, client_id)
+
+    def _build_outcome_from_order_resp(
+        self,
+        resp: dict,
+        side: Side,
+        qty: Decimal,
+        client_id: str,
+    ) -> LegOutcome:
+        """Shared shape: place_order POST and queryOrder GET return the same
+        fields (status, executedQty, avgPrice, transactTime/updateTime).
+
+        `transactTime` (POST) / `updateTime` (GET) is the exchange-server
+        millisecond timestamp of the order action. Aster's REST also
+        returns `executedQty`/`avgPrice` for market orders (fills are
+        synchronous), which we store as a fallback in case the WS
+        ORDER_TRADE_UPDATE never lands; `submit_and_await` overlays WS
+        data on top when it does.
+
+        Only populate the fill-side fields when BOTH executedQty>0 AND
+        avgPrice>0 are present — otherwise _weighted_price_sum=qty*0=0
+        would fabricate a `realized_price=0` (via the avg_price property)
+        downstream, blowing up PnL math with a $0 fill price. `is not None`
+        over `or`-fallback because Decimal('0') is falsy in Python.
+        """
+        ts = resp.get("transactTime") or resp.get("updateTime")
         outcome = LegOutcome(
             success=True,
             client_id=client_id,
             side=side,
             requested_qty=qty,
             status=_ASTER_STATUS_MAP.get(resp["status"], OrderStatus.UNKNOWN),
-            exchange_ts_ms=int(resp["transactTime"]) if resp.get("transactTime") else None,
+            exchange_ts_ms=int(ts) if ts else None,
         )
+        rest_filled = _dec(resp.get("executedQty"))
+        rest_avg = _dec(resp.get("avgPrice"))
         if (
             rest_filled is not None and rest_avg is not None
             and rest_filled > 0 and rest_avg > 0
         ):
             outcome.set_fill(rest_filled, rest_avg)
         return outcome
+
+    async def _try_recover_timed_out_order(
+        self,
+        market: MarketInfo,
+        side: Side,
+        qty: Decimal,
+        client_id: str,
+    ) -> LegOutcome | None:
+        """Call queryOrder after a 400/timeout from POST /order. Returns the
+        reconstructed outcome if the order is found at the venue, or None
+        if the lookup fails (treat as confirmed non-execution upstream).
+
+        A query that itself times out / errors is *not* re-interpreted —
+        we can't recurse indefinitely, and the WS-based position
+        reconciler in the strategy layer will catch any residual drift
+        on the next ACCOUNT_UPDATE.
+        """
+        try:
+            resp = await self.rest.query_order(
+                str(market.contract_id), orig_client_order_id=client_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            _log.warning(
+                "aster queryOrder lookup failed for cid=%s after place "
+                "timeout: %s (treating order as not executed)",
+                client_id, e,
+            )
+            return None
+        return self._build_outcome_from_order_resp(resp, side, qty, client_id)
 
     async def get_position(self, market: MarketInfo) -> Position:
         # Assumes the account is in one-way (non-hedge) position mode:
@@ -289,3 +351,12 @@ def _dec(v: object) -> Decimal | None:
     if v is None or v == "":
         return None
     return Decimal(str(v))
+
+
+def _is_aster_request_timeout(exc: BaseException) -> bool:
+    """Recognise aster's `400 ... "msg":"The request has timed out."`
+    server-side rejection. Matched by substring (`AsterRestError` carries
+    the verbatim response body); deliberately tolerant of formatting
+    variations like punctuation/casing the server might tweak."""
+    s = str(exc).lower()
+    return "400" in s and "timed out" in s
