@@ -318,8 +318,11 @@ class LighterUserWs:
 
     async def send_tx(self, tx_type: int, tx_info: str, *, timeout_s: float = 10.0) -> dict[str, Any]:
         """Sign locally, submit over WS, await the server's matching reply."""
-        # If the WS is mid-reconnect, wait for it to come back rather than fail.
-        await asyncio.wait_for(self._connected.wait(), timeout=timeout_s)
+        # Hot path: connected almost always set. Skip wait_for's TimerHandle +
+        # cancel-handler setup (~30-80µs) when we can; only pay it on the
+        # rare mid-reconnect window.
+        if not self._connected.is_set():
+            await asyncio.wait_for(self._connected.wait(), timeout=timeout_s)
         if self._ws is None:
             raise TxSubmitError("user WS not connected")
         req_id = f"pa-{uuid.uuid4().hex[:12]}-{int(time.time_ns())}"

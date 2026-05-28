@@ -8,15 +8,26 @@ Separates two concerns:
 
 from __future__ import annotations
 
+import atexit
 import csv
 import logging
+import queue
 import sys
 from datetime import UTC, datetime
 from decimal import Decimal
-from logging.handlers import RotatingFileHandler
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 from threading import Lock
 from typing import Any, TextIO
+
+_listener: QueueListener | None = None
+
+
+def _stop_listener() -> None:
+    global _listener
+    if _listener is not None:
+        _listener.stop()
+        _listener = None
 
 _DEFAULT_FORMAT = "%(asctime)s.%(msecs)03d %(levelname)-7s [%(name)s] %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
@@ -46,7 +57,15 @@ class RateLimited:
 
 
 def setup_logging(log_dir: Path, level: str = "INFO", run_tag: str = "run") -> Path:
-    """Install stderr + rotating-file handlers. Returns the log file path."""
+    """Install stderr + rotating-file handlers behind a QueueListener.
+
+    Hot-path callers (`_log.info(...)` during order firing) only enqueue
+    a LogRecord (~5µs); a background thread does the actual stderr + file
+    writes. Without this, every INFO line on the fire path blocks on two
+    synchronous write() syscalls (50-300µs each), and we sit right above
+    a real `ws.send`.
+    """
+    global _listener
 
     log_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -58,12 +77,12 @@ def setup_logging(log_dir: Path, level: str = "INFO", run_tag: str = "run") -> P
     # avoid duplicate handlers if setup_logging is called twice in the same process
     for h in list(root.handlers):
         root.removeHandler(h)
+    _stop_listener()
 
     fmt = logging.Formatter(_DEFAULT_FORMAT, datefmt=_DATE_FORMAT)
 
     sh = logging.StreamHandler(sys.stderr)
     sh.setFormatter(fmt)
-    root.addHandler(sh)
 
     # Rotating, not plain: a multi-day run that hits a reconnect / bad-frame
     # warning storm must not fill a small VPS disk (a full disk stalls the
@@ -72,7 +91,16 @@ def setup_logging(log_dir: Path, level: str = "INFO", run_tag: str = "run") -> P
         log_path, maxBytes=50 * 1024 * 1024, backupCount=5, encoding="utf-8",
     )
     fh.setFormatter(fmt)
-    root.addHandler(fh)
+
+    # Unbounded queue: a stalled listener thread should not drop log records
+    # silently. Memory bound is naturally enforced by the disk-side rotation
+    # (50 MB × 5) — a runaway log storm rotates files, it doesn't grow RAM.
+    log_queue: queue.Queue[Any] = queue.Queue(-1)
+    root.addHandler(QueueHandler(log_queue))
+
+    _listener = QueueListener(log_queue, sh, fh, respect_handler_level=False)
+    _listener.start()
+    atexit.register(_stop_listener)
 
     # silence noisy upstream libs unless we explicitly want their detail
     for noisy in ("websockets", "aiohttp", "lighter"):
