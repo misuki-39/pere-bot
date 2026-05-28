@@ -67,6 +67,15 @@ def _fail_outcome(side: Side, qty: Decimal, msg: str) -> LegOutcome:
     )
 
 
+class _CountingCidGen:
+    def __init__(self) -> None:
+        self._n = 9000
+
+    def next(self, *, side: Side) -> str:  # noqa: ARG002
+        self._n += 1
+        return str(self._n)
+
+
 @dataclass
 class _StubExchange:
     """Records every submit_and_await call so tests can assert on the
@@ -75,6 +84,9 @@ class _StubExchange:
     name: str
     submit_outcomes: list[LegOutcome] = field(default_factory=list)
     submit_calls: list[dict[str, Any]] = field(default_factory=list)
+    # Reconcile path asks the venue for a fresh cid via this generator
+    # (matches the real `BaseExchange.client_id_generator` contract).
+    client_id_generator: Any = field(default_factory=_CountingCidGen)
 
     def live_position(self, _market: MarketInfo) -> Position | None:
         return None

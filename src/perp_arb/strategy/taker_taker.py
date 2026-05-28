@@ -408,11 +408,14 @@ class TakerTakerArbitrage(BaseStrategy):
             qty = (qty // market.lot_size) * market.lot_size
             if qty < dust:
                 return True
-        # Reuse the executor's monotonic cid counter so the reconcile
-        # order is guaranteed unique across the run (cids are per-driver
-        # scoped; an old cid could collide if we rolled our own clock-
-        # based string and the bot restarts within a second).
-        cid = self._executor._next_cid()
+        # Reuse the venue's monotonic cid generator so the reconcile order
+        # is guaranteed unique across the run (cids are per-driver scoped;
+        # an old cid could collide if we rolled our own clock-based string
+        # and the bot restarts within a second). Reduce-only reconciles
+        # never consume pool slots — they request from the venue's own
+        # generator, which for a pool-backed lighter falls back to the
+        # underlying counter when slots are empty / not addressable.
+        cid = exchange.client_id_generator.next(side=side)
         _log.warning(
             "reconcile: rebalancing %s with %s %s (reduce_only)",
             exchange.name, side.value, qty,

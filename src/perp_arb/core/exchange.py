@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from decimal import Decimal
 
+from .client_id import ClientIdGenerator, CounterClientIdGenerator
 from .fill_tracker import _PerCidFillTracker
 from .types import (
     FillDelta,
@@ -44,6 +45,11 @@ class BaseExchange(ABC):
 
     def __init__(self) -> None:
         self._fill_tracker = _PerCidFillTracker()
+        # Default cid policy: monotonic epoch-seeded counter. Venues that
+        # pre-stage cids (e.g., lighter's pre-signed pool) swap this for a
+        # pool-backed generator after their state is ready — the executor
+        # never knows the difference.
+        self.client_id_generator: ClientIdGenerator = CounterClientIdGenerator()
 
     @abstractmethod
     async def connect(self) -> None: ...

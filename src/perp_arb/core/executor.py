@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -83,18 +82,14 @@ class TwoLegExecutor:
         self._is_paper = is_paper
         self.max_levels = max_levels
         self.fill_wait_timeout_s = fill_wait_timeout_s
-        # cid is a venue-protocol detail; the executor owns the counter.
-        # Both legs of a trade share a cid — each driver's `_fill_tracker`
-        # is per-driver, so the same string keys disjoint event spaces.
-        # Seed from epoch seconds (Lighter SDK's canonical pattern); cap
-        # is Lighter's `2^48 - 10`, so an epoch-seeded int is comfortably
-        # within range and monotonic across sessions.
-        self._cid_counter = cid_seed if cid_seed is not None else int(time.time())
-
-    def _next_cid(self) -> str:
-        cid = str(self._cid_counter)
-        self._cid_counter += 1
-        return cid
+        # cid policy lives on each `BaseExchange.client_id_generator`. Default
+        # is a monotonic, epoch-seeded counter (preserves the historical cid
+        # shape). Venues that pre-stage cids (lighter's pre-signed pool) swap
+        # in their own generator; the executor stays venue-agnostic.
+        if cid_seed is not None:
+            from .client_id import CounterClientIdGenerator
+            for ex in exchanges.values():
+                ex.client_id_generator = CounterClientIdGenerator(seed=cid_seed)
 
     async def execute(
         self,
@@ -111,8 +106,8 @@ class TwoLegExecutor:
         # cid because the first finishing leg's release_fill_slot would
         # wipe the second leg's accumulator mid-flight. Per-leg cids
         # cost one int and close that door.
-        cid_a = self._next_cid()
-        cid_b = self._next_cid()
+        cid_a = self.exchanges[a_intent.venue].client_id_generator.next(side=a_intent.side)
+        cid_b = self.exchanges[b_intent.venue].client_id_generator.next(side=b_intent.side)
 
         timeline.mark(Phase.SEND)
         send_ts_ms = now_ms()

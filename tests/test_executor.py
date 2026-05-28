@@ -174,11 +174,13 @@ async def test_both_legs_succeed_no_unwind() -> None:
     assert report.failure_reason is None
     assert [leg.kind for leg in report.legs] == [LegKind.ENTRY, LegKind.ENTRY]
     assert [leg.venue for leg in report.legs] == ["aster", "lighter"]
-    # executor allocates one cid per leg — defends against a future
-    # same-venue strategy where a shared cid would alias accumulator
-    # state and the first finishing leg's release would wipe the other.
+    # Each venue owns its `client_id_generator` (per-venue cid namespace),
+    # so cross-venue legs both start at the seeded value — that's safe
+    # because each driver's `_fill_tracker` is per-venue and keys won't
+    # collide. A same-venue two-leg fire would see distinct cids from the
+    # same counter (1000, 1001), which is what the original guard was for.
     assert aster.submit_calls[0]["client_id"] == str(_TEST_CID_SEED)
-    assert lighter.submit_calls[0]["client_id"] == str(_TEST_CID_SEED + 1)
+    assert lighter.submit_calls[0]["client_id"] == str(_TEST_CID_SEED)
     # send_ts_ms stamped onto each leg so the caller can derive its own record
     assert report.legs[0].send_ts_ms is not None and report.legs[0].send_ts_ms > 0
     # Cash-flow pair PnL: sell 100.05, buy 100.07, no fees → -0.02.
@@ -432,3 +434,41 @@ async def test_timeline_send_mark_set() -> None:
     )
 
     assert timeline.get(Phase.SEND) is not None
+
+
+# ---- per-venue client_id_generator delegation ---------------------------
+
+@pytest.mark.asyncio
+async def test_executor_delegates_cid_to_venue_generator() -> None:
+    """Executor must call each venue's `client_id_generator.next(side=...)`
+    rather than mint cids itself. A pool-backed venue would inject a custom
+    generator that returns its pre-staged COIs; this test verifies the
+    plumbing using a sentinel-returning fake."""
+
+    class _SentinelGen:
+        def next(self, *, side: Side) -> str:
+            return f"POOLED-{side.value}"
+
+    qty = Decimal("1.0")
+    aster = _StubExchange(
+        name="aster",
+        submit_outcome=_ok(side=Side.SELL, qty=qty, avg="100.05"),
+    )
+    lighter = _StubExchange(
+        name="lighter",
+        submit_outcome=_ok(side=Side.BUY, qty=qty, avg="100.07"),
+    )
+    # Pre-set generators; construct executor WITHOUT cid_seed so it doesn't
+    # overwrite them.
+    aster.client_id_generator = _SentinelGen()
+    lighter.client_id_generator = _SentinelGen()
+    ex = TwoLegExecutor(
+        {"leg_a": aster, "leg_b": lighter}, _MARKETS,
+        is_paper=False, max_levels=3,
+    )
+    await ex.execute(
+        trade_id="t-1", legs=_legs(), qty=qty, timeline=Timeline(),
+    )
+    # leg_a fires SELL on aster; leg_b fires BUY on lighter.
+    assert aster.submit_calls[0]["client_id"] == "POOLED-sell"
+    assert lighter.submit_calls[0]["client_id"] == "POOLED-buy"
