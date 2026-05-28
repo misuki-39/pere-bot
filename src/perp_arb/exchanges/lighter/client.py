@@ -72,6 +72,21 @@ class LighterClient(BaseExchange):
         self._signer: lighter.SignerClient | None = None
         self._user_ws: LighterUserWs | None = None
 
+        # Locally-managed nonce. `sign_create_order(nonce=-1)` (the SDK default)
+        # triggers a hidden HTTP fetch inside the Go signer on every call —
+        # measured at +8 ms p50 on a Tokyo VPS. We prefetch once at connect,
+        # pass explicit `nonce=` per sign, and refetch only on ambiguous
+        # send_tx outcomes. See scripts/bench_lighter_sign.py.
+        #
+        # Scope: nonce is per (account_index, api_key_index), NOT per account.
+        # Running multiple bots against the same (account, api_key) → constant
+        # nonce collisions (both fetch N, one wins, the other refetches N+1,
+        # repeat). To run N concurrent bots on one account, give each a
+        # distinct LIGHTER_API_KEY_INDEX — each api_key has its own monotonic
+        # nonce sequence on the server side.
+        self._next_nonce: int | None = None
+        self._nonce_lock = asyncio.Lock()
+
         self._meta_by_symbol: dict[str, _MarketMeta] = {}
         self._symbol_by_market_index: dict[int, str] = {}
         self._public_ws_by_symbol: dict[str, LighterPublicWs] = {}
@@ -99,6 +114,7 @@ class LighterClient(BaseExchange):
         err = self._signer.check_client()
         if err is not None:
             raise RuntimeError(f"lighter signer check_client failed: {err}")
+        self._next_nonce = await self._fetch_nonce()
         self._user_ws = LighterUserWs(
             base_url=self.base_url,
             account_index=self.account_index,
@@ -227,40 +243,65 @@ class LighterClient(BaseExchange):
         # to match the slot we registered. Max is Lighter's `2^48 - 10`.
         coi = int(client_id)
 
-        tx_type, tx_info, _tx_hash, err = self._signer.sign_create_order(
-            market_index=meta.market_index,
-            client_order_index=coi,
-            base_amount=base_amount,
-            price=avg_price_int,
-            is_ask=int(is_ask),
-            order_type=self._signer.ORDER_TYPE_MARKET,
-            time_in_force=self._signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-            reduce_only=int(reduce_only),
-            order_expiry=self._signer.DEFAULT_IOC_EXPIRY,
-            api_key_index=self.api_key_index,
-        )
-        if err is not None:
-            return LegOutcome(
-                success=False, client_id=client_id, side=side,
-                requested_qty=qty, error_message=f"sign: {err}",
-            )
+        # Hold the nonce lock across sign + send so the (nonce → sign → send →
+        # advance/refetch) sequence is atomic. The strategy is already
+        # single-flight per fire, so serialising the network round-trip here
+        # costs nothing in practice and removes a whole class of nonce-skew
+        # bugs. Revisit if Step-2 multi-key pool introduces real concurrency.
+        async with self._nonce_lock:
+            if self._next_nonce is None:
+                self._next_nonce = await self._fetch_nonce()
+            nonce_for_this = self._next_nonce
 
-        # SDK type stub declares tx_type as `str | None`, but the runtime
-        # value (when `err is None`) is the L2-tx-type int constant our
-        # `send_tx` serializes — cast at the boundary.
-        try:
-            reply = await self._user_ws.send_tx(cast(int, tx_type), cast(str, tx_info))
-        except (TimeoutError, TxSubmitError) as e:
-            return LegOutcome(
-                success=False, client_id=client_id, side=side,
-                requested_qty=qty, error_message=str(e),
+            tx_type, tx_info, _tx_hash, err = self._signer.sign_create_order(
+                market_index=meta.market_index,
+                client_order_index=coi,
+                base_amount=base_amount,
+                price=avg_price_int,
+                is_ask=int(is_ask),
+                order_type=self._signer.ORDER_TYPE_MARKET,
+                time_in_force=self._signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                reduce_only=int(reduce_only),
+                order_expiry=self._signer.DEFAULT_IOC_EXPIRY,
+                nonce=nonce_for_this,
+                api_key_index=self.api_key_index,
             )
-        ok, err_msg = _sendtx_outcome(reply)
-        if not ok:
-            return LegOutcome(
-                success=False, client_id=client_id, side=side,
-                requested_qty=qty, error_message=err_msg,
-            )
+            if err is not None:
+                # Sign is purely local — server never saw this nonce. Keep
+                # `_next_nonce` as-is so the same value gets reused next call.
+                return LegOutcome(
+                    success=False, client_id=client_id, side=side,
+                    requested_qty=qty, error_message=f"sign: {err}",
+                )
+
+            # SDK type stub declares tx_type as `str | None`, but the runtime
+            # value (when `err is None`) is the L2-tx-type int constant our
+            # `send_tx` serializes — cast at the boundary.
+            try:
+                reply = await self._user_ws.send_tx(cast(int, tx_type), cast(str, tx_info))
+            except (TimeoutError, TxSubmitError) as e:
+                # Outcome ambiguous — the tx may or may not have reached the
+                # server. Refetch on the next call to resync with whatever
+                # the server actually believes.
+                self._next_nonce = None
+                return LegOutcome(
+                    success=False, client_id=client_id, side=side,
+                    requested_qty=qty, error_message=str(e),
+                )
+            ok, err_msg = _sendtx_outcome(reply)
+            if not ok:
+                # Server rejected. Could be nonce-related or a business error
+                # (insufficient margin etc.). Either way the safe move is to
+                # refetch — Lighter's SDK does the same on "invalid nonce".
+                self._next_nonce = None
+                return LegOutcome(
+                    success=False, client_id=client_id, side=side,
+                    requested_qty=qty, error_message=err_msg,
+                )
+
+            # Server accepted → nonce consumed → advance.
+            self._next_nonce = nonce_for_this + 1
+
         # Lighter sendtx returns no fill data — the fill arrives later via
         # the account_market WS stream; `submit_and_await` overlays it.
         return LegOutcome(
@@ -303,6 +344,16 @@ class LighterClient(BaseExchange):
                 configuration=lighter.Configuration(host=self.base_url),
             )
         return self._api_client
+
+    async def _fetch_nonce(self) -> int:
+        """Pull the server's expected next nonce for our (account, api_key)."""
+        api = await self._ensure_api()
+        tx_api = lighter.TransactionApi(api)
+        resp = await tx_api.next_nonce(
+            account_index=self.account_index,
+            api_key_index=self.api_key_index,
+        )
+        return int(resp.nonce)
 
     def _on_market_event(self, payload: dict[str, Any]) -> None:
         """`subscribed/account_market` (snapshot) / `update/account_market`
