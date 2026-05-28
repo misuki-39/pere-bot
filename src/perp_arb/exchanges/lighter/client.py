@@ -18,6 +18,7 @@ from typing import Any, cast
 
 import lighter
 
+from ...core.client_id import CounterClientIdGenerator
 from ...core.exchange import (
     BaseExchange,
     OrderBookCallback,
@@ -36,6 +37,7 @@ from ...core.types import (
     Side,
     Symbol,
 )
+from .presign_pool import LighterPreSignedPool, PreSignedPoolClientIdGenerator
 from .ws import LighterPublicWs, LighterUserWs, TxSubmitError
 
 _log = logging.getLogger(__name__)
@@ -95,6 +97,11 @@ class LighterClient(BaseExchange):
         self._position_cbs: defaultdict[str, list[PositionCallback]] = defaultdict(list)
         self._live_positions: dict[str, Position] = {}
 
+        # Pre-signed pool — set up by `enable_presign_pool` after `load_market`
+        # so we know the market metadata and the strategy's fixed qty. None ⇒
+        # warm path disabled, place_market_order always cold-signs.
+        self._presign_pool: LighterPreSignedPool | None = None
+
     # ---- lifecycle ----
 
     async def connect(self) -> None:
@@ -132,6 +139,14 @@ class LighterClient(BaseExchange):
         return token
 
     async def disconnect(self) -> None:
+        # Stop the pool first — it holds references to the signer + WS;
+        # its background tasks could race signer.close otherwise.
+        if self._presign_pool is not None:
+            await self._presign_pool.stop()
+            self._presign_pool = None
+            # Restore the default counter generator so subsequent connects
+            # (in tests) don't hold a stale pool reference.
+            self.client_id_generator = CounterClientIdGenerator()
         for ws in self._public_ws_by_symbol.values():
             await ws.stop()
         if self._user_ws is not None:
@@ -145,6 +160,57 @@ class LighterClient(BaseExchange):
             with contextlib.suppress(Exception):
                 await self._api_client.close()
             self._api_client = None
+
+    async def enable_presign_pool(
+        self,
+        market: MarketInfo,
+        *,
+        qty: Decimal,
+        refresh_interval_s: float,
+        drift_threshold_bps: Decimal,
+    ) -> None:
+        """Spin up the pre-signed order pool for `market` with strategy's
+        fixed `qty`. Called by the builder after `load_market`; idempotent.
+
+        Hooks the pool's quote callback into the public WS so live BBO
+        updates drive drift-triggered refreshes. Swaps the client's
+        `client_id_generator` so the executor's `cid_a/cid_b` pull from
+        the pool's staged slots — pool's cold-sign fallback (when slots
+        are empty) is wrapped behind the prior counter generator.
+        """
+        assert self._signer is not None, "connect() must run before enable_presign_pool"
+        if self._presign_pool is not None:
+            return  # idempotent
+        meta = self._meta_by_symbol[market.symbol.raw]
+        public_ws = self._ensure_public_ws(market)
+        self._presign_pool = LighterPreSignedPool(
+            signer=self._signer,
+            market_index=meta.market_index,
+            price_multiplier=meta.price_multiplier,
+            base_multiplier=meta.base_multiplier,
+            api_key_index=self.api_key_index,
+            qty=qty,
+            get_quote=lambda: public_ws.last_quote,
+            nonce_borrower=self._borrow_nonce,
+            refresh_interval_s=refresh_interval_s,
+            drift_threshold_bps=drift_threshold_bps,
+        )
+        public_ws.add_quote_callback(self._presign_pool.on_quote)
+        await self._presign_pool.start()
+        self.client_id_generator = PreSignedPoolClientIdGenerator(
+            pool=self._presign_pool,
+            fallback=self.client_id_generator,
+        )
+
+    async def _borrow_nonce(self) -> int:
+        """Returns the current expected nonce (refetches from server if
+        invalidated). Does NOT advance — only `place_market_order`'s
+        success path advances. Used by the pool to sign without
+        consuming."""
+        async with self._nonce_lock:
+            if self._next_nonce is None:
+                self._next_nonce = await self._fetch_nonce()
+            return self._next_nonce
 
     # ---- markets / data ----
 
@@ -243,36 +309,52 @@ class LighterClient(BaseExchange):
         # to match the slot we registered. Max is Lighter's `2^48 - 10`.
         coi = int(client_id)
 
+        # Warm path: pool already signed a tx for this (side, coi) — skip
+        # `sign_create_order` and ship the cached payload. The pool also
+        # invalidates the sibling slot (its nonce is about to be eaten by
+        # this fire) and schedules a background re-sign at the new nonce.
+        # Reduce-only fires bypass the pool — slots are entry-direction
+        # only, and unwind paths are rare enough that cold-sign is fine.
+        slot = (
+            self._presign_pool.pop_for_fire(side, client_id)
+            if (self._presign_pool is not None and not reduce_only)
+            else None
+        )
+
         # Hold the nonce lock across sign + send so the (nonce → sign → send →
         # advance/refetch) sequence is atomic. The strategy is already
         # single-flight per fire, so serialising the network round-trip here
         # costs nothing in practice and removes a whole class of nonce-skew
-        # bugs. Revisit if Step-2 multi-key pool introduces real concurrency.
+        # bugs.
         async with self._nonce_lock:
-            if self._next_nonce is None:
-                self._next_nonce = await self._fetch_nonce()
-            nonce_for_this = self._next_nonce
-
-            tx_type, tx_info, _tx_hash, err = self._signer.sign_create_order(
-                market_index=meta.market_index,
-                client_order_index=coi,
-                base_amount=base_amount,
-                price=avg_price_int,
-                is_ask=int(is_ask),
-                order_type=self._signer.ORDER_TYPE_MARKET,
-                time_in_force=self._signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
-                reduce_only=int(reduce_only),
-                order_expiry=self._signer.DEFAULT_IOC_EXPIRY,
-                nonce=nonce_for_this,
-                api_key_index=self.api_key_index,
-            )
-            if err is not None:
-                # Sign is purely local — server never saw this nonce. Keep
-                # `_next_nonce` as-is so the same value gets reused next call.
-                return LegOutcome(
-                    success=False, client_id=client_id, side=side,
-                    requested_qty=qty, error_message=f"sign: {err}",
+            if slot is not None:
+                tx_type: int | str | None = slot.tx_type
+                tx_info: str | None = slot.tx_info
+                nonce_for_this = slot.nonce
+            else:
+                if self._next_nonce is None:
+                    self._next_nonce = await self._fetch_nonce()
+                nonce_for_this = self._next_nonce
+                tx_type, tx_info, _tx_hash, err = self._signer.sign_create_order(
+                    market_index=meta.market_index,
+                    client_order_index=coi,
+                    base_amount=base_amount,
+                    price=avg_price_int,
+                    is_ask=int(is_ask),
+                    order_type=self._signer.ORDER_TYPE_MARKET,
+                    time_in_force=self._signer.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                    reduce_only=int(reduce_only),
+                    order_expiry=self._signer.DEFAULT_IOC_EXPIRY,
+                    nonce=nonce_for_this,
+                    api_key_index=self.api_key_index,
                 )
+                if err is not None:
+                    # Sign is purely local — server never saw this nonce. Keep
+                    # `_next_nonce` as-is so the same value gets reused next call.
+                    return LegOutcome(
+                        success=False, client_id=client_id, side=side,
+                        requested_qty=qty, error_message=f"sign: {err}",
+                    )
 
             # SDK type stub declares tx_type as `str | None`, but the runtime
             # value (when `err is None`) is the L2-tx-type int constant our
