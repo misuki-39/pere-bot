@@ -21,6 +21,7 @@ from .core.logging import setup_logging
 from .core.session import LiveSession, PaperSession, Session
 from .core.types import MarketInfo
 from .exchanges.factory import build_exchanges, required_legs
+from .exchanges.lighter.client import LighterClient
 from .strategy.base import BaseStrategy
 from .strategy.spread_monitor import SpreadMonitor
 from .strategy.taker_taker import TakerTakerArbitrage
@@ -63,6 +64,39 @@ def _build_strategy(
     return cls(cfg, exchanges, markets, session)
 
 
+async def _maybe_enable_lighter_presign_pool(
+    cfg: AppCfg,
+    exchanges: dict[str, BaseExchange],
+    markets: dict[str, MarketInfo],
+) -> None:
+    """If the optimisation is enabled in config AND the strategy actually
+    binds a lighter leg, spin up the pre-signed pool on that LighterClient
+    after its market is loaded. No-op for spread_monitor / non-lighter pairs
+    / paper sessions running without a signer.
+    """
+    pool_cfg = cfg.strategy.optimisations.lighter_presign_pool
+    if not pool_cfg.enabled:
+        return
+    for leg, ex in exchanges.items():
+        if not isinstance(ex, LighterClient):
+            continue
+        # public_only LighterClient (paper without creds) has no signer —
+        # the pool would have nothing to sign with. Skip silently.
+        if ex.public_only:
+            _log.info("lighter presign pool: skipped — leg=%s is public_only", leg)
+            continue
+        await ex.enable_presign_pool(
+            markets[leg],
+            qty=cfg.strategy.qty,
+            refresh_interval_s=pool_cfg.refresh_interval_s,
+            drift_threshold_bps=pool_cfg.drift_threshold_bps,
+        )
+        _log.info(
+            "lighter presign pool: enabled leg=%s refresh=%.0fs drift_threshold=%sbps",
+            leg, pool_cfg.refresh_interval_s, pool_cfg.drift_threshold_bps,
+        )
+
+
 async def _async_main(cfg: AppCfg) -> int:
     setup_logging(cfg.runtime.log_dir, cfg.runtime.log_level, run_tag=cfg.strategy.strategy)
     _log.info(
@@ -93,6 +127,8 @@ async def _async_main(cfg: AppCfg) -> int:
                 "market resolved: %s (%s)=%s tick=%s lot=%s",
                 leg, exchanges[leg].name, m.symbol.raw, m.tick_size, m.lot_size,
             )
+
+        await _maybe_enable_lighter_presign_pool(cfg, exchanges, markets)
 
         strategy = _build_strategy(cfg, exchanges, markets, session)
 

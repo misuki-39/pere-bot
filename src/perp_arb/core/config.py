@@ -65,6 +65,12 @@ class PersistenceConfirmCfg(BaseModel):
     drift_max_bps: Decimal = Decimal("1.0")
 
 
+class LighterPreSignPoolCfg(BaseModel):
+    enabled: bool = False
+    refresh_interval_s: float = Field(default=240.0, gt=0)
+    drift_threshold_bps: Decimal = Field(default=Decimal("200"), gt=0)
+
+
 class OptimisationsCfg(BaseModel):
     """Wave-1 optional knobs. All default-off = identical pre-Wave-1 behaviour.
 
@@ -109,6 +115,15 @@ class OptimisationsCfg(BaseModel):
     # tool). See docs/inventory_skew_wti_2026-05-24.md.
     inventory_skew_bps: Decimal = Decimal("0")
     inventory_skew_close_bps: Decimal | None = None
+
+    # Lighter pre-signed order pool. Pre-signs both BUY and SELL with the
+    # same nonce, refreshes every `refresh_interval_s` OR when the remaining
+    # slippage buffer falls below `drift_threshold_bps` (worst price is set
+    # at ±5% of sign-time mid, i.e. 500 bps buffer; default trigger of 200
+    # bps means refresh after mid drifts ~300 bps). Disabled by default.
+    lighter_presign_pool: LighterPreSignPoolCfg = Field(
+        default_factory=LighterPreSignPoolCfg,
+    )
 
 
 class StrategyCfg(BaseModel):
