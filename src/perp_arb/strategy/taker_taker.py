@@ -128,7 +128,7 @@ class TakerTakerArbitrage(BaseStrategy):
         self._reconcile_target: tuple[Decimal, Decimal] | None = None
         self._risk = RiskManager(s.risk)
         self._last_heartbeat_ms = 0
-        self._heartbeat_interval_ms = 60_000  # liveness only; trades go to CSV
+        self._heartbeat_interval_ms = 300_000  # 5 min; liveness only, trades go to CSV
         self._risk_blocked = False
         # parameters consumed by the pure decision function.
         # Wave-1 optimisations (throttle, cap) come from
