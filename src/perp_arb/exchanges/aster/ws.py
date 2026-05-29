@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 from collections.abc import Callable
 from decimal import Decimal
 
+import orjson
 import websockets
 
 from ...core.logging import RateLimited
@@ -122,7 +122,7 @@ class AsterPublicWs:
 
     def _handle(self, raw: str | bytes) -> None:
         # Combined-stream wraps as {"stream": "...", "data": {...depthUpdate...}}.
-        payload = json.loads(raw)["data"]
+        payload = orjson.loads(raw)["data"]
         ts_ms = int(payload["E"])
         # @depth<N> stream returns sides pre-sorted (bids desc, asks asc).
         bids = [BookLevel(Decimal(p), s) for p, q in payload["b"] if (s := Decimal(q)) > 0]
@@ -214,8 +214,8 @@ class AsterUserWs:
                         if self._stop.is_set():
                             break
                         try:
-                            data = json.loads(msg if isinstance(msg, str) else msg.decode())
-                        except json.JSONDecodeError:
+                            data = orjson.loads(msg)
+                        except orjson.JSONDecodeError:
                             continue
                         if data.get("e") == "listenKeyExpired":
                             _log.warning("aster listenKey expired; rotating")
