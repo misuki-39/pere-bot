@@ -84,11 +84,6 @@ class OptimisationsCfg(BaseModel):
     shrinks (κ_close). Default 0 / None = off. See
     docs/inventory_skew_wti_2026-05-24.md for BT-derived recommendations.
     """
-    # Per-(direction, edge-bucket) adverse-selection table built offline by
-    # `scripts/build_markout_table.py`. None ⇒ MarkoutTable.disabled().
-    # Path is relative to the cwd at runbot startup.
-    markout_table_path: Path | None = None
-
     # Same-direction threshold throttle. After each FILLED on direction X,
     # raise X's threshold by `throttle_bump_bps`; decay back over half-life
     # `throttle_halflife_s`. bump=0 disables.
@@ -160,13 +155,6 @@ class StrategyCfg(BaseModel):
     def _validate_sizes(self) -> StrategyCfg:
         if self.max_qty < self.qty:
             raise ValueError("max_qty must be >= qty")
-        # Fail fast if a markout table path is configured but missing — easier
-        # to debug at startup than at the first FIRED tick.
-        mp = self.optimisations.markout_table_path
-        if mp is not None and not Path(mp).exists():
-            raise ValueError(
-                f"optimisations.markout_table_path does not exist: {mp}"
-            )
         return self
 
 

@@ -2,7 +2,7 @@
 
 This is the *signal* layer: given depth-aware fill prices and the EWMA bias,
 it decides whether the bias-adjusted spread is beyond the entry threshold
-(fees + min-profit + optional markout / inventory-skew / throttle), picks a
+(fees + min-profit + optional inventory-skew / throttle), picks a
 direction, and builds a `Decision`. It is generic to a spread-reversion bet —
 it never computes fills and so makes no assumption about execution style; the
 caller supplies the fill prices (see `taker_fill_model.compute_taker_fills`).
@@ -27,7 +27,6 @@ from decimal import Decimal
 from ..core.exec_record import Decision, Direction, Outcome
 from ..core.types import Quote, Side
 from ..utils.precision import BPS
-from .markout import MarkoutTable
 from .taker_fill_model import FillAbort, TakerFills
 
 
@@ -36,9 +35,6 @@ class AssessParams:
     """Static decision parameters; build once per strategy instance.
 
     Optional tuning knobs (default-off = same behaviour as v0):
-      markout: per-direction adverse-selection table, subtracted from raw
-               edge before threshold check. `MarkoutTable.disabled()` is the
-               no-op default. See `strategy/markout.py`.
       inventory_skew_bps: κ in the AS-style threshold widener. Per unit of
                |position|/max_qty, raise the entry threshold by κ bps when
                the trade GROWS |position|, lower it by κ bps when it FLATTENS.
@@ -52,7 +48,6 @@ class AssessParams:
     min_profit_bps: Decimal
     max_stale_ms: int
     max_qty: Decimal
-    markout: MarkoutTable = MarkoutTable.disabled()
     inventory_skew_bps: Decimal = Decimal(0)
     inventory_skew_close_bps: Decimal | None = None
 
@@ -141,10 +136,6 @@ def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
 
     # Threshold contributors. All in bps; converted to price units below.
     fee_bps = p.fees_bps + p.min_profit_bps
-    raw_edge_A_bps = raw_edge_A / ref_mid * BPS
-    raw_edge_B_bps = raw_edge_B / ref_mid * BPS
-    markout_A_bps = p.markout.markout_bps(direction_a=True,  raw_edge_bps=raw_edge_A_bps)
-    markout_B_bps = p.markout.markout_bps(direction_a=False, raw_edge_bps=raw_edge_B_bps)
     kappa_close = (p.inventory_skew_close_bps
                    if p.inventory_skew_close_bps is not None
                    else p.inventory_skew_bps)
@@ -155,8 +146,8 @@ def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
         p.inventory_skew_bps, kappa_close, x.position_left,
         left_side(Direction.B).sign, p.max_qty)
 
-    total_thresh_A_bps = fee_bps + markout_A_bps + skew_A_bps + x.bump_a_bps
-    total_thresh_B_bps = fee_bps + markout_B_bps + skew_B_bps + x.bump_b_bps
+    total_thresh_A_bps = fee_bps + skew_A_bps + x.bump_a_bps
+    total_thresh_B_bps = fee_bps + skew_B_bps + x.bump_b_bps
 
     threshold_A = ref_mid * total_thresh_A_bps / BPS
     threshold_B = ref_mid * total_thresh_B_bps / BPS

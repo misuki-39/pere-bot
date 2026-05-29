@@ -130,7 +130,6 @@ def test_mode_override_replaces_yaml_mode(tmp_path: Path) -> None:
 def test_optimisations_defaults_when_block_absent() -> None:
     cfg = StrategyCfg.model_validate(yaml.safe_load(SAMPLE_YAML))
     opt = cfg.optimisations
-    assert opt.markout_table_path is None
     assert opt.throttle_bump_bps == Decimal("0")
     assert opt.throttle_halflife_s == 3.0
     assert opt.in_flight_cap_per_direction == 0
@@ -153,29 +152,17 @@ def test_optimisations_inventory_skew_round_trips() -> None:
     assert cfg.optimisations.inventory_skew_close_bps == Decimal("5")
 
 
-def test_optimisations_block_fully_populated(tmp_path: Path) -> None:
-    # write a fake markout JSON so the validator passes
-    table = tmp_path / "m.json"
-    table.write_text('{"direction_A":{"buckets":[]},"direction_B":{"buckets":[]}}')
+def test_optimisations_block_fully_populated() -> None:
     raw = yaml.safe_load(SAMPLE_YAML)
     raw["optimisations"] = {
-        "markout_table_path": str(table),
         "throttle_bump_bps": "2",
         "throttle_halflife_s": 5.0,
         "in_flight_cap_per_direction": 1,
     }
     cfg = StrategyCfg.model_validate(raw)
-    assert cfg.optimisations.markout_table_path == table
     assert cfg.optimisations.throttle_bump_bps == Decimal("2")
     assert cfg.optimisations.throttle_halflife_s == 5.0
     assert cfg.optimisations.in_flight_cap_per_direction == 1
-
-
-def test_optimisations_missing_markout_path_raises() -> None:
-    raw = yaml.safe_load(SAMPLE_YAML)
-    raw["optimisations"] = {"markout_table_path": "/tmp/__no_such_file__.json"}
-    with pytest.raises(ValueError, match="markout_table_path does not exist"):
-        StrategyCfg.model_validate(raw)
 
 
 def test_spread_monitor_config_still_validates_without_optimisations() -> None:
@@ -201,4 +188,4 @@ max_levels: 3
     cfg = StrategyCfg.model_validate(yaml.safe_load(sm_yaml))
     assert cfg.strategy == "spread_monitor"
     # default block fills in
-    assert cfg.optimisations.markout_table_path is None
+    assert cfg.optimisations.throttle_bump_bps == Decimal("0")

@@ -40,7 +40,6 @@ def _load_params(config_path: Path, override_qty: Decimal | None) -> StrategyPar
     raw = yaml.safe_load(config_path.read_text())
     qty = override_qty if override_qty is not None else Decimal(str(raw["qty"]))
     opt = raw.get("optimisations", {}) or {}
-    markout_path = opt.get("markout_table_path")
     pc = opt.get("persistence_confirm", {}) or {}
     persistence = PersistenceParams(
         enabled=bool(pc.get("enabled", False)),
@@ -57,7 +56,6 @@ def _load_params(config_path: Path, override_qty: Decimal | None) -> StrategyPar
         scale_halflife_s=float(raw.get("scale_halflife_s", 300)),
         warmup_seconds=float(raw.get("warmup_seconds", 180)),
         max_qty=Decimal(str(raw.get("max_qty", raw["qty"] * 100))),
-        markout_table_path=Path(markout_path) if markout_path else None,
         inventory_skew_bps=Decimal(str(opt.get("inventory_skew_bps", 0))),
         throttle_bump_bps=Decimal(str(opt.get("throttle_bump_bps", 0))),
         throttle_halflife_s=float(opt.get("throttle_halflife_s", 3.0)),

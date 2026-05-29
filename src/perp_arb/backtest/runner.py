@@ -9,7 +9,6 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from pathlib import Path
 
 from ..core.exec_record import ExecutionRecorder
 from ..strategy.persistence_gate import PersistenceParams
@@ -34,7 +33,6 @@ class StrategyParams:
     warmup_seconds: float
     max_qty: Decimal
     # Optional Wave-1 knobs. Default = legacy behaviour.
-    markout_table_path: Path | None = None
     inventory_skew_bps: Decimal = Decimal(0)
     inventory_skew_close_bps: Decimal | None = None
     throttle_bump_bps: Decimal = Decimal(0)
@@ -68,7 +66,6 @@ def build_context(
         right_venue=right_venue,
         fill_model=cfg.fill_model,
         recorder=recorder,
-        markout_table_path=params.markout_table_path,
         inventory_skew_bps=params.inventory_skew_bps,
         inventory_skew_close_bps=params.inventory_skew_close_bps,
         throttle_bump_bps=params.throttle_bump_bps,

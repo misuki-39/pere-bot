@@ -60,7 +60,6 @@ from ..core.types import LegKind, MarketInfo, Side
 from ..risk.manager import RiskManager
 from ..utils.time import now_ms
 from .base import BaseStrategy, SpreadModel, TimeEwma
-from .markout import MarkoutTable
 from .persistence_gate import PersistenceGate, PersistenceParams
 from .reversion_signal import (
     AssessInputs,
@@ -132,15 +131,10 @@ class TakerTakerArbitrage(BaseStrategy):
         self._heartbeat_interval_ms = 60_000  # liveness only; trades go to CSV
         self._risk_blocked = False
         # parameters consumed by the pure decision function.
-        # Wave-1 optimisations (markout, throttle, cap) come from
+        # Wave-1 optimisations (throttle, cap) come from
         # `s.optimisations` — defaults are all "off" so legacy configs that
         # omit the block keep their pre-Wave-1 behaviour.
         opt = s.optimisations
-        markout = (
-            MarkoutTable.from_json(opt.markout_table_path)
-            if opt.markout_table_path is not None
-            else MarkoutTable.disabled()
-        )
         self._fill_params = TakerFillParams(
             qty=Decimal(str(s.qty)),
             max_levels=s.max_levels,
@@ -151,7 +145,6 @@ class TakerTakerArbitrage(BaseStrategy):
             min_profit_bps=Decimal(str(s.min_profit_bps)),
             max_stale_ms=s.max_stale_ms,
             max_qty=Decimal(str(s.max_qty)),
-            markout=markout,
             inventory_skew_bps=Decimal(str(opt.inventory_skew_bps)),
             inventory_skew_close_bps=(
                 Decimal(str(opt.inventory_skew_close_bps))
@@ -205,11 +198,6 @@ class TakerTakerArbitrage(BaseStrategy):
             max_levels=s.max_levels,
         )
 
-        if markout.direction_A or markout.direction_B:
-            _log.info(
-                "markout enabled: %s",
-                markout.latency_label or "(unlabelled)",
-            )
         if self._throttle_enabled:
             _log.info(
                 "same-side throttle enabled: bump=%s bps halflife=%ss",

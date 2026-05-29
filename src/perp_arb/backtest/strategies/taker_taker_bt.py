@@ -16,7 +16,6 @@ from decimal import Decimal
 
 from ...core.exec_record import Direction, Outcome, Phase
 from ...strategy.base import SpreadModel, TimeEwma
-from ...strategy.markout import MarkoutTable
 from ...strategy.persistence_gate import PersistenceGate
 from ...strategy.reversion_signal import (
     AssessInputs,
@@ -41,11 +40,6 @@ class TakerTakerBT(BacktestStrategy):
             scale_half_life_s=ctx.scale_halflife_s,
             warmup_s=ctx.warmup_seconds,
         )
-        markout = (
-            MarkoutTable.from_json(ctx.markout_table_path)
-            if ctx.markout_table_path is not None
-            else MarkoutTable.disabled()
-        )
         self._fill_params = TakerFillParams(
             qty=ctx.capture_qty,
             max_levels=1,                      # BBO snapshot → one level
@@ -56,7 +50,6 @@ class TakerTakerBT(BacktestStrategy):
             min_profit_bps=ctx.min_profit_bps,
             max_stale_ms=ctx.max_stale_ms,
             max_qty=ctx.max_qty,
-            markout=markout,
             inventory_skew_bps=ctx.inventory_skew_bps,
             inventory_skew_close_bps=ctx.inventory_skew_close_bps,
         )

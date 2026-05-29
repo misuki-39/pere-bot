@@ -11,7 +11,6 @@ from decimal import Decimal
 from perp_arb.core.exec_record import Direction, Outcome
 from perp_arb.core.types import BookLevel, OrderBook, Quote, Symbol
 from perp_arb.strategy.base import SpreadModel, TimeEwma
-from perp_arb.strategy.markout import MarkoutTable, _Bucket
 from perp_arb.strategy.reversion_signal import (
     AssessInputs,
     AssessParams,
@@ -254,32 +253,6 @@ def _inputs(*, a_bid: str, a_ask: str, l_bid: str, l_ask: str,
         bump_a_bps=Decimal(bump_a_bps),
         bump_b_bps=Decimal(bump_b_bps),
     )
-
-
-def test_markout_subtraction_blocks_fire_just_above_fee_threshold() -> None:
-    """Without markout: a +1.5 bps edge with 1 bps fee fires.
-    With markout that bills another 1 bps for the 1-2 bps bucket: no fire."""
-    # left bid 100.015, right ask 100.000 → vwap_left_sell - vwap_right_buy = +0.015
-    # ref_mid ≈ 100.0075, so edge_A_bps ≈ +1.5 bps (clear above 1 bps fee)
-    inp = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000")
-
-    # Sanity: without markout, fires
-    p_off = _params()
-    d = assess_reversion(p_off, inp)
-    assert d is not None and d.outcome is Outcome.FIRED
-    assert d.direction is Direction.A
-
-    # With markout subtracting +1 bps on direction A in the 1-2 bps bucket → no fire
-    table = MarkoutTable(
-        direction_A=(_Bucket(Decimal("0"), Decimal("1"), Decimal("0")),
-                     _Bucket(Decimal("1"), Decimal("2"), Decimal("1.0")),
-                     _Bucket(Decimal("2"), Decimal("Infinity"), Decimal("0"))),
-        direction_B=(),
-        latency_label="test",
-    )
-    p_on = _params(markout=table)
-    d2 = assess_reversion(p_on, inp)
-    assert d2 is None, f"expected no fire, got {d2}"
 
 
 def test_bump_a_raises_threshold_for_direction_a_only() -> None:

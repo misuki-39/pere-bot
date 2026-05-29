@@ -16,7 +16,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from decimal import Decimal
-from pathlib import Path
 
 from ..core.exec_record import ExecutionRecorder
 from ..strategy.persistence_gate import PersistenceParams
@@ -48,7 +47,6 @@ class StrategyContext:
     recorder: ExecutionRecorder
     # Optional Wave-1 optimisation knobs. All default-off so the legacy
     # strategy behaviour is preserved when the YAML omits these fields.
-    markout_table_path: Path | None = None     # JSON from scripts/build_markout_table.py
     inventory_skew_bps: Decimal = Decimal(0)   # κ for AS-style threshold widener (open side)
     inventory_skew_close_bps: Decimal | None = None  # κ for the close side (None = symmetric)
     throttle_bump_bps: Decimal = Decimal(0)    # Δ added to same-direction threshold on FIRED
