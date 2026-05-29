@@ -146,10 +146,11 @@ class TwoLegExecutor:
         legs_out: list[LegOutcome] = [a_out, b_out]
         if a_out.success and b_out.success:
             _log.info(
-                "[%s] FILLED %s pnl=%s",
+                "[%s] FILLED %s pnl=%s %s",
                 trade_id,
                 _spread_log(a_intent, b_intent, a_out, b_out),
                 pair_pnl_from_legs(a_out, b_out),
+                _latency_log(a_out, b_out),
             )
             return ExecutionResult(legs=legs_out)
 
@@ -284,3 +285,14 @@ def _spread_log(
     ap_s = ap if a_intent.side is Side.SELL else -ap
     bp_s = bp if b_intent.side is Side.SELL else -bp
     return f"a={ap_s} b={bp_s} spread={ap_s + bp_s}"
+
+
+def _latency_log(a_out: LegOutcome, b_out: LegOutcome) -> str:
+    """Per-leg fill latency (fill_ts_ms - send_ts_ms) keyed by venue name,
+    e.g. 'lat_lighter=330ms lat_aster=180ms'. '?' when either timestamp
+    is missing (REST-only fallbacks, etc.)."""
+    def _lat(o: LegOutcome) -> str:
+        if o.fill_ts_ms is None or o.send_ts_ms is None:
+            return "?"
+        return f"{o.fill_ts_ms - o.send_ts_ms}ms"
+    return f"lat_{a_out.venue}={_lat(a_out)} lat_{b_out.venue}={_lat(b_out)}"
