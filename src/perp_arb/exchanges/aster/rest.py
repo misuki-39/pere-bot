@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from decimal import Decimal
 from typing import Any
 
@@ -35,22 +34,7 @@ class AsterRest:
 
     async def __aenter__(self) -> AsterRest:
         if self._session is None:
-            # DIAG (temp): wrap the connector to log every new TCP open.
-            # aiohttp only calls _wrap_create_connection on miss, so pooled
-            # reuses are silent — a `NEW-TCP` line means a real handshake
-            # happened on that REST call. Remove once the prewarm question
-            # is settled.
-            connector = aiohttp.TCPConnector()
-            _orig_wrap = connector._wrap_create_connection
-            async def _wrap_diag(*a: Any, **k: Any) -> Any:
-                t0 = time.perf_counter()
-                transport, proto = await _orig_wrap(*a, **k)
-                dt_ms = (time.perf_counter() - t0) * 1000
-                peer = transport.get_extra_info("peername")
-                _log.info("aster NEW-TCP peer=%s handshake_ms=%.1f", peer, dt_ms)
-                return transport, proto
-            connector._wrap_create_connection = _wrap_diag  # type: ignore[method-assign]
-            self._session = aiohttp.ClientSession(connector=connector, trust_env=True)
+            self._session = aiohttp.ClientSession(trust_env=True)
         return self
 
     async def __aexit__(self, *_: Any) -> None:
