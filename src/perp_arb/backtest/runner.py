@@ -35,7 +35,7 @@ class StrategyParams:
     max_qty: Decimal
     # Optional Wave-1 knobs. Default = legacy behaviour.
     inventory_skew_bps: Decimal = Decimal(0)
-    inventory_skew_close_bps: Decimal | None = None
+    inventory_skew_close_bps: Decimal = Decimal(0)
     in_flight_cap_per_direction: int = 0       # 0 = unlimited (current behaviour)
     persistence: PersistenceParams = PersistenceParams()   # edge-persistence gate
 

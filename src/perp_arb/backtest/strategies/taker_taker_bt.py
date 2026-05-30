@@ -19,8 +19,7 @@ from ...strategy.reversion_signal import (
     AssessInputs,
     AssessParams,
     assess_reversion,
-    left_side,
-    right_side,
+    leg_sides,
 )
 from ...strategy.taker_fill_model import TakerFillParams, compute_taker_fills
 from ..base import BacktestStrategy, EngineView
@@ -123,8 +122,7 @@ class TakerTakerBT(BacktestStrategy):
         if self._inflight_cap > 0:
             self._inflight_dir[d.decision_id] = d.direction
             self._inflight_legs[d.decision_id] = 2
-        l_side = left_side(d.direction)
-        r_side = right_side(d.direction)
+        l_side, r_side = leg_sides(d.direction)
         l_exp = d.vwap_left_sell  if l_side.value == "sell" else d.vwap_left_buy
         r_exp = d.vwap_right_sell if r_side.value == "sell" else d.vwap_right_buy
         intent_left = OrderIntent(

@@ -81,7 +81,7 @@ class OptimisationsCfg(BaseModel):
 
     `inventory_skew_bps` / `inventory_skew_close_bps` widen the entry
     threshold as |position| grows (κ_open) and narrow it as |position|
-    shrinks (κ_close). Default 0 / None = off. See
+    shrinks (κ_close). Both default 0 = off, each opt-in independently. See
     docs/inventory_skew_wti_2026-05-24.md for BT-derived recommendations.
     """
     # Per-direction in-flight cap. K=0 disables. K=1 = at most one outstanding
@@ -96,14 +96,14 @@ class OptimisationsCfg(BaseModel):
 
     # Avellaneda-Stoikov-style inventory skew (κ in bps per unit of
     # |position|/max_qty). κ_open raises the entry threshold when the trade
-    # GROWS |position|; κ_close lowers it when the trade FLATTENS. κ_open=0
-    # disables the widener entirely. κ_close=None recovers symmetric behaviour
-    # (uses κ_open for both sides); =0 disables exit-easing while keeping
-    # entry-tightening. BT-recommended on WTI: κ_open=15, κ_close=5
-    # (regime-conditional: +22% on drift, slight loss on calm — capacity-bound
-    # tool). See docs/inventory_skew_wti_2026-05-24.md.
+    # GROWS |position|; κ_close lowers it when the trade FLATTENS. Both default
+    # 0 = off and are opt-in independently: κ_open=0 disables entry-tightening,
+    # κ_close=0 disables exit-easing (set κ_close>0 to enable it; = κ_open gives
+    # symmetric AS). BT-recommended on WTI: κ_open=15, κ_close=5 (regime-
+    # conditional: +22% on drift, slight loss on calm — capacity-bound tool).
+    # See docs/inventory_skew_wti_2026-05-24.md.
     inventory_skew_bps: Decimal = Decimal("0")
-    inventory_skew_close_bps: Decimal | None = None
+    inventory_skew_close_bps: Decimal = Decimal("0")
 
     # Lighter pre-signed order pool. Pre-signs both BUY and SELL with the
     # same nonce, refreshes every `refresh_interval_s` OR when the remaining

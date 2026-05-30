@@ -43,9 +43,10 @@ class AssessParams:
                |position|/max_qty, raise the entry threshold by κ bps when
                the trade GROWS |position|, lower it by κ bps when it FLATTENS.
                κ=0 = current binary max_qty gate only.
-      inventory_skew_close_bps: optional separate κ for the FLATTEN side. None
-               (default) = symmetric (use `inventory_skew_bps` for both sides).
-               Set to 0 to disable exit-easing while keeping entry-tightening.
+      inventory_skew_close_bps: separate κ for the FLATTEN side. Default 0 =
+               no exit-easing — opt in independently of the open side by setting
+               it >0. Setting it equal to `inventory_skew_bps` recovers the
+               symmetric Avellaneda-Stoikov skew.
     """
     qty: Decimal
     fees_bps: Decimal
@@ -53,7 +54,7 @@ class AssessParams:
     max_stale_ms: int
     max_qty: Decimal
     inventory_skew_bps: Decimal = Decimal(0)
-    inventory_skew_close_bps: Decimal | None = None
+    inventory_skew_close_bps: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,14 +85,12 @@ class AssessInputs:
     position: Decimal
 
 
-def left_side(direction: Direction) -> Side:
-    """The side the left leg takes given the direction (execution layer)."""
-    return Side.SELL if direction.sign < 0 else Side.BUY
-
-
-def right_side(direction: Direction) -> Side:
-    """Right leg always hedges the left (offsetting taker-taker pair)."""
-    return left_side(direction).opposite
+def leg_sides(direction: Direction) -> tuple[Side, Side]:
+    """The `(left, right)` execution sides for this direction. The left leg
+    buys on a positive-sign direction and sells otherwise; the right leg always
+    hedges the left (offsetting taker-taker pair)."""
+    left = Side.SELL if direction.sign < 0 else Side.BUY
+    return left, left.opposite
 
 
 def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
@@ -145,14 +144,11 @@ def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
 
     # Threshold contributors. All in bps; converted to price units below.
     fee_bps = p.fees_bps + p.min_profit_bps
-    kappa_close = (p.inventory_skew_close_bps
-                   if p.inventory_skew_close_bps is not None
-                   else p.inventory_skew_bps)
     skew_A_bps = _inventory_skew_bps(
-        p.inventory_skew_bps, kappa_close, x.position,
+        p.inventory_skew_bps, p.inventory_skew_close_bps, x.position,
         Direction.A.sign, p.max_qty)
     skew_B_bps = _inventory_skew_bps(
-        p.inventory_skew_bps, kappa_close, x.position,
+        p.inventory_skew_bps, p.inventory_skew_close_bps, x.position,
         Direction.B.sign, p.max_qty)
 
     total_thresh_A_bps = fee_bps + skew_A_bps

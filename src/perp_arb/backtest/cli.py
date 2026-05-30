@@ -57,6 +57,7 @@ def _load_params(config_path: Path, override_qty: Decimal | None) -> StrategyPar
         warmup_seconds=float(raw.get("warmup_seconds", 180)),
         max_qty=Decimal(str(raw.get("max_qty", raw["qty"] * 100))),
         inventory_skew_bps=Decimal(str(opt.get("inventory_skew_bps", 0))),
+        inventory_skew_close_bps=Decimal(str(opt.get("inventory_skew_close_bps", 0))),
         in_flight_cap_per_direction=int(opt.get("in_flight_cap_per_direction", 0)),
         persistence=persistence,
     )

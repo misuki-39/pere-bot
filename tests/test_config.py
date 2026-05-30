@@ -131,10 +131,11 @@ def test_optimisations_defaults_when_block_absent() -> None:
     cfg = StrategyCfg.model_validate(yaml.safe_load(SAMPLE_YAML))
     opt = cfg.optimisations
     assert opt.in_flight_cap_per_direction == 0
-    # inventory skew default-off: κ_open=0 disables widener; κ_close=None
-    # means "symmetric — fall back to κ_open" rather than "explicitly 0".
+    # inventory skew default-off: each side opt-in independently. κ_open=0
+    # disables entry-tightening; κ_close=0 disables exit-easing (unset = 0,
+    # NOT a symmetric fall-back to κ_open).
     assert opt.inventory_skew_bps == Decimal("0")
-    assert opt.inventory_skew_close_bps is None
+    assert opt.inventory_skew_close_bps == Decimal("0")
 
 
 def test_optimisations_inventory_skew_round_trips() -> None:

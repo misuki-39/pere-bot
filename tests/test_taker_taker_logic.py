@@ -257,12 +257,13 @@ def test_inventory_skew_widens_growing_direction_narrows_flattening() -> None:
     """At position=+5 (half of max_qty=10), direction A (sells left → shrinks
     |pos|) should be EASIER, direction B (buys left → grows |pos|) HARDER.
 
-    With κ=2 bps and |pos|/max_qty=0.5, the skew is ±1 bps respectively.
+    With κ_open=κ_close=2 bps and |pos|/max_qty=0.5, the skew is ±1 bps. κ_close
+    is set explicitly — it defaults to 0 (no exit-easing).
     """
     # A +1.5 bps A-edge sits just above default fee.
     inp = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000",
                   pos="5")
-    p = _params(inventory_skew_bps=Decimal("2"))
+    p = _params(inventory_skew_bps=Decimal("2"), inventory_skew_close_bps=Decimal("2"))
     d = assess_reversion(p, inp)
     # A flattens → skew_A = +2 * (5 * -1) / 10 = -1 bps. Threshold drops; still fires.
     assert d is not None and d.outcome is Verdict.FIRED and d.direction is Direction.A
@@ -273,6 +274,21 @@ def test_inventory_skew_widens_growing_direction_narrows_flattening() -> None:
     d2 = assess_reversion(p, inp_short)
     # A grows → skew_A = +2 * (-5 * -1) / 10 = +1 bps. Effective threshold 2 bps > 1.5.
     assert d2 is None, "A should be blocked: growing |pos| and edge below skewed threshold"
+
+
+def test_inventory_skew_close_defaults_to_zero_no_exit_easing() -> None:
+    """κ_close defaults to 0: unset means NO exit-easing — a flattening trade
+    sees the base threshold, not a lowered one. Only an explicit κ_close>0 eases
+    the exit (it does NOT fall back to κ_open)."""
+    # +0.5 bps A-edge at pos=+5 (A flattens). Base fee threshold = 1 bps.
+    inp = _inputs(a_bid="100.005", a_ask="100.010", l_bid="100.000", l_ask="100.000",
+                  pos="5")
+    # κ_open set, κ_close defaulted (0): flatten side NOT eased → 0.5 < 1 → no fire.
+    assert assess_reversion(_params(inventory_skew_bps=Decimal("2")), inp) is None
+    # κ_close=2 eases the flatten threshold to ~0 → the same edge now fires.
+    d = assess_reversion(
+        _params(inventory_skew_bps=Decimal("2"), inventory_skew_close_bps=Decimal("2")), inp)
+    assert d is not None and d.outcome is Verdict.FIRED and d.direction is Direction.A
 
 
 def test_position_cap_returns_none_not_blocked_risk() -> None:

@@ -48,7 +48,7 @@ class StrategyContext:
     # Optional Wave-1 optimisation knobs. All default-off so the legacy
     # strategy behaviour is preserved when the YAML omits these fields.
     inventory_skew_bps: Decimal = Decimal(0)   # κ for AS-style threshold widener (open side)
-    inventory_skew_close_bps: Decimal | None = None  # κ for the close side (None = symmetric)
+    inventory_skew_close_bps: Decimal = Decimal(0)   # κ for the close side (0 = no exit-easing)
     in_flight_cap_per_direction: int = 0       # 0 = unlimited; K = at most K same-dir entries pending
     persistence: PersistenceParams = PersistenceParams()   # edge-persistence gate (off by default)
 

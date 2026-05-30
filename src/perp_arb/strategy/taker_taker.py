@@ -65,8 +65,7 @@ from .reversion_signal import (
     AssessInputs,
     AssessParams,
     assess_reversion,
-    left_side,
-    right_side,
+    leg_sides,
 )
 from .taker_fill_model import TakerFillParams, compute_taker_fills
 
@@ -146,11 +145,7 @@ class TakerTakerArbitrage(BaseStrategy):
             max_stale_ms=s.max_stale_ms,
             max_qty=Decimal(str(s.max_qty)),
             inventory_skew_bps=Decimal(str(opt.inventory_skew_bps)),
-            inventory_skew_close_bps=(
-                Decimal(str(opt.inventory_skew_close_bps))
-                if opt.inventory_skew_close_bps is not None
-                else None
-            ),
+            inventory_skew_close_bps=Decimal(str(opt.inventory_skew_close_bps)),
         )
 
         # Per-direction in-flight cap. K=0 disables. K=1 = at most one
@@ -202,18 +197,10 @@ class TakerTakerArbitrage(BaseStrategy):
                 "drift_max=%s bps",
                 pc.t_confirm_ms, pc.n_confirm, pc.drift_max_bps,
             )
-        if opt.inventory_skew_bps > 0 or (
-            opt.inventory_skew_close_bps is not None
-            and opt.inventory_skew_close_bps > 0
-        ):
-            close_repr = (
-                f"{opt.inventory_skew_close_bps}"
-                if opt.inventory_skew_close_bps is not None
-                else f"{opt.inventory_skew_bps} (symmetric)"
-            )
+        if opt.inventory_skew_bps > 0 or opt.inventory_skew_close_bps > 0:
             _log.info(
                 "inventory skew enabled: κ_open=%s bps κ_close=%s bps",
-                opt.inventory_skew_bps, close_repr,
+                opt.inventory_skew_bps, opt.inventory_skew_close_bps,
             )
 
     async def run(self) -> None:
@@ -594,7 +581,7 @@ class TakerTakerArbitrage(BaseStrategy):
         # the WS/overlay view. A decision-level fact → recorded on the trades row.
         pos_a_before = self._pos_a()
         d.position_before = pos_a_before
-        a_side, b_side = left_side(d.direction), right_side(d.direction)
+        a_side, b_side = leg_sides(d.direction)
         if d.direction is Direction.A:
             a_exp, b_exp = d.vwap_left_sell, d.vwap_right_buy
         else:
