@@ -47,12 +47,8 @@ def _leg(venue: str, side: Side, px: str) -> LegOutcome:
     lg.send_ts_ms = 1_700_000_000_500
     lg.last_ts_ms = 1_700_000_000_810
     lg.kind = LegKind.ENTRY
-    lg.bbo_bid = Decimal(px)
-    lg.bbo_ask = Decimal(px)
     lg.quote_ts_ms = 1_700_000_000_400
     lg.position_before = Decimal("0.24")
-    lg.bbo_bid_size = Decimal("5")
-    lg.bbo_ask_size = Decimal("7")
     return lg
 
 
@@ -123,14 +119,14 @@ async def test_turso_roundtrip(tmp_path):
 
             # legs: 2 rows; per-venue context lands losslessly as TEXT
             rs = await client.execute(
-                "SELECT venue, side, realized_price, position_before, bbo_bid_size "
+                "SELECT venue, side, realized_price, position_before, quote_ts_ms "
                 "FROM legs WHERE run_id=? ORDER BY venue", [run_id])
             assert len(rs.rows) == 2
             aster, lighter = rs.rows[0], rs.rows[1]
             assert aster[0] == "aster" and lighter[0] == "lighter"
             assert lighter[2] == "88.61"          # realized_price
             assert lighter[3] == "0.24"           # position_before
-            assert lighter[4] == "5"              # bbo_bid_size
+            assert lighter[4] == 1_700_000_000_400  # quote_ts_ms (INTEGER)
 
             # rejection: 1 row, no legs
             rs = await client.execute(

@@ -693,11 +693,9 @@ class TakerTakerArbitrage(BaseStrategy):
 
 def _stamp_leg_ctx(leg: LegOutcome, q: Quote, position_before: Decimal) -> None:
     """Attach a leg's decision-time per-venue context for the SQLite recorder.
-    Raw top-of-book prices + sizes come straight off the Quote — analysis
-    picks the touch by side (SELL→bid, BUY→ask) and can derive mid / spread."""
-    leg.bbo_bid = q.bid
-    leg.bbo_ask = q.ask
+    Only what `expected_price` can't carry: quote freshness (staleness
+    forensics) and the pre-fire position (entry vs reverse / inventory). The
+    book itself is not re-stamped — it was already folded into `expected_price`,
+    against which fill quality (`realized − expected`) is measured."""
     leg.quote_ts_ms = q.ts_ms
     leg.position_before = position_before
-    leg.bbo_bid_size = q.bid_size
-    leg.bbo_ask_size = q.ask_size

@@ -224,16 +224,14 @@ class LegOutcome:
     kind: LegKind | None = None
 
     # decision-time per-venue context — stamped by the live strategy after the
-    # execute() gather (the strategy owns the decision-time book/position; the
-    # executor does not see them). All None in backtest / CSV path; the live
-    # SQLite recorder reads them. Deliberately NOT in `_CSV_FIELDS` so the
+    # execute() gather (the executor does not see them). These carry what
+    # `expected_price` can't: execution quality is `realized vs expected_price`
+    # (both already recorded), so the book/BBO is NOT re-stored here — it was
+    # already folded into `expected_price`. All None in backtest / CSV path; the
+    # live SQLite recorder reads them. Deliberately NOT in `_CSV_FIELDS` so the
     # backtest legs CSV stays byte-for-byte unchanged.
-    bbo_bid: Decimal | None = None          # this venue's best bid at decision (SELL fills here)
-    bbo_ask: Decimal | None = None          # this venue's best ask at decision (BUY fills here)
-    quote_ts_ms: int | None = None          # this venue's quote freshness at decision
-    position_before: Decimal | None = None  # this venue's signed position pre-fire
-    bbo_bid_size: Decimal | None = None      # top-of-book bid size at decision
-    bbo_ask_size: Decimal | None = None      # top-of-book ask size at decision
+    quote_ts_ms: int | None = None          # this venue's quote freshness at decision (staleness forensics)
+    position_before: Decimal | None = None  # this venue's signed position pre-fire (entry vs reverse)
 
     def add(self, event: OrderSnapshot | FillDelta) -> None:
         """Absorb a WS event. `OrderSnapshot` (lighter cumulative state)

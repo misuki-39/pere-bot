@@ -75,9 +75,7 @@ _SCHEMA: dict[str, dict] = {
                  ("realized_price", "TEXT"), ("status", "TEXT"), ("success", "INTEGER"),
                  ("error_message", "TEXT"), ("client_id", "TEXT"), ("total_fee", "TEXT"),
                  ("send_ts_ms", "INTEGER"), ("fill_ts_ms", "INTEGER"), ("kind", "TEXT"),
-                 ("bbo_bid", "TEXT"), ("bbo_ask", "TEXT"), ("quote_ts_ms", "INTEGER"),
-                 ("position_before", "TEXT"),
-                 ("bbo_bid_size", "TEXT"), ("bbo_ask_size", "TEXT")),
+                 ("quote_ts_ms", "INTEGER"), ("position_before", "TEXT")),
         "unique": "decision_id, venue, kind",
     },
 }
@@ -231,9 +229,7 @@ class SqliteRecorder(Recorder):
             _txt(lg.avg_price), lg.status.value, int(lg.success), lg.error_message,
             lg.client_id, _txt(lg.total_fee), _int(lg.send_ts_ms), _int(lg.fill_ts_ms),
             lg.kind.value if lg.kind else None,
-            _txt(lg.bbo_bid), _txt(lg.bbo_ask), _int(lg.quote_ts_ms),
-            _txt(lg.position_before),
-            _txt(lg.bbo_bid_size), _txt(lg.bbo_ask_size),
+            _int(lg.quote_ts_ms), _txt(lg.position_before),
         )
 
     # ----- Turso sync (background) -----
