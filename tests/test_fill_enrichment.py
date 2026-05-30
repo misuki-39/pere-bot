@@ -388,8 +388,8 @@ def test_recorder_writes_send_ts_ms_to_csv(tmp_path: Path) -> None:
         last_ts_ms=1_700_000_000_050,
     )
     leg.set_fill(Decimal("1.0"), Decimal("100.05"))
-    d.legs.append(leg)
     rec.emit(d)
+    rec.emit_legs(d.decision_id, d.ts_ms, [leg])
     rec.close()
 
     decisions_csv = next(tmp_path.glob("decisions_*.csv")).read_text().splitlines()

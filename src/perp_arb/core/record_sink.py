@@ -30,6 +30,7 @@ import asyncio
 import contextlib
 import logging
 import sqlite3
+from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -178,14 +179,21 @@ class SqliteRecorder:
     # ----- write (hot path, synchronous) -----
 
     def emit(self, d: Decision) -> None:
-        """Route one Decision by outcome. FIRED → trades + legs; everything
-        else (ABORT_* / BLOCKED_RISK) → rejections. Synchronous local write."""
+        """Record one Decision header by outcome. FIRED → trades; everything
+        else (ABORT_* / BLOCKED_RISK) → rejections. Legs are recorded separately
+        via `emit_legs`. Synchronous local write."""
         if d.outcome is Verdict.FIRED:
             self._insert("trades", _cols("trades"), self._trade_row(d))
-            for leg in d.legs:
-                self._insert("legs", _cols("legs"), self._leg_row(d, leg))
         else:
             self._insert("rejections", _cols("rejections"), self._rejection_row(d))
+        self._conn.commit()
+
+    def emit_legs(self, decision_id: str, ts_ms: int, legs: Sequence[LegOutcome]) -> None:
+        """Record the per-leg execution detail for a fired trade. Separate from
+        `emit` (own commit) — a trade header with its legs briefly absent is a
+        harmless, detectable audit gap, not a corrupted trade."""
+        for leg in legs:
+            self._insert("legs", _cols("legs"), self._leg_row(decision_id, ts_ms, leg))
         self._conn.commit()
 
     def _insert(self, table: str, cols: tuple[str, ...], row: tuple) -> None:
@@ -202,10 +210,8 @@ class SqliteRecorder:
         )
 
     def _trade_row(self, d: Decision) -> tuple:
-        success = bool(d.legs) and all(lg.success for lg in d.legs)
-        failure = None if success else "; ".join(
-            f"{lg.venue}: {lg.error_message}" for lg in d.legs if not lg.success
-        ) or "no legs recorded"
+        success = d.failure_reason is None
+        failure = d.failure_reason
         return (
             self._run_id, d.decision_id, _int(d.ts_ms),
             d.direction.value if d.direction else None,
@@ -214,9 +220,9 @@ class SqliteRecorder:
             _txt(d.realised_pnl), int(success), failure, _txt(d.thr_throttle_bps),
         )
 
-    def _leg_row(self, d: Decision, lg: LegOutcome) -> tuple:
+    def _leg_row(self, decision_id: str, ts_ms: int, lg: LegOutcome) -> tuple:
         return (
-            self._run_id, d.decision_id, _int(d.ts_ms),
+            self._run_id, decision_id, _int(ts_ms),
             lg.venue, lg.side.value if lg.side else None, _txt(lg.requested_qty),
             _txt(lg.filled_qty if lg.success else None), _txt(lg.expected_price),
             _txt(lg.avg_price), lg.status.value, int(lg.success), lg.error_message,

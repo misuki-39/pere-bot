@@ -11,9 +11,9 @@ from perp_arb.core.exec_record import (
     Decision,
     Direction,
     ExecutionRecorder,
-    Verdict,
     Phase,
     Timeline,
+    Verdict,
     _decision_header,
     _leg_header,
 )
@@ -35,7 +35,7 @@ def test_timeline_span_none_until_both_marks(monkeypatch) -> None:
 
 def test_headers_are_derived_from_dataclasses() -> None:
     dh = _decision_header()
-    assert "timeline" not in dh and "legs" not in dh
+    assert "timeline" not in dh and "failure_reason" not in dh
     assert dh[:2] == ["decision_id", "ts_ms"]
     assert dh[-1] == "lat_decision_send_ms"
     assert "realised_pnl" in dh
@@ -86,8 +86,8 @@ def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkey
         send_ts_ms=1_700_000_000_000, last_ts_ms=1_700_000_000_330,
     )
     leg_b.set_fill(Decimal("0.6"), Decimal("100.038"))
-    d.legs = [leg_a, leg_b]
     rec.emit(d)
+    rec.emit_legs(d.decision_id, d.ts_ms, [leg_a, leg_b])
     rec.close()
 
     dec = _read(tmp_path / "decisions_taker_taker_TEST.csv")

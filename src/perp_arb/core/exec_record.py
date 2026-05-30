@@ -12,6 +12,7 @@ from the dataclass fields so header and row cannot drift.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -93,8 +94,11 @@ class Timeline:
 
 @dataclass
 class Decision:
-    """One evaluated opportunity. `outcome` is terminal; `legs` is populated
-    only when it FIRED."""
+    """One evaluated opportunity — the pre-trade decision record. `outcome` is
+    terminal. It carries no `LegOutcome`: execution legs are a post-trade result
+    (`ExecutionResult.legs`) recorded separately via the recorder's `emit_legs`;
+    only scalar result summaries (`realised_pnl`, `failure_reason`, `send_ts_ms`)
+    are stamped back onto the decision."""
 
     decision_id: str
     ts_ms: int
@@ -118,18 +122,23 @@ class Decision:
     # Cash-flow realized PnL for this two-leg trade, net of fees. None on
     # non-FIRED outcomes or partial-failure unwinds (success=False).
     realised_pnl: Decimal | None = None
+    # Executor's failure narrative for a fired trade (None = all legs filled).
+    # The live SQLite `trades` row's success/failure_reason derive from this —
+    # the result summary, sourced from `ExecutionResult.failure_reason`, not the
+    # legs. Like `thr_throttle_bps`: live-SQLite-only, kept out of the CSV.
+    failure_reason: str | None = None
     # Same-direction throttle bump applied to the chosen direction's threshold
     # (bps). The only threshold component that is path-dependent and so cannot
     # be reconstructed post-hoc — the live SQLite recorder persists it on the
     # `trades` row. Excluded from the CSV projection (backtest stays unchanged).
     thr_throttle_bps: Decimal = Decimal(0)
     timeline: Timeline = field(default_factory=Timeline)
-    legs: list[LegOutcome] = field(default_factory=list)
 
 
-# `thr_throttle_bps` is live-SQLite-only telemetry; keep it out of the CSV
-# projection so the backtest decisions CSV header/rows are byte-for-byte stable.
-_DECISION_SKIP = {"timeline", "legs", "thr_throttle_bps"}
+# These fields are live-SQLite-only telemetry (or non-serialisable); keep them
+# out of the CSV projection so the backtest decisions CSV header/rows are
+# byte-for-byte stable.
+_DECISION_SKIP = {"timeline", "thr_throttle_bps", "failure_reason"}
 
 
 def _decision_header() -> list[str]:
@@ -142,8 +151,9 @@ def _leg_header() -> list[str]:
 
 
 class ExecutionRecorder:
-    """Single sink. `emit(decision)` writes one decisions row + one legs row
-    per leg. The only place the strategy's telemetry reaches disk."""
+    """Backtest CSV sink. `emit(decision)` writes the decisions row; `emit_legs`
+    writes one legs row per leg. The only place the strategy's telemetry reaches
+    disk in backtest."""
 
     def __init__(
         self,
@@ -169,8 +179,10 @@ class ExecutionRecorder:
         row["edge_bps"] = d.edge_bps.quantize(Decimal("0.1"))
         row["bias"] = _quantize_to_price_scale(d.bias, d.mid_left)
         self._dec.write([row[h] for h in self._dec.header])
-        for leg in d.legs:
-            self._legs.write([d.decision_id, d.ts_ms, *leg.to_csv_row()])
+
+    def emit_legs(self, decision_id: str, ts_ms: int, legs: Sequence[LegOutcome]) -> None:
+        for leg in legs:
+            self._legs.write([decision_id, ts_ms, *leg.to_csv_row()])
 
     def close(self) -> None:
         self._dec.close()

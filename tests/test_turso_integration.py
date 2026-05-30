@@ -55,7 +55,7 @@ def _leg(venue: str, side: Side, px: str) -> LegOutcome:
     return lg
 
 
-def _fired(run_id: str) -> Decision:
+def _fired(run_id: str) -> tuple[Decision, list[LegOutcome]]:
     tl = Timeline()
     tl.mark_at(Phase.DECISION, 100)
     tl.mark_at(Phase.SEND, 102)
@@ -66,9 +66,9 @@ def _fired(run_id: str) -> Decision:
         edge_bps=Decimal("1.94"), direction=Direction.B, outcome=Verdict.FIRED,
         timeline=tl, thr_throttle_bps=Decimal("0.5"),
     )
-    d.legs = [_leg("lighter", Side.BUY, "88.61"), _leg("aster", Side.SELL, "88.63")]
-    d.send_ts_ms = d.legs[0].send_ts_ms
-    return d
+    legs = [_leg("lighter", Side.BUY, "88.61"), _leg("aster", Side.SELL, "88.63")]
+    d.send_ts_ms = legs[0].send_ts_ms
+    return d, legs
 
 
 def _reject(run_id: str) -> Decision:
@@ -101,7 +101,9 @@ async def test_turso_roundtrip(tmp_path):
                          config_json='{"qty": "0.12"}', turso=cfg)
     await rec.start()
     try:
-        rec.emit(_fired(run_id))
+        fired_d, fired_legs = _fired(run_id)
+        rec.emit(fired_d)
+        rec.emit_legs(fired_d.decision_id, fired_d.ts_ms, fired_legs)
         rec.emit(_reject(run_id))
         await rec._push_all()  # deterministic: remote DDL bootstrap + push
 

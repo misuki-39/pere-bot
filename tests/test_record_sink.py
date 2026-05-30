@@ -12,7 +12,7 @@ import sqlite3
 from decimal import Decimal
 
 from perp_arb.core.config import TursoCfg
-from perp_arb.core.exec_record import Decision, Direction, Verdict, Phase, Timeline
+from perp_arb.core.exec_record import Decision, Direction, Phase, Timeline, Verdict
 from perp_arb.core.record_sink import SqliteRecorder
 from perp_arb.core.types import LegKind, LegOutcome, OrderStatus, Side
 
@@ -52,7 +52,7 @@ def _leg(venue: str, side: Side, *, success=True, error=None) -> LegOutcome:
     return lg
 
 
-def _decision(outcome: Verdict, *, did="d-1", legs=None) -> Decision:
+def _decision(outcome: Verdict, *, did="d-1", legs=None, failure_reason=None) -> Decision:
     tl = Timeline()
     tl.mark_at(Phase.DECISION, 100)
     tl.mark_at(Phase.SEND, 101)
@@ -64,11 +64,17 @@ def _decision(outcome: Verdict, *, did="d-1", legs=None) -> Decision:
         direction=Direction.B if outcome is Verdict.FIRED else None,
         outcome=outcome, timeline=tl,
         thr_throttle_bps=Decimal("0.5"),
+        failure_reason=failure_reason,
     )
     if legs is not None:
-        d.legs = legs
         d.send_ts_ms = legs[0].send_ts_ms
     return d
+
+
+def _emit_fired(rec, d, legs) -> None:
+    """Helper: a fired trade records its header then its legs (two writes)."""
+    rec.emit(d)
+    rec.emit_legs(d.decision_id, d.ts_ms, legs)
 
 
 def _rows(tmp_path, table: str) -> list[sqlite3.Row]:
@@ -86,7 +92,7 @@ def _rows(tmp_path, table: str) -> list[sqlite3.Row]:
 def test_fired_routes_to_trades_and_legs(tmp_path):
     rec = _recorder(tmp_path)
     legs = [_leg("lighter", Side.BUY), _leg("aster", Side.SELL)]
-    rec.emit(_decision(Verdict.FIRED, legs=legs))
+    _emit_fired(rec, _decision(Verdict.FIRED, legs=legs), legs)
     trades, legrows, rejs = (_rows(tmp_path, t) for t in ("trades", "legs", "rejections"))
     assert len(trades) == 1 and len(legrows) == 2 and len(rejs) == 0
     t = trades[0]
@@ -118,7 +124,8 @@ def test_partial_failure_routes_to_trades_with_failure(tmp_path):
     rec = _recorder(tmp_path)
     legs = [_leg("lighter", Side.BUY),
             _leg("aster", Side.SELL, success=False, error="timeout")]
-    rec.emit(_decision(Verdict.FIRED, legs=legs))
+    d = _decision(Verdict.FIRED, legs=legs, failure_reason="aster: timeout")
+    _emit_fired(rec, d, legs)
     trades, legrows = _rows(tmp_path, "trades"), _rows(tmp_path, "legs")
     assert len(trades) == 1 and len(legrows) == 2
     assert trades[0]["success"] == 0
@@ -131,8 +138,8 @@ def test_partial_failure_routes_to_trades_with_failure(tmp_path):
 def test_idempotent_on_duplicate_decision_id(tmp_path):
     rec = _recorder(tmp_path)
     legs = [_leg("lighter", Side.BUY), _leg("aster", Side.SELL)]
-    rec.emit(_decision(Verdict.FIRED, legs=legs))
-    rec.emit(_decision(Verdict.FIRED, legs=legs))  # same decision_id -> ignored
+    _emit_fired(rec, _decision(Verdict.FIRED, legs=legs), legs)
+    _emit_fired(rec, _decision(Verdict.FIRED, legs=legs), legs)  # same decision_id -> ignored
     assert len(_rows(tmp_path, "trades")) == 1
     assert len(_rows(tmp_path, "legs")) == 2
 

@@ -25,9 +25,9 @@ import pytest
 from perp_arb.core.exec_record import (
     Decision,
     Direction,
-    Verdict,
     Phase,
     Timeline,
+    Verdict,
 )
 from perp_arb.core.executor import ExecutionResult
 from perp_arb.core.types import (

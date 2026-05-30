@@ -160,6 +160,10 @@ class Engine:
         }
         self.in_flight: dict[str, Decision] = {}
         self.remaining_legs: dict[str, int] = {}
+        # Per-decision leg accumulator. Legs are a post-trade result, not part
+        # of the Decision; the engine collects them here and hands them to the
+        # recorder's `emit_legs` once the pair resolves.
+        self._legs_by_decision: dict[str, list[LegOutcome]] = {}
         # signed in-flight qty per venue (scheduled but not yet resolved).
         # Combined with `positions.sizes` by `EngineView.position()` so
         # `max_qty` caps total commitment, not just settled exposure.
@@ -186,7 +190,6 @@ class Engine:
             self.in_flight_qty.get(intent.venue, Decimal("0"))
             - intent.qty * Decimal(intent.side.sign)
         )
-        d = self.in_flight[fill.decision_id]
         # Mirror live: the outcome carries the venue-side fill instant as
         # `exchange_ts_ms`. In backtest, that's the simulated arrival ts
         # (= submit ts + venue latency). Recorder derives latency from
@@ -213,7 +216,7 @@ class Engine:
             and fill.realized_price is not None and fill.filled_qty > 0
         ):
             out.set_fill(fill.filled_qty, fill.realized_price)
-        d.legs.append(out)
+        self._legs_by_decision[fill.decision_id].append(out)
         if fill.success:
             self.summary.fills_succeeded += 1
         else:
@@ -227,10 +230,11 @@ class Engine:
             return
         d = self.in_flight.pop(decision_id)
         del self.remaining_legs[decision_id]
-        all_success = bool(d.legs) and all(leg.success for leg in d.legs)
-        if all_success and len(d.legs) == 2:
-            left_leg = next((lg for lg in d.legs if lg.venue == self.ctx.left_venue), None)
-            right_leg = next((lg for lg in d.legs if lg.venue == self.ctx.right_venue), None)
+        legs = self._legs_by_decision.pop(decision_id)
+        all_success = bool(legs) and all(leg.success for leg in legs)
+        if all_success and len(legs) == 2:
+            left_leg = next((lg for lg in legs if lg.venue == self.ctx.left_venue), None)
+            right_leg = next((lg for lg in legs if lg.venue == self.ctx.right_venue), None)
             assert left_leg is not None and right_leg is not None
             assert left_leg.side is not None and right_leg.side is not None
             self.positions.apply_pair(
@@ -244,12 +248,14 @@ class Engine:
             elif d.direction is Direction.B:
                 self.summary.fires_dir_b += 1
         recorder.emit(d)
+        recorder.emit_legs(d.decision_id, d.ts_ms, legs)
         self.summary.decisions_emitted += 1
 
     def _schedule(self, intent: OrderIntent) -> None:
         intent.decision.timeline.mark_at(Phase.SEND, intent.sim_ts_ms)
         self.in_flight[intent.decision_id] = intent.decision
         self.remaining_legs[intent.decision_id] = self.remaining_legs.get(intent.decision_id, 0) + 1
+        self._legs_by_decision.setdefault(intent.decision_id, [])
         arrival = self.cfg.latency.arrival_ts(intent.venue, intent.sim_ts_ms)
         insort(self.pending[intent.venue], PendingOrder(intent, arrival),
                key=lambda p: p.arrival_ts_ms)

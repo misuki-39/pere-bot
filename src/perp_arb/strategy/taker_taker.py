@@ -50,10 +50,10 @@ from decimal import Decimal
 from ..core.exec_record import (
     Decision,
     Direction,
-    Verdict,
     Phase,
+    Verdict,
 )
-from ..core.executor import LegIntent, TwoLegExecutor
+from ..core.executor import ExecutionResult, LegIntent, TwoLegExecutor
 from ..core.pnl import pair_pnl_from_legs
 from ..core.record_sink import SqliteRecorder
 from ..core.types import LegKind, LegOutcome, MarketInfo, Quote, Side
@@ -475,12 +475,15 @@ class TakerTakerArbitrage(BaseStrategy):
         d = self._assess(a_book, b_book, a_q, b_q)
         if d is None:
             return
+        result: ExecutionResult | None = None
         try:
             if d.outcome is Verdict.FIRED:
-                await self._fire(d, a_q, b_q)
+                result = await self._fire(d, a_q, b_q)
         finally:
             if self._recorder:
                 self._recorder.emit(d)
+                if result is not None:
+                    self._recorder.emit_legs(d.decision_id, d.ts_ms, result.legs)
 
     def _assess(self, a_book, b_book, a_q, b_q) -> Decision | None:
         """Thin wrapper around the pure `assess_reversion` decision math.
@@ -600,7 +603,7 @@ class TakerTakerArbitrage(BaseStrategy):
 
     # ---- order firing ----
 
-    async def _fire(self, d: Decision, a_q: Quote, b_q: Quote) -> None:
+    async def _fire(self, d: Decision, a_q: Quote, b_q: Quote) -> ExecutionResult:
         """Resolve Direction → venue-side intents, delegate execution,
         then apply the ExecutionResult to position / risk / throttle.
 
@@ -645,7 +648,7 @@ class TakerTakerArbitrage(BaseStrategy):
                 qty=qty,
                 timeline=d.timeline,
             )
-            d.legs = result.legs
+            d.failure_reason = result.failure_reason
             # Stamp each leg's decision-time per-venue context. result.legs is
             # ordered [leg_a, leg_b]; a_q/b_q and the pre-fire positions line up
             # by that order. Quote already carries top-of-book sizes.
@@ -719,6 +722,9 @@ class TakerTakerArbitrage(BaseStrategy):
         finally:
             if self._inflight_cap > 0:
                 self._inflight_dir.pop(d.decision_id, None)
+        # Hand the execution result back so the caller can record the legs
+        # separately (Decision no longer carries them).
+        return result
 
 
 def _stamp_leg_ctx(leg: LegOutcome, q: Quote, position_before: Decimal) -> None:

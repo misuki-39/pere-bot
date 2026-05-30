@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from ...core.exec_record import Direction, Verdict, Phase
+from ...core.exec_record import Direction, Phase, Verdict
 from ...strategy.base import SpreadModel, TimeEwma
 from ...strategy.persistence_gate import PersistenceGate
 from ...strategy.reversion_signal import (
