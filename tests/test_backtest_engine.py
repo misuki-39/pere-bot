@@ -16,7 +16,8 @@ from perp_arb.backtest.fills import FillModelKind
 from perp_arb.backtest.intents import OrderIntent
 from perp_arb.backtest.latency import BookIndex, LatencyModel
 from perp_arb.backtest.snapshot import MarketSnapshot
-from perp_arb.core.exec_record import Decision, ExecutionRecorder, Verdict
+from perp_arb.core.csv_recorder import CsvRecorder
+from perp_arb.core.decision import Decision, Verdict
 from perp_arb.core.types import Side
 
 
@@ -104,8 +105,8 @@ class _AlwaysFireStrategy(BacktestStrategy):
 
 def _ctx(out_dir: Path, *, max_qty: str = "1000",
          fill_model: FillModelKind = FillModelKind.VWAP,
-         strategy_id: str = "test_always_fire") -> tuple[StrategyContext, ExecutionRecorder]:
-    rec = ExecutionRecorder(out_dir, run_ts="TEST", strategy_id=strategy_id)
+         strategy_id: str = "test_always_fire") -> tuple[StrategyContext, CsvRecorder]:
+    rec = CsvRecorder(out_dir, run_ts="TEST", strategy_id=strategy_id)
     return StrategyContext(
         capture_qty=Decimal("1"),
         fees_bps=Decimal("0"),

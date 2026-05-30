@@ -1,8 +1,8 @@
 """Live execution telemetry sink: local SQLite source-of-truth + Turso sync.
 
-Replaces the CSV `ExecutionRecorder` on the **live** path (the backtest keeps
-CSV). One `Decision` per evaluated tick is routed by outcome into a normalised
-three-table model:
+The `Recorder` backend for the **live** path (the backtest uses the CSV
+`CsvRecorder`). One `Decision` per evaluated tick is routed by outcome into a
+normalised three-table model:
 
 * `rejections` — ticks we declined to fire (ABORT_* / BLOCKED_RISK). Diagnostic,
   no legs.
@@ -35,7 +35,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .exec_record import Decision, Verdict
+from .decision import Decision, Verdict
+from .recorder import Recorder
 
 if TYPE_CHECKING:
     from .config import TursoCfg
@@ -135,13 +136,14 @@ def _http_url(url: str) -> str:
     return url
 
 
-class SqliteRecorder:
-    """Live telemetry recorder. `emit(Decision)` is the only write entry point.
+class SqliteRecorder(Recorder):
+    """Live telemetry recorder. `emit` / `emit_legs` are the write entry points
+    (the `Recorder` contract).
 
     Construct synchronously (opens the local DB, creates tables, records the
     run); call `await start()` to spin up the Turso sync task and `await
-    aclose()` on shutdown. Mirrors the `ExecutionRecorder.emit(Decision)`
-    interface so the strategy call site is unchanged."""
+    aclose()` on shutdown — the lifecycle is backend-specific and not part of
+    the `Recorder` contract."""
 
     def __init__(
         self,

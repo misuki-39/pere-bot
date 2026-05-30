@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from ..core.exec_record import Decision, Direction, Verdict
+from ..core.decision import Decision, Direction, Verdict
 from ..utils.precision import BPS
 
 

@@ -21,12 +21,12 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 
-from ..core.exec_record import (
+from ..core.decision import (
     Decision,
     Direction,
-    ExecutionRecorder,
     Phase,
 )
+from ..core.recorder import Recorder
 from ..core.types import LegKind, LegOutcome, OrderStatus
 from .base import BacktestStrategy, EngineView, StrategyContext
 from .dataset import BBORow
@@ -225,7 +225,7 @@ class Engine:
             self.summary.reject_reasons[reason] = self.summary.reject_reasons.get(reason, 0) + 1
         self.remaining_legs[fill.decision_id] -= 1
 
-    def _maybe_emit(self, decision_id: str, recorder: ExecutionRecorder) -> None:
+    def _maybe_emit(self, decision_id: str, recorder: Recorder) -> None:
         if self.remaining_legs[decision_id] > 0:
             return
         d = self.in_flight.pop(decision_id)
@@ -269,7 +269,7 @@ class Engine:
         self.view._sim_now_ms = now_ms
         self.view._pending_count = sum(len(v) for v in self.pending.values())
 
-    def _drain(self, up_to: int, recorder: ExecutionRecorder) -> None:
+    def _drain(self, up_to: int, recorder: Recorder) -> None:
         """Drain every pending arrival whose `arrival_ts ≤ up_to` across both
         venues. Called twice per row (before + after the strategy step) so a
         zero-latency intent scheduled this tick lands the same tick."""
@@ -285,7 +285,7 @@ class Engine:
                 self.strategy.on_fill(fill, self.view)
                 self._maybe_emit(p.intent.decision_id, recorder)
 
-    def run(self, recorder: ExecutionRecorder) -> EngineSummary:
+    def run(self, recorder: Recorder) -> EngineSummary:
         if not self.rows:
             return self.summary
         for row in self.rows:

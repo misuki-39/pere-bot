@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from perp_arb.core.exec_record import Phase, Timeline
+from perp_arb.core.decision import Phase, Timeline
 from perp_arb.core.executor import LegIntent, TwoLegExecutor
 from perp_arb.core.pnl import pair_pnl_from_legs
 from perp_arb.core.types import (

@@ -313,7 +313,7 @@ class LegOutcome:
 
     # ----- CSV projection -----
     #
-    # Owned here (not in exec_record) so the column set and the
+    # Owned here (not in csv_recorder) so the column set and the
     # field/property accessors stay in one place. Adding/renaming a
     # column is a single-file change.
 

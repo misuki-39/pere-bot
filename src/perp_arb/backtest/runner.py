@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from ..core.exec_record import ExecutionRecorder
+from ..core.csv_recorder import CsvRecorder
+from ..core.recorder import Recorder
 from ..strategy.persistence_gate import PersistenceParams
 from .base import StrategyContext
 from .dataset import load_capture
@@ -46,7 +47,7 @@ def build_context(
     cfg: EngineConfig,
     left_venue: str,
     right_venue: str,
-    recorder: ExecutionRecorder,
+    recorder: Recorder,
 ) -> StrategyContext:
     if params.qty != cfg.capture_qty:
         raise ValueError(
@@ -90,7 +91,7 @@ def run_backtest(cfg: EngineConfig, params: StrategyParams) -> EngineSummary:
 
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     run_ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    recorder = ExecutionRecorder(cfg.out_dir, run_ts=run_ts, strategy_id=cfg.strategy_id)
+    recorder = CsvRecorder(cfg.out_dir, run_ts=run_ts, strategy_id=cfg.strategy_id)
     try:
         ctx = build_context(params, cfg, left_venue, right_venue, recorder)
         strategy = build_strategy(cfg.strategy_id, ctx)

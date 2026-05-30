@@ -23,7 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 # Cloud sync for the live SQLite recorder. Optional: the recorder writes
 # local SQLite without it; only the Turso push needs the client (imported
-# lazily in core.record_sink). Install with `uv sync --extra turso`.
+# lazily in core.sqlite_recorder). Install with `uv sync --extra turso`.
 turso = [
     "libsql-client>=0.3",
 ]

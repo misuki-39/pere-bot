@@ -6,23 +6,25 @@ from __future__ import annotations
 import csv
 from decimal import Decimal
 
-import perp_arb.core.exec_record as er
-from perp_arb.core.exec_record import (
+import perp_arb.core.decision as decmod
+from perp_arb.core.csv_recorder import (
+    CsvRecorder,
+    _decision_header,
+    _leg_header,
+)
+from perp_arb.core.decision import (
     Decision,
     Direction,
-    ExecutionRecorder,
     Phase,
     Timeline,
     Verdict,
-    _decision_header,
-    _leg_header,
 )
 from perp_arb.core.types import LegKind, LegOutcome, OrderStatus, Side
 
 
 def test_timeline_span_none_until_both_marks(monkeypatch) -> None:
     clock = {"t": 1000}
-    monkeypatch.setattr(er, "mono_ms", lambda: clock["t"])
+    monkeypatch.setattr(decmod, "mono_ms", lambda: clock["t"])
     tl = Timeline()
     assert tl.span("decision", "send") is None
     tl.mark("decision")
@@ -55,8 +57,8 @@ def _read(path):
 
 def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkeypatch) -> None:
     clock = {"t": 0}
-    monkeypatch.setattr(er, "mono_ms", lambda: clock["t"])
-    rec = ExecutionRecorder(tmp_path, run_ts="TEST")
+    monkeypatch.setattr(decmod, "mono_ms", lambda: clock["t"])
+    rec = CsvRecorder(tmp_path, run_ts="TEST")
 
     d = Decision(
         decision_id="d-abc", ts_ms=111, mid_left=Decimal("100"), mid_right=Decimal("100.05"),
@@ -112,7 +114,7 @@ def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkey
 
 
 def test_abort_decision_emits_row_with_no_legs(tmp_path) -> None:
-    rec = ExecutionRecorder(tmp_path, run_ts="AB")
+    rec = CsvRecorder(tmp_path, run_ts="AB")
     # only the always-known fields; the rest default — proves early aborts
     # (pre-edge) can be recorded without fabricating values.
     d = Decision(

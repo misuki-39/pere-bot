@@ -17,7 +17,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from decimal import Decimal
 
-from ..core.exec_record import ExecutionRecorder
+from ..core.recorder import Recorder
 from ..strategy.persistence_gate import PersistenceParams
 from .fills import FillModelKind
 from .intents import FillEvent, OrderIntent
@@ -44,7 +44,7 @@ class StrategyContext:
     left_venue: str
     right_venue: str
     fill_model: FillModelKind
-    recorder: ExecutionRecorder
+    recorder: Recorder
     # Optional Wave-1 optimisation knobs. All default-off so the legacy
     # strategy behaviour is preserved when the YAML omits these fields.
     inventory_skew_bps: Decimal = Decimal(0)   # κ for AS-style threshold widener (open side)

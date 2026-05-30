@@ -28,7 +28,7 @@ import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 
-from ..core.exec_record import Decision, Direction, Verdict
+from ..core.decision import Decision, Direction, Verdict
 from ..core.types import Quote, Side
 from ..utils.precision import BPS
 from .taker_fill_model import FillAbort, TakerFills

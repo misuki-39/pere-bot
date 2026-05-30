@@ -19,15 +19,17 @@ from pathlib import Path
 
 import pytest
 
-from perp_arb.core.exchange import BaseExchange
-from perp_arb.core.exec_record import (
-    Decision,
-    Direction,
-    ExecutionRecorder,
-    Verdict,
+from perp_arb.core.csv_recorder import (
+    CsvRecorder,
     _decision_header,
     _leg_header,
 )
+from perp_arb.core.decision import (
+    Decision,
+    Direction,
+    Verdict,
+)
+from perp_arb.core.exchange import BaseExchange
 from perp_arb.core.types import (
     FillDelta,
     LegKind,
@@ -368,7 +370,7 @@ def test_leg_header_contains_fill_ts_ms() -> None:
 def test_recorder_writes_send_ts_ms_to_csv(tmp_path: Path) -> None:
     """End-to-end: a FIRED Decision with send_ts_ms + a LegOutcome with
     fill timestamps should round-trip through the CSV writer."""
-    rec = ExecutionRecorder(tmp_path, run_ts="TEST", strategy_id="taker_taker")
+    rec = CsvRecorder(tmp_path, run_ts="TEST", strategy_id="taker_taker")
     d = Decision(
         decision_id="d-test",
         ts_ms=1_700_000_000_000,

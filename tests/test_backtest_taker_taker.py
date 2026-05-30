@@ -18,7 +18,7 @@ from perp_arb.backtest.fills import FillModelKind
 from perp_arb.backtest.latency import LatencyModel
 from perp_arb.backtest.runner import build_context
 from perp_arb.backtest.strategies import TakerTakerBT
-from perp_arb.core.exec_record import ExecutionRecorder
+from perp_arb.core.csv_recorder import CsvRecorder
 
 
 def _row(ts: int, mid_left: str, mid_right: str, *,
@@ -71,7 +71,7 @@ def test_taker_taker_zero_latency_captures_clean_edge(tmp_path: Path) -> None:
 
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    rec = ExecutionRecorder(out_dir, run_ts="ZL", strategy_id="taker_taker")
+    rec = CsvRecorder(out_dir, run_ts="ZL", strategy_id="taker_taker")
 
     from perp_arb.backtest.runner import StrategyParams
     params = StrategyParams(

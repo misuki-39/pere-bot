@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
 
-from ..core.exec_record import Decision
+from ..core.decision import Decision
 from ..core.types import Side
 
 

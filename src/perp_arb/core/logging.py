@@ -168,4 +168,4 @@ SPREAD_CSV_HEADER = [
     "edge_A_bps", "edge_B_bps", "gates_passed",
 ]
 # taker_taker telemetry headers live with their dataclasses in
-# core.exec_record (derived from fields, so they cannot drift).
+# core.csv_recorder (derived from fields, so they cannot drift).

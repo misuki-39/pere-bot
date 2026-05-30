@@ -22,7 +22,7 @@ from decimal import Decimal
 
 import pytest
 
-from perp_arb.core.exec_record import (
+from perp_arb.core.decision import (
     Decision,
     Direction,
     Phase,
