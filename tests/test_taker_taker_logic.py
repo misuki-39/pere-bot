@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from perp_arb.core.exec_record import Direction, Outcome
+from perp_arb.core.exec_record import Direction, Verdict
 from perp_arb.core.types import BookLevel, OrderBook, Quote, Symbol
 from perp_arb.strategy.base import SpreadModel, TimeEwma
 from perp_arb.strategy.reversion_signal import (
@@ -234,7 +234,7 @@ def _fill_params() -> TakerFillParams:
 
 
 def _inputs(*, a_bid: str, a_ask: str, l_bid: str, l_ask: str,
-            bias: str = "0", pos_left: str = "0", pos_right: str = "0",
+            bias: str = "0", pos: str = "0",
             bump_a_bps: str = "0", bump_b_bps: str = "0") -> AssessInputs:
     """Build AssessInputs from BBO quotes (qty=1 fits inside top size)."""
     sa = Symbol(exchange="lighter", raw="WTI", base="WTI", quote="USD")
@@ -249,7 +249,7 @@ def _inputs(*, a_bid: str, a_ask: str, l_bid: str, l_ask: str,
         left_quote=a_q, right_quote=b_q,
         fills=fills,
         bias=Decimal(bias), is_warm=True,
-        position_left=Decimal(pos_left), position_right=Decimal(pos_right),
+        position=Decimal(pos),
         bump_a_bps=Decimal(bump_a_bps),
         bump_b_bps=Decimal(bump_b_bps),
     )
@@ -269,26 +269,26 @@ def test_bump_a_raises_threshold_for_direction_a_only() -> None:
     inp_b_bump = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000",
                          bump_b_bps="1.0")
     d2 = assess_reversion(p, inp_b_bump)
-    assert d2 is not None and d2.outcome is Outcome.FIRED and d2.direction is Direction.A
+    assert d2 is not None and d2.outcome is Verdict.FIRED and d2.direction is Direction.A
 
 
 def test_inventory_skew_widens_growing_direction_narrows_flattening() -> None:
-    """At position_left=+5 (half of max_qty=10), direction A (sells left → shrinks
+    """At position=+5 (half of max_qty=10), direction A (sells left → shrinks
     |pos|) should be EASIER, direction B (buys left → grows |pos|) HARDER.
 
     With κ=2 bps and |pos|/max_qty=0.5, the skew is ±1 bps respectively.
     """
     # A +1.5 bps A-edge sits just above default fee.
     inp = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000",
-                  pos_left="5", pos_right="-5")
+                  pos="5")
     p = _params(inventory_skew_bps=Decimal("2"))
     d = assess_reversion(p, inp)
     # A flattens → skew_A = +2 * (5 * -1) / 10 = -1 bps. Threshold drops; still fires.
-    assert d is not None and d.outcome is Outcome.FIRED and d.direction is Direction.A
+    assert d is not None and d.outcome is Verdict.FIRED and d.direction is Direction.A
 
-    # Now flip the position: long the OTHER way (position_left = -5 → A grows).
+    # Now flip the position: long the OTHER way (position = -5 → A grows).
     inp_short = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000",
-                        pos_left="-5", pos_right="5")
+                        pos="-5")
     d2 = assess_reversion(p, inp_short)
     # A grows → skew_A = +2 * (-5 * -1) / 10 = +1 bps. Effective threshold 2 bps > 1.5.
     assert d2 is None, "A should be blocked: growing |pos| and edge below skewed threshold"
@@ -302,12 +302,12 @@ def test_position_cap_returns_none_not_blocked_risk() -> None:
     # Sanity: book has a +1.5 bps A-edge and at flat position it fires.
     flat = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000")
     p = _params()
-    assert assess_reversion(p, flat).outcome is Outcome.FIRED
+    assert assess_reversion(p, flat).outcome is Verdict.FIRED
 
-    # Direction A: post_left = pos_left + 1*(-1), post_right = pos_right + 1*(+1).
-    # At pos_left=-10, pos_right=+10 the fire would push |pos|=11 > max_qty=10.
+    # Direction A sells left → post = pos + 1*(-1). At pos=-10 the fire would
+    # push |pos| to 11 > max_qty=10, so it's dropped.
     growing = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000",
-                      pos_left="-10", pos_right="10")
+                      pos="-10")
     assert assess_reversion(p, growing) is None
 
 
@@ -315,10 +315,9 @@ def test_position_cap_allows_flattening_fire() -> None:
     """Reverse-direction exits MUST still pass when current |pos| is already at
     the cap — that's how the strategy unwinds."""
     # Same book (A-edge) but position flipped so a Direction-A fire shrinks
-    # |pos|: pos_left=+10 → post_left = 10 - 1 = 9; pos_right=-10 → post_right
-    # = -10 + 1 = -9. max(9, 9) ≤ max_qty=10.
+    # |pos|: pos=+10 → post = 10 - 1 = 9 ≤ max_qty=10, so it still fires.
     flattening = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000",
-                         pos_left="10", pos_right="-10")
+                         pos="10")
     p = _params()
     d = assess_reversion(p, flattening)
-    assert d is not None and d.outcome is Outcome.FIRED and d.direction is Direction.A
+    assert d is not None and d.outcome is Verdict.FIRED and d.direction is Direction.A

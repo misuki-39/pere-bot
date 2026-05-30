@@ -12,7 +12,7 @@ import sqlite3
 from decimal import Decimal
 
 from perp_arb.core.config import TursoCfg
-from perp_arb.core.exec_record import Decision, Direction, Outcome, Phase, Timeline
+from perp_arb.core.exec_record import Decision, Direction, Verdict, Phase, Timeline
 from perp_arb.core.record_sink import SqliteRecorder
 from perp_arb.core.types import LegKind, LegOutcome, OrderStatus, Side
 
@@ -52,7 +52,7 @@ def _leg(venue: str, side: Side, *, success=True, error=None) -> LegOutcome:
     return lg
 
 
-def _decision(outcome: Outcome, *, did="d-1", legs=None) -> Decision:
+def _decision(outcome: Verdict, *, did="d-1", legs=None) -> Decision:
     tl = Timeline()
     tl.mark_at(Phase.DECISION, 100)
     tl.mark_at(Phase.SEND, 101)
@@ -61,7 +61,7 @@ def _decision(outcome: Outcome, *, did="d-1", legs=None) -> Decision:
         mid_left=Decimal("88.6175"), mid_right=Decimal("88.6250"),
         left_quote_ts_ms=1_700_000_000_400, right_quote_ts_ms=1_700_000_000_300,
         bias=Decimal("0.0107"), edge_bps=Decimal("1.94"),
-        direction=Direction.B if outcome is Outcome.FIRED else None,
+        direction=Direction.B if outcome is Verdict.FIRED else None,
         outcome=outcome, timeline=tl,
         thr_throttle_bps=Decimal("0.5"),
     )
@@ -86,7 +86,7 @@ def _rows(tmp_path, table: str) -> list[sqlite3.Row]:
 def test_fired_routes_to_trades_and_legs(tmp_path):
     rec = _recorder(tmp_path)
     legs = [_leg("lighter", Side.BUY), _leg("aster", Side.SELL)]
-    rec.emit(_decision(Outcome.FIRED, legs=legs))
+    rec.emit(_decision(Verdict.FIRED, legs=legs))
     trades, legrows, rejs = (_rows(tmp_path, t) for t in ("trades", "legs", "rejections"))
     assert len(trades) == 1 and len(legrows) == 2 and len(rejs) == 0
     t = trades[0]
@@ -107,7 +107,7 @@ def test_fired_routes_to_trades_and_legs(tmp_path):
 
 def test_abort_routes_to_rejections_only(tmp_path):
     rec = _recorder(tmp_path)
-    rec.emit(_decision(Outcome.ABORT_STALE, did="d-rej"))
+    rec.emit(_decision(Verdict.ABORT_STALE, did="d-rej"))
     trades, legrows, rejs = (_rows(tmp_path, t) for t in ("trades", "legs", "rejections"))
     assert len(trades) == 0 and len(legrows) == 0 and len(rejs) == 1
     assert rejs[0]["outcome"] == "ABORT_STALE"
@@ -118,7 +118,7 @@ def test_partial_failure_routes_to_trades_with_failure(tmp_path):
     rec = _recorder(tmp_path)
     legs = [_leg("lighter", Side.BUY),
             _leg("aster", Side.SELL, success=False, error="timeout")]
-    rec.emit(_decision(Outcome.FIRED, legs=legs))
+    rec.emit(_decision(Verdict.FIRED, legs=legs))
     trades, legrows = _rows(tmp_path, "trades"), _rows(tmp_path, "legs")
     assert len(trades) == 1 and len(legrows) == 2
     assert trades[0]["success"] == 0
@@ -131,8 +131,8 @@ def test_partial_failure_routes_to_trades_with_failure(tmp_path):
 def test_idempotent_on_duplicate_decision_id(tmp_path):
     rec = _recorder(tmp_path)
     legs = [_leg("lighter", Side.BUY), _leg("aster", Side.SELL)]
-    rec.emit(_decision(Outcome.FIRED, legs=legs))
-    rec.emit(_decision(Outcome.FIRED, legs=legs))  # same decision_id -> ignored
+    rec.emit(_decision(Verdict.FIRED, legs=legs))
+    rec.emit(_decision(Verdict.FIRED, legs=legs))  # same decision_id -> ignored
     assert len(_rows(tmp_path, "trades")) == 1
     assert len(_rows(tmp_path, "legs")) == 2
 
@@ -161,7 +161,7 @@ async def test_push_table_advances_cursor(tmp_path):
     rec = _recorder(tmp_path, enabled=True)
     rec._client = _FakeClient()
     for i in range(3):
-        rec.emit(_decision(Outcome.ABORT_NO_DEPTH, did=f"d-{i}"))
+        rec.emit(_decision(Verdict.ABORT_NO_DEPTH, did=f"d-{i}"))
 
     await rec._push_table("rejections")
     # all 3 pushed, cursor at the last rowid
@@ -177,7 +177,7 @@ async def test_push_table_advances_cursor(tmp_path):
     assert len(rec._client.batches) == 1
 
     # a new row advances only by the delta
-    rec.emit(_decision(Outcome.ABORT_NO_DEPTH, did="d-3"))
+    rec.emit(_decision(Verdict.ABORT_NO_DEPTH, did="d-3"))
     await rec._push_table("rejections")
     assert len(rec._client.batches) == 2
     assert len(rec._client.batches[1]) == 1
@@ -187,6 +187,6 @@ async def test_local_only_when_turso_disabled(tmp_path):
     rec = _recorder(tmp_path, enabled=False)
     await rec.start()                       # no client, no task
     assert rec._client is None and rec._sync_task is None
-    rec.emit(_decision(Outcome.ABORT_STALE, did="d-x"))
+    rec.emit(_decision(Verdict.ABORT_STALE, did="d-x"))
     assert len(_rows(tmp_path, "rejections")) == 1
     await rec.aclose()

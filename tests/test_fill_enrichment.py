@@ -24,7 +24,7 @@ from perp_arb.core.exec_record import (
     Decision,
     Direction,
     ExecutionRecorder,
-    Outcome,
+    Verdict,
     _decision_header,
     _leg_header,
 )
@@ -376,7 +376,7 @@ def test_recorder_writes_send_ts_ms_to_csv(tmp_path: Path) -> None:
         left_quote_ts_ms=1_700_000_000_000,
         right_quote_ts_ms=1_700_000_000_000,
         direction=Direction.A,
-        outcome=Outcome.FIRED,
+        outcome=Verdict.FIRED,
         send_ts_ms=1_700_000_000_010,
     )
     leg = LegOutcome(

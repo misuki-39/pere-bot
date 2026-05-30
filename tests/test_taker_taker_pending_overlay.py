@@ -25,7 +25,7 @@ import pytest
 from perp_arb.core.exec_record import (
     Decision,
     Direction,
-    Outcome,
+    Verdict,
     Phase,
     Timeline,
 )
@@ -144,7 +144,7 @@ def _mk_decision(qty: Decimal) -> Decision:
         bias=Decimal("0"),
         vwap_left_sell=Decimal("100"), vwap_left_buy=Decimal("100"),
         vwap_right_sell=Decimal("100"), vwap_right_buy=Decimal("100"),
-        edge_bps=Decimal("0"), direction=Direction.A, outcome=Outcome.FIRED,
+        edge_bps=Decimal("0"), direction=Direction.A, outcome=Verdict.FIRED,
         timeline=Timeline(),
     )
 

@@ -23,7 +23,7 @@ from decimal import Decimal
 import pytest
 
 from perp_arb.core.config import TursoCfg
-from perp_arb.core.exec_record import Decision, Direction, Outcome, Phase, Timeline
+from perp_arb.core.exec_record import Decision, Direction, Phase, Timeline, Verdict
 from perp_arb.core.record_sink import _SYNCED_TABLES, SqliteRecorder, _http_url
 from perp_arb.core.types import LegKind, LegOutcome, OrderStatus, Side
 
@@ -63,7 +63,7 @@ def _fired(run_id: str) -> Decision:
         decision_id=f"{run_id}-f0", ts_ms=1_700_000_000_000,
         mid_left=Decimal("88.61"), mid_right=Decimal("88.63"),
         left_quote_ts_ms=1, right_quote_ts_ms=1, bias=Decimal("0.0107"),
-        edge_bps=Decimal("1.94"), direction=Direction.B, outcome=Outcome.FIRED,
+        edge_bps=Decimal("1.94"), direction=Direction.B, outcome=Verdict.FIRED,
         timeline=tl, thr_throttle_bps=Decimal("0.5"),
     )
     d.legs = [_leg("lighter", Side.BUY, "88.61"), _leg("aster", Side.SELL, "88.63")]
@@ -75,7 +75,7 @@ def _reject(run_id: str) -> Decision:
     return Decision(
         decision_id=f"{run_id}-r0", ts_ms=1_700_000_000_050,
         mid_left=Decimal("88.6"), mid_right=Decimal("88.6"),
-        left_quote_ts_ms=1, right_quote_ts_ms=1, outcome=Outcome.ABORT_NO_DEPTH,
+        left_quote_ts_ms=1, right_quote_ts_ms=1, outcome=Verdict.ABORT_NO_DEPTH,
         abort_reason="qty does not fill within max_levels", edge_bps=Decimal("0.4"),
         timeline=Timeline(),
     )

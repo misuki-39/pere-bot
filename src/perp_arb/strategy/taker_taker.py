@@ -50,7 +50,7 @@ from decimal import Decimal
 from ..core.exec_record import (
     Decision,
     Direction,
-    Outcome,
+    Verdict,
     Phase,
 )
 from ..core.executor import LegIntent, TwoLegExecutor
@@ -476,7 +476,7 @@ class TakerTakerArbitrage(BaseStrategy):
         if d is None:
             return
         try:
-            if d.outcome is Outcome.FIRED:
+            if d.outcome is Verdict.FIRED:
                 await self._fire(d, a_q, b_q)
         finally:
             if self._recorder:
@@ -509,8 +509,7 @@ class TakerTakerArbitrage(BaseStrategy):
             left_quote=a_q, right_quote=b_q,
             fills=fills,
             bias=bias, is_warm=self._spread.is_warm,
-            position_left=self._pos_a(),
-            position_right=self._pos_b(),
+            position=self._pos_a(),
             bump_a_bps=bump_a,
             bump_b_bps=bump_b,
         ))
@@ -525,7 +524,7 @@ class TakerTakerArbitrage(BaseStrategy):
         self._prev_b_ts = b_q.ts_ms
         d = self._gate.admit(d, left_ticked=left_ticked, right_ticked=right_ticked)
 
-        if d is not None and d.outcome is Outcome.FIRED:
+        if d is not None and d.outcome is Verdict.FIRED:
             assert d.direction is not None
 
             # Persist the chosen direction's throttle bump — the one threshold
@@ -544,7 +543,7 @@ class TakerTakerArbitrage(BaseStrategy):
                     1 for x in self._inflight_dir.values() if x is d.direction
                 )
                 if same_dir >= self._inflight_cap:
-                    d.outcome = Outcome.BLOCKED_RISK
+                    d.outcome = Verdict.BLOCKED_RISK
                     d.abort_reason = (
                         f"in-flight cap {self._inflight_cap} reached for "
                         f"direction {d.direction.value}"
@@ -552,7 +551,7 @@ class TakerTakerArbitrage(BaseStrategy):
 
         # Operational risk gate: halted / consec-failures / daily-loss cap.
         # Position-cap is enforced upstream in the pure function.
-        if d is not None and d.outcome is Outcome.FIRED:
+        if d is not None and d.outcome is Verdict.FIRED:
             assert d.direction is not None
             d.timeline.mark(Phase.DECISION)
             ok, reason = self._risk.can_trade()
@@ -560,7 +559,7 @@ class TakerTakerArbitrage(BaseStrategy):
                 if not self._risk_blocked:
                     self._risk_blocked = True
                     _log.info("entry blocked by risk: %s (suppressing until cleared)", reason)
-                d.outcome = Outcome.BLOCKED_RISK
+                d.outcome = Verdict.BLOCKED_RISK
                 d.abort_reason = reason
             elif self._risk_blocked:
                 self._risk_blocked = False

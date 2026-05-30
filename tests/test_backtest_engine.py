@@ -16,7 +16,7 @@ from perp_arb.backtest.fills import FillModelKind
 from perp_arb.backtest.intents import OrderIntent
 from perp_arb.backtest.latency import BookIndex, LatencyModel
 from perp_arb.backtest.snapshot import MarketSnapshot
-from perp_arb.core.exec_record import Decision, ExecutionRecorder, Outcome
+from perp_arb.core.exec_record import Decision, ExecutionRecorder, Verdict
 from perp_arb.core.types import Side
 
 
@@ -83,7 +83,7 @@ class _AlwaysFireStrategy(BacktestStrategy):
             ts_ms=snap.ts_ms,
             mid_left=snap.left_quote.mid, mid_right=snap.right_quote.mid,
             left_quote_ts_ms=snap.left_ts_ms, right_quote_ts_ms=snap.right_ts_ms,
-            outcome=Outcome.FIRED,
+            outcome=Verdict.FIRED,
         )
         self.intents_built += 1
         return [

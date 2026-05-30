@@ -34,7 +34,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .exec_record import Decision, Outcome
+from .exec_record import Decision, Verdict
 
 if TYPE_CHECKING:
     from .config import TursoCfg
@@ -180,7 +180,7 @@ class SqliteRecorder:
     def emit(self, d: Decision) -> None:
         """Route one Decision by outcome. FIRED → trades + legs; everything
         else (ABORT_* / BLOCKED_RISK) → rejections. Synchronous local write."""
-        if d.outcome is Outcome.FIRED:
+        if d.outcome is Verdict.FIRED:
             self._insert("trades", _cols("trades"), self._trade_row(d))
             for leg in d.legs:
                 self._insert("legs", _cols("legs"), self._leg_row(d, leg))

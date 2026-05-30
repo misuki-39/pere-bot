@@ -11,7 +11,7 @@ from perp_arb.core.exec_record import (
     Decision,
     Direction,
     ExecutionRecorder,
-    Outcome,
+    Verdict,
     Phase,
     Timeline,
     _decision_header,
@@ -64,7 +64,7 @@ def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkey
         bias=Decimal("-0.03"), vwap_left_sell=Decimal("100.01"),
         vwap_left_buy=Decimal("100.02"), vwap_right_sell=Decimal("100.04"),
         vwap_right_buy=Decimal("100.06"), edge_bps=Decimal("2.5"),
-        direction=Direction.B, outcome=Outcome.FIRED,
+        direction=Direction.B, outcome=Verdict.FIRED,
         realised_pnl=Decimal("0.012"),
     )
     clock["t"] = 5
@@ -118,7 +118,7 @@ def test_abort_decision_emits_row_with_no_legs(tmp_path) -> None:
     d = Decision(
         decision_id="d-x", ts_ms=9, mid_left=Decimal("100"), mid_right=Decimal("100"),
         left_quote_ts_ms=1, right_quote_ts_ms=2,
-        outcome=Outcome.ABORT_STALE, abort_reason="quote older than max_stale_ms",
+        outcome=Verdict.ABORT_STALE, abort_reason="quote older than max_stale_ms",
     )
     rec.emit(d)
     rec.close()

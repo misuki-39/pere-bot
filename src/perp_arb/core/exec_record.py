@@ -23,7 +23,12 @@ from .logging import CsvWriter
 from .types import LegOutcome
 
 
-class Outcome(StrEnum):
+class Verdict(StrEnum):
+    """The disposition of an evaluated opportunity — a *pre-execution* verdict
+    (fire / abort / blocked), NOT an execution result. The actual fill / PnL
+    result lives on `LegOutcome` and `Decision.realised_pnl`. String values are
+    persisted (SQLite/CSV `outcome` column); do not change them."""
+
     PENDING = "PENDING"
     FIRED = "FIRED"
     ABORT_STALE = "ABORT_STALE"
@@ -32,8 +37,14 @@ class Outcome(StrEnum):
 
 
 class Direction(StrEnum):
-    A = "A"   # sell leg_a, buy leg_b
-    B = "B"   # reverse
+    A = "A"  # sell leg_a, buy leg_b
+    B = "B"  # reverse
+
+    @property
+    def sign(self) -> int:
+        """Signed unit change to the (left-leg) position when firing this
+        direction: A sells the left leg (−1), B buys it (+1)."""
+        return -1 if self is Direction.A else 1
 
 
 class Phase(StrEnum):
@@ -89,7 +100,7 @@ class Decision:
     ts_ms: int
     mid_left: Decimal
     mid_right: Decimal
-    left_quote_ts_ms: int           # for decision-time staleness analysis
+    left_quote_ts_ms: int  # for decision-time staleness analysis
     right_quote_ts_ms: int
     # below are unknown at an early (pre-edge) abort, hence defaulted
     bias: Decimal = Decimal(0)
@@ -99,7 +110,7 @@ class Decision:
     vwap_right_buy: Decimal = Decimal(0)
     edge_bps: Decimal = Decimal(0)  # chosen direction's net edge, bps
     direction: Direction | None = None
-    outcome: Outcome = Outcome.PENDING
+    outcome: Verdict = Verdict.PENDING
     abort_reason: str | None = None
     # Our local clock at SEND (epoch ms). Pair with `LegOutcome.fill_ts_ms`
     # (exchange clock) for end-to-end submit→fill latency, modulo NTP skew.
@@ -142,14 +153,11 @@ class ExecutionRecorder:
         strategy_id: str = "taker_taker",
     ) -> None:
         ts = run_ts or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        self._dec = CsvWriter(log_dir / f"decisions_{strategy_id}_{ts}.csv",
-                              _decision_header())
-        self._legs = CsvWriter(log_dir / f"legs_{strategy_id}_{ts}.csv",
-                               _leg_header())
+        self._dec = CsvWriter(log_dir / f"decisions_{strategy_id}_{ts}.csv", _decision_header())
+        self._legs = CsvWriter(log_dir / f"legs_{strategy_id}_{ts}.csv", _leg_header())
 
     def emit(self, d: Decision) -> None:
-        row = {f.name: getattr(d, f.name)
-               for f in fields(d) if f.name not in _DECISION_SKIP}
+        row = {f.name: getattr(d, f.name) for f in fields(d) if f.name not in _DECISION_SKIP}
         row |= d.timeline.latencies()
         # CSV-only precision shaping: keep the in-memory Decimals
         # full-precision so analytics math doesn't lose digits, but the
@@ -176,6 +184,6 @@ def _quantize_to_price_scale(value: Decimal, price: Decimal) -> Decimal:
     non-positive (only seen pre-warmup / aborted tick)."""
     if price <= 0:
         return value.quantize(Decimal("0.0001"))
-    magnitude = len(str(int(price))) - 1   # ⌊log10(price)⌋
+    magnitude = len(str(int(price))) - 1  # ⌊log10(price)⌋
     dp = max(2, 6 - magnitude)
     return value.quantize(Decimal(10) ** -dp)

@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from perp_arb.core.exec_record import Decision, Direction, Outcome
+from perp_arb.core.exec_record import Decision, Direction, Verdict
 from perp_arb.strategy.persistence_gate import PersistenceGate, PersistenceParams
 
 
 def _decision(
     ts_ms: int,
     *,
-    outcome: Outcome = Outcome.FIRED,
+    outcome: Verdict = Verdict.FIRED,
     direction: Direction | None = Direction.A,
     mid_left: str = "100",
     mid_right: str = "100",
@@ -46,7 +46,7 @@ def test_fired_suppressed_until_time_and_count_met() -> None:
         assert gate.admit(_decision(ts), left_ticked=True, right_ticked=False) is None
     # 500ms old AND 5 updates AND no drift → confirmed, fires
     out = gate.admit(_decision(1500), left_ticked=True, right_ticked=False)
-    assert out is not None and out.outcome is Outcome.FIRED
+    assert out is not None and out.outcome is Verdict.FIRED
 
 
 def test_only_one_fire_per_run() -> None:
@@ -67,7 +67,7 @@ def test_non_fired_resets_the_run() -> None:
     # the run restarts: a fresh FIRED is young again, so it is suppressed
     assert gate.admit(_decision(1300), left_ticked=True, right_ticked=False) is None
     # an abort passes straight through (telemetry) and also resets
-    abort = _decision(1350, outcome=Outcome.ABORT_STALE, direction=None)
+    abort = _decision(1350, outcome=Verdict.ABORT_STALE, direction=None)
     assert gate.admit(abort, left_ticked=True, right_ticked=False) is abort
 
 

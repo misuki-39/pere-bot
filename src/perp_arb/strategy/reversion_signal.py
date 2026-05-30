@@ -1,17 +1,21 @@
-"""Pure decision math for the spread-reversion arbitrage signal.
+"""Pure decision core for the spread-reversion arbitrage strategy.
 
-This is the *signal* layer: given depth-aware fill prices and the EWMA bias,
-it decides whether the bias-adjusted spread is beyond the entry threshold
-(fees + min-profit + optional inventory-skew / throttle), picks a
-direction, and builds a `Decision`. It is generic to a spread-reversion bet —
-it never computes fills and so makes no assumption about execution style; the
-caller supplies the fill prices (see `taker_fill_model.compute_taker_fills`).
+This is more than a bare signal: it owns both the *edge signal* (given
+depth-aware fill prices and the EWMA bias, is the bias-adjusted spread beyond
+the entry threshold?) AND the *inventory-management policy* layered on top —
+the Avellaneda-Stoikov threshold skew and the position cap. Those are strategy
+decisions, not pure signal; they live here so the live and backtest strategies
+share one implementation and stay identical by construction.
 
-Shared by the live `TakerTakerArbitrage` strategy (which composes EWMA, risk,
-asyncio firing around this) and the backtest `TakerTakerBT` strategy. The
-function never reads or mutates global state — caller supplies the EWMA bias,
-the fill prices, and the current synthetic position; this function only does
-math + builds a `Decision`.
+It is generic to a spread-reversion bet — it never computes fills and so makes
+no assumption about execution style; the caller supplies the fill prices (see
+`taker_fill_model.compute_taker_fills`).
+
+Shared by the live `TakerTakerArbitrage` strategy (which composes EWMA, the
+operational `RiskManager`, asyncio firing around this) and the backtest
+`TakerTakerBT` strategy. The function never reads or mutates global state —
+caller supplies the EWMA bias, the fill prices, and the current position; this
+function only does math + builds a `Decision`.
 
 Convention: "left" = monitor_pair[0], "right" = monitor_pair[1]. In the
 existing live setup that's aster=left, lighter=right; in the WTI capture it's
@@ -24,7 +28,7 @@ import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 
-from ..core.exec_record import Decision, Direction, Outcome
+from ..core.exec_record import Decision, Direction, Verdict
 from ..core.types import Quote, Side
 from ..utils.precision import BPS
 from .taker_fill_model import FillAbort, TakerFills
@@ -63,6 +67,10 @@ class AssessInputs:
     caller maintains a per-direction TimeEwma of "recently fired" bumps,
     `bump_a_bps` and `bump_b_bps` add directly to that direction's threshold;
     the pure function does not own the EWMA state.
+
+    `position` is the single offsetting position, keyed off the left leg: the
+    two legs are equal-magnitude / opposite-sign by construction, so the right
+    leg's position is just `-position` and need not be passed separately.
     """
     now_ms: int
     left_quote: Quote
@@ -70,31 +78,31 @@ class AssessInputs:
     fills: TakerFills | FillAbort
     bias: Decimal
     is_warm: bool
-    position_left: Decimal
-    position_right: Decimal
+    position: Decimal
     bump_a_bps: Decimal = Decimal(0)
     bump_b_bps: Decimal = Decimal(0)
 
 
 def left_side(direction: Direction) -> Side:
-    """The side the left leg takes given the direction."""
-    return Side.SELL if direction is Direction.A else Side.BUY
+    """The side the left leg takes given the direction (execution layer)."""
+    return Side.SELL if direction.sign < 0 else Side.BUY
 
 
 def right_side(direction: Direction) -> Side:
-    """The side the right leg takes given the direction."""
-    return Side.BUY if direction is Direction.A else Side.SELL
+    """Right leg always hedges the left (offsetting taker-taker pair)."""
+    return left_side(direction).opposite
 
 
 def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
-    """Returns a Decision (outcome terminal) or None when the tick isn't worth
-    recording (warmup, or no positive edge). Pure; never raises for ordinary
-    market states."""
+    """Evaluate one tick. Returns a `Decision` when the tick is worth surfacing
+    — a fire, or a noteworthy abort (stale quote / no depth) — or `None` for an
+    ordinary non-event (pre-warmup, no positive edge, or the position cap doing
+    its job). Pure; never raises for ordinary market states."""
     mid_left = x.left_quote.mid
     mid_right = x.right_quote.mid
 
     def new(
-        outcome: Outcome, reason: str | None = None, *,
+        outcome: Verdict, reason: str | None = None, *,
         bias: Decimal = Decimal(0), edge_bps: Decimal = Decimal(0),
         direction: Direction | None = None, vwaps: TakerFills | None = None,
     ) -> Decision:
@@ -113,7 +121,7 @@ def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
         )
 
     if (x.now_ms - max(x.left_quote.ts_ms, x.right_quote.ts_ms)) > p.max_stale_ms:
-        return new(Outcome.ABORT_STALE, "quote older than max_stale_ms")
+        return new(Verdict.ABORT_STALE, "quote older than max_stale_ms")
 
     if not x.is_warm:
         return None
@@ -122,7 +130,7 @@ def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
     # tick (book too thin for qty within max_levels). Surface as ABORT_NO_DEPTH
     # — done after the stale / warmup gates so outcome precedence is unchanged.
     if isinstance(x.fills, FillAbort):
-        return new(Outcome.ABORT_NO_DEPTH,
+        return new(Verdict.ABORT_NO_DEPTH,
                    "qty does not fill within max_levels", bias=x.bias)
     vw = x.fills
     vwap_left_sell, vwap_left_buy = vw.left_sell, vw.left_buy
@@ -140,11 +148,11 @@ def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
                    if p.inventory_skew_close_bps is not None
                    else p.inventory_skew_bps)
     skew_A_bps = _inventory_skew_bps(
-        p.inventory_skew_bps, kappa_close, x.position_left,
-        left_side(Direction.A).sign, p.max_qty)
+        p.inventory_skew_bps, kappa_close, x.position,
+        Direction.A.sign, p.max_qty)
     skew_B_bps = _inventory_skew_bps(
-        p.inventory_skew_bps, kappa_close, x.position_left,
-        left_side(Direction.B).sign, p.max_qty)
+        p.inventory_skew_bps, kappa_close, x.position,
+        Direction.B.sign, p.max_qty)
 
     total_thresh_A_bps = fee_bps + skew_A_bps + x.bump_a_bps
     total_thresh_B_bps = fee_bps + skew_B_bps + x.bump_b_bps
@@ -160,29 +168,33 @@ def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
     direction = Direction.A if edge_A >= edge_B else Direction.B
     edge_bps = max(edge_A, edge_B) / ref_mid * BPS
 
-    qty = p.qty
-    post_left  = x.position_left  + qty * Decimal(left_side(direction).sign)
-    post_right = x.position_right + qty * Decimal(right_side(direction).sign)
-    if max(abs(post_left), abs(post_right)) > p.max_qty:
-        # Position-cap hit is not a risk event — the cap is doing its job; the
-        # trade simply can't grow |pos| further. Drop the tick so it doesn't
-        # flood the decisions log with identical "0.X > max_qty" rows while
-        # we wait for a reverse-direction signal to flatten. Reverse-direction
-        # exits naturally pass this same check (post-trade |pos| <= max_qty)
-        # and proceed to FIRED.
+    if _exceeds_position_cap(x.position, direction, p.qty, p.max_qty):
+        # Cap doing its job — drop the tick (don't flood the log with identical
+        # "over cap" rows while we wait for a reverse-direction signal). Not a
+        # risk event; reverse/flatten fires pass the same check and proceed.
         return None
 
     # NOTE: caller marks Phase.DECISION — live uses `mark()` (mono_ms), backtest
     # uses `mark_at(snap.ts_ms)`. Keeping it out of the pure fn avoids clock-source
     # coupling.
-    return new(Outcome.FIRED, bias=x.bias, edge_bps=edge_bps,
+    return new(Verdict.FIRED, bias=x.bias, edge_bps=edge_bps,
                direction=direction, vwaps=vw)
+
+
+def _exceeds_position_cap(
+    position: Decimal, direction: Direction, qty: Decimal, max_qty: Decimal,
+) -> bool:
+    """Would firing `direction` push |position| past the cap? Post-trade-aware:
+    reverse/flatten trades shrink |pos| and pass even when already at the cap.
+    The cap is strategy policy (a position limit), not a risk event."""
+    post = position + qty * Decimal(direction.sign)
+    return abs(post) > max_qty
 
 
 def _inventory_skew_bps(
     kappa_open_bps: Decimal,
     kappa_close_bps: Decimal,
-    position_left: Decimal,
+    position: Decimal,
     delta_sign: int,
     max_qty: Decimal,
 ) -> Decimal:
@@ -193,16 +205,16 @@ def _inventory_skew_bps(
     |position|/max_qty and signed by whether the trade grows or shrinks
     |position|:
 
-      growing = position_left * delta_sign / max_qty
+      growing = position * delta_sign / max_qty
       skew    = kappa_open  * growing   if growing > 0   (raise threshold)
               = kappa_close * growing   if growing < 0   (lower threshold; growing<0)
 
-    With `delta_sign = left_side(direction).sign` (sell=−1, buy=+1):
-      - If `position_left` and `delta_sign` AGREE in sign  → growing |pos|
+    With `delta_sign = direction.sign` (sell=−1, buy=+1):
+      - If `position` and `delta_sign` AGREE in sign  → growing |pos|
         → positive skew (raise threshold; require stronger edge to add more).
-      - If they DISAGREE                                   → shrinking |pos|
+      - If they DISAGREE                               → shrinking |pos|
         → negative skew (lower threshold; reward flattening).
-      - At `|position_left| = max_qty`, |skew| = the relevant κ (full strength).
+      - At `|position| = max_qty`, |skew| = the relevant κ (full strength).
 
     Asymmetric usage: pass kappa_close_bps=0 to disable exit-easing while
     keeping entry-tightening (the "raise threshold for adding" intuition).
@@ -210,7 +222,7 @@ def _inventory_skew_bps(
     """
     if max_qty == 0:
         return Decimal(0)
-    growing = position_left * Decimal(delta_sign) / max_qty
+    growing = position * Decimal(delta_sign) / max_qty
     if growing > 0:
         return kappa_open_bps * growing
     if growing < 0:

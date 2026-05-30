@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from ...core.exec_record import Direction, Outcome, Phase
+from ...core.exec_record import Direction, Verdict, Phase
 from ...strategy.base import SpreadModel, TimeEwma
 from ...strategy.persistence_gate import PersistenceGate
 from ...strategy.reversion_signal import (
@@ -98,8 +98,7 @@ class TakerTakerBT(BacktestStrategy):
             fills=fills,
             bias=bias,
             is_warm=self._spread.is_warm,
-            position_left=view.position(self.ctx.left_venue),
-            position_right=view.position(self.ctx.right_venue),
+            position=view.position(self.ctx.left_venue),
             bump_a_bps=bump_a if self._throttle_enabled else Decimal(0),
             bump_b_bps=bump_b if self._throttle_enabled else Decimal(0),
         ))
@@ -114,7 +113,7 @@ class TakerTakerBT(BacktestStrategy):
 
         if d is None:
             return []
-        if d.outcome is not Outcome.FIRED:
+        if d.outcome is not Verdict.FIRED:
             # abort/blocked decisions get recorded immediately — no legs.
             self.ctx.recorder.emit(d)
             return []
@@ -129,7 +128,7 @@ class TakerTakerBT(BacktestStrategy):
                 1 for dir_ in self._inflight_dir.values() if dir_ is d.direction
             )
             if same_dir_inflight >= self._inflight_cap:
-                d.outcome = Outcome.BLOCKED_RISK
+                d.outcome = Verdict.BLOCKED_RISK
                 d.abort_reason = (
                     f"in-flight cap {self._inflight_cap} reached "
                     f"for direction {d.direction.value}"

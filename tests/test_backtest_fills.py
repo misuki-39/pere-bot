@@ -7,7 +7,7 @@ from decimal import Decimal
 from perp_arb.backtest.dataset import BBORow
 from perp_arb.backtest.fills import BBOFill, FillModelKind, VwapFill
 from perp_arb.backtest.intents import OrderIntent
-from perp_arb.core.exec_record import Decision, Outcome
+from perp_arb.core.exec_record import Decision, Verdict
 from perp_arb.core.types import Side
 
 
@@ -36,7 +36,7 @@ def _intent(side: Side, qty: str, fm: FillModelKind = FillModelKind.BBO) -> Orde
         decision_id="d-test", ts_ms=1900,
         mid_left=Decimal("100.05"), mid_right=Decimal("100.10"),
         left_quote_ts_ms=1900, right_quote_ts_ms=1900,
-        outcome=Outcome.FIRED,
+        outcome=Verdict.FIRED,
     )
     return OrderIntent(
         decision_id=d.decision_id, decision=d,

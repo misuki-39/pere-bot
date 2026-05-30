@@ -28,7 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from ..core.exec_record import Decision, Direction, Outcome
+from ..core.exec_record import Decision, Direction, Verdict
 from ..utils.precision import BPS
 
 
@@ -84,7 +84,7 @@ class PersistenceGate:
         """
         if not self._p.enabled:
             return candidate
-        if candidate is None or candidate.outcome is not Outcome.FIRED:
+        if candidate is None or candidate.outcome is not Verdict.FIRED:
             self._run = None
             return candidate
 

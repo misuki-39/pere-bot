@@ -407,12 +407,7 @@ class LighterClient(BaseExchange):
             #  avg_entry_price / unrealized_pnl).
             for p in (sdk_p.to_dict() for sdk_p in data.accounts[0].positions):
                 if int(p["market_id"]) == meta.market_index:
-                    pos = Position(
-                        symbol=market.symbol,
-                        size=_signed_size(p),
-                        entry_price=Decimal(str(p.get("avg_entry_price") or 0)),
-                        unrealised_pnl=Decimal(str(p.get("unrealized_pnl") or 0)),
-                    )
+                    pos = _position_from_dict(p, market.symbol)
                     break
         # Pattern A: WS owns the cache; REST only seeds. See docs/position_cache.md.
         self._live_positions.setdefault(market.symbol.raw, pos)
@@ -457,12 +452,7 @@ class LighterClient(BaseExchange):
         if raw_symbol is None:
             return
         meta = self._meta_by_symbol[raw_symbol]
-        pos = Position(
-            symbol=meta.symbol,
-            size=_signed_size(p),
-            entry_price=Decimal(p["avg_entry_price"]),
-            unrealised_pnl=Decimal(p["unrealized_pnl"]),
-        )
+        pos = _position_from_dict(p, meta.symbol)
         self._live_positions[raw_symbol] = pos
         for cb in self._position_cbs.get(raw_symbol, ()):
             cb(pos)
@@ -488,10 +478,21 @@ def _worst_acceptable_price(q: Quote | None, is_ask: bool) -> Decimal:
     return Decimal("0.01") if is_ask else Decimal("1000000000")
 
 
-def _signed_size(p: dict[str, Any]) -> Decimal:
-    """Lighter encodes position as unsigned `position` + separate `sign` (+1/-1)."""
+def _position_from_dict(p: dict[str, Any], symbol: Symbol) -> Position:
+    """Build a Position from a Lighter position dict. Shared by the REST seed
+    (`get_position`, via SDK `.to_dict()`) and the WS delta
+    (`_handle_position_update`) — both payloads carry identical field names
+    (`position` / `sign` / `avg_entry_price` / `unrealized_pnl`).
+
+    Lighter encodes size as unsigned `position` + separate `sign` (+1/-1).
+    """
     size = Decimal(p["position"])
-    return size if int(p["sign"]) >= 0 else -size
+    return Position(
+        symbol=symbol,
+        size=size if int(p["sign"]) >= 0 else -size,
+        entry_price=Decimal(str(p.get("avg_entry_price") or 0)),
+        unrealised_pnl=Decimal(str(p.get("unrealized_pnl") or 0)),
+    )
 
 
 def _sendtx_outcome(reply: dict[str, Any]) -> tuple[bool, str]:
