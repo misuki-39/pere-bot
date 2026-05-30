@@ -223,6 +223,17 @@ class LegOutcome:
     send_ts_ms: int | None = None           # local epoch ms at SEND mark (executor stamps)
     kind: LegKind | None = None
 
+    # decision-time per-venue context — stamped by the live strategy after the
+    # execute() gather (the strategy owns the decision-time book/position; the
+    # executor does not see them). All None in backtest / CSV path; the live
+    # SQLite recorder reads them. Deliberately NOT in `_CSV_FIELDS` so the
+    # backtest legs CSV stays byte-for-byte unchanged.
+    mid: Decimal | None = None              # this venue's decision-time mid
+    quote_ts_ms: int | None = None          # this venue's quote freshness at decision
+    position_before: Decimal | None = None  # this venue's signed position pre-fire
+    bbo_bid_size: Decimal | None = None      # top-of-book bid size at decision
+    bbo_ask_size: Decimal | None = None      # top-of-book ask size at decision
+
     def add(self, event: OrderSnapshot | FillDelta) -> None:
         """Absorb a WS event. `OrderSnapshot` (lighter cumulative state)
         OVERWRITES filled_qty + _weighted_price_sum; `FillDelta` (aster

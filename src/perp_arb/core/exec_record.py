@@ -107,11 +107,18 @@ class Decision:
     # Cash-flow realized PnL for this two-leg trade, net of fees. None on
     # non-FIRED outcomes or partial-failure unwinds (success=False).
     realised_pnl: Decimal | None = None
+    # Same-direction throttle bump applied to the chosen direction's threshold
+    # (bps). The only threshold component that is path-dependent and so cannot
+    # be reconstructed post-hoc — the live SQLite recorder persists it on the
+    # `trades` row. Excluded from the CSV projection (backtest stays unchanged).
+    thr_throttle_bps: Decimal = Decimal(0)
     timeline: Timeline = field(default_factory=Timeline)
     legs: list[LegOutcome] = field(default_factory=list)
 
 
-_DECISION_SKIP = {"timeline", "legs"}
+# `thr_throttle_bps` is live-SQLite-only telemetry; keep it out of the CSV
+# projection so the backtest decisions CSV header/rows are byte-for-byte stable.
+_DECISION_SKIP = {"timeline", "legs", "thr_throttle_bps"}
 
 
 def _decision_header() -> list[str]:

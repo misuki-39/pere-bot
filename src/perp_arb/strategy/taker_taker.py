@@ -50,13 +50,13 @@ from decimal import Decimal
 from ..core.exec_record import (
     Decision,
     Direction,
-    ExecutionRecorder,
     Outcome,
     Phase,
 )
 from ..core.executor import LegIntent, TwoLegExecutor
 from ..core.pnl import pair_pnl_from_legs
-from ..core.types import LegKind, MarketInfo, Side
+from ..core.record_sink import SqliteRecorder
+from ..core.types import LegKind, LegOutcome, MarketInfo, Quote, Side
 from ..risk.manager import RiskManager
 from ..utils.time import now_ms
 from .base import BaseStrategy, SpreadModel, TimeEwma
@@ -98,7 +98,7 @@ class TakerTakerArbitrage(BaseStrategy):
             scale_half_life_s=s.scale_halflife_s,
             warmup_s=s.warmup_seconds,
         )
-        self._recorder: ExecutionRecorder | None = None
+        self._recorder: SqliteRecorder | None = None
         self._evaluating = False
         self._position = SyntheticPosition()
         # Provisional overlay: predicted signed delta NOT YET pushed by
@@ -128,7 +128,7 @@ class TakerTakerArbitrage(BaseStrategy):
         self._reconcile_target: tuple[Decimal, Decimal] | None = None
         self._risk = RiskManager(s.risk)
         self._last_heartbeat_ms = 0
-        self._heartbeat_interval_ms = 300_000  # 5 min; liveness only, trades go to CSV
+        self._heartbeat_interval_ms = 300_000  # 5 min; liveness only, trades go to the recorder
         self._risk_blocked = False
         # parameters consumed by the pure decision function.
         # Wave-1 optimisations (throttle, cap) come from
@@ -231,10 +231,17 @@ class TakerTakerArbitrage(BaseStrategy):
 
     async def run(self) -> None:
         ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        self._recorder = ExecutionRecorder(self.cfg.runtime.log_dir, ts)
         mode_label = "paper" if self.session.is_paper else "live"
+        self._recorder = SqliteRecorder(
+            ts,
+            strategy_id="taker_taker",
+            mode=mode_label,
+            config_json=self.cfg.strategy.model_dump_json(),
+            turso=self.cfg.runtime.turso,
+        )
+        await self._recorder.start()
         _log.info("taker_taker mode=%s recording to %s",
-                  mode_label, self.cfg.runtime.log_dir)
+                  mode_label, self.cfg.runtime.turso.db_path)
 
         # Seed venue position truth before any FIRE evaluates. After a
         # restart with real inventory, this is the only way max_qty stays
@@ -270,7 +277,7 @@ class TakerTakerArbitrage(BaseStrategy):
             await self._stop.wait()
         finally:
             if self._recorder:
-                self._recorder.close()
+                await self._recorder.aclose()
 
     # ---- position view (WS-truth + pending overlay) ----
 
@@ -470,7 +477,7 @@ class TakerTakerArbitrage(BaseStrategy):
             return
         try:
             if d.outcome is Outcome.FIRED:
-                await self._fire(d)
+                await self._fire(d, a_q, b_q)
         finally:
             if self._recorder:
                 self._recorder.emit(d)
@@ -520,6 +527,10 @@ class TakerTakerArbitrage(BaseStrategy):
 
         if d is not None and d.outcome is Outcome.FIRED:
             assert d.direction is not None
+
+            # Persist the chosen direction's throttle bump — the one threshold
+            # component that is path-dependent and so not reconstructable later.
+            d.thr_throttle_bps = bump_a if d.direction is Direction.A else bump_b
 
             # In-flight cap: block if K same-direction entries are already
             # pending. Live's `_evaluating` gate already serializes
@@ -590,16 +601,21 @@ class TakerTakerArbitrage(BaseStrategy):
 
     # ---- order firing ----
 
-    async def _fire(self, d: Decision) -> None:
+    async def _fire(self, d: Decision, a_q: Quote, b_q: Quote) -> None:
         """Resolve Direction → venue-side intents, delegate execution,
         then apply the ExecutionResult to position / risk / throttle.
 
         Strategy owns the Direction→Side resolution because Direction is
         a strategy concept; the executor only sees concrete `Side`s.
         Strategy also owns position / risk / throttle updates because
-        they feed back into the next `_assess`."""
+        they feed back into the next `_assess`. `a_q`/`b_q` are threaded in
+        only to stamp the legs' decision-time per-venue context (mid / quote
+        freshness / position / depth) — telemetry the executor never sees."""
         assert d.direction is not None
         qty = self.cfg.strategy.qty
+        # Decision-time positions, captured before the execute() await mutates
+        # the WS/overlay view.
+        pos_a_before, pos_b_before = self._pos_a(), self._pos_b()
         a_side, b_side = left_side(d.direction), right_side(d.direction)
         if d.direction is Direction.A:
             a_exp, b_exp = d.vwap_left_sell, d.vwap_right_buy
@@ -631,6 +647,12 @@ class TakerTakerArbitrage(BaseStrategy):
                 timeline=d.timeline,
             )
             d.legs = result.legs
+            # Stamp each leg's decision-time per-venue context. result.legs is
+            # ordered [leg_a, leg_b]; a_q/b_q and the pre-fire positions line up
+            # by that order. Quote already carries top-of-book sizes.
+            if len(result.legs) == 2:
+                _stamp_leg_ctx(result.legs[0], a_q, pos_a_before)
+                _stamp_leg_ctx(result.legs[1], b_q, pos_b_before)
             entry_legs = [lg for lg in result.legs if lg.kind is LegKind.ENTRY]
             assert len(entry_legs) == 2
             d.send_ts_ms = entry_legs[0].send_ts_ms
@@ -698,3 +720,13 @@ class TakerTakerArbitrage(BaseStrategy):
         finally:
             if self._inflight_cap > 0:
                 self._inflight_dir.pop(d.decision_id, None)
+
+
+def _stamp_leg_ctx(leg: LegOutcome, q: Quote, position_before: Decimal) -> None:
+    """Attach a leg's decision-time per-venue context for the SQLite recorder.
+    Top-of-book sizes come straight off the Quote."""
+    leg.mid = q.mid
+    leg.quote_ts_ms = q.ts_ms
+    leg.position_before = position_before
+    leg.bbo_bid_size = q.bid_size
+    leg.bbo_ask_size = q.ask_size

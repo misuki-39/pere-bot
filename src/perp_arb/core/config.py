@@ -193,9 +193,31 @@ class KatanaCreds(BaseModel):
     ws_url: str = "wss://websocket-perps.katana.network/v1"
 
 
+class TursoCfg(BaseModel):
+    """libSQL/Turso cloud-sync settings for the live SQLite recorder.
+
+    The recorder always writes a local SQLite file (the on-box source of
+    truth); when `enabled`, a background task replicates new rows to Turso.
+    `url` / `auth_token` come from env (placeholders when absent) so paper
+    runs load without a token. `enabled=False` = local-only, no network, no
+    libsql dependency touched at runtime."""
+
+    enabled: bool = False
+    url: str = ""                       # libsql://<db>.turso.io  (from TURSO_DATABASE_URL)
+    auth_token: str = ""                # from TURSO_AUTH_TOKEN
+    db_path: Path = Path("./logs/live.db")   # local SQLite source of truth
+    sync_interval_s: float = 5.0        # background push cadence
+    sync_batch_rows: int = 500          # max rows per remote batch
+
+    @property
+    def is_placeholder(self) -> bool:
+        return not self.url or not self.auth_token
+
+
 class RuntimeCfg(BaseModel):
     log_dir: Path = Path("./logs")
     log_level: str = "INFO"
+    turso: TursoCfg = TursoCfg()
 
 
 class AppCfg(BaseModel):
@@ -242,9 +264,23 @@ def load_app_config(yaml_path: str | Path, *, mode_override: RunMode | None = No
         base_url=os.getenv("KATANA_BASE_URL") or "https://api-perps.katana.network",
         ws_url=os.getenv("KATANA_WS_URL") or "wss://websocket-perps.katana.network/v1",
     )
+    # Runtime knobs come from the YAML `runtime:` block (non-secret) merged
+    # with env (secrets + dir overrides). Turso secrets are env-only so paper
+    # configs stay credential-free.
+    runtime_raw = raw.get("runtime") or {}
+    turso_raw = runtime_raw.get("turso") or {}
+    turso = TursoCfg(
+        enabled=bool(turso_raw.get("enabled", False)),
+        url=os.getenv("TURSO_DATABASE_URL") or "",
+        auth_token=os.getenv("TURSO_AUTH_TOKEN") or "",
+        db_path=Path(turso_raw.get("db_path") or os.getenv("LIVE_DB_PATH") or "./logs/live.db"),
+        sync_interval_s=float(turso_raw.get("sync_interval_s", 5.0)),
+        sync_batch_rows=int(turso_raw.get("sync_batch_rows", 500)),
+    )
     runtime = RuntimeCfg(
         log_dir=Path(os.getenv("LOG_DIR") or "./logs"),
         log_level=os.getenv("LOG_LEVEL") or "INFO",
+        turso=turso,
     )
 
     return AppCfg(

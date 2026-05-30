@@ -1,25 +1,22 @@
-"""Realized + open PnL for a live taker_taker run.
+"""Realized + open PnL for a live taker_taker run (SQLite recorder).
 
-Used because the bot writing these CSVs predates the per-trade-PnL commit
-(8a6c941) — the `fee` column is empty and there is no PnL log to read back.
-
-Inputs:  decisions_*.csv + legs_*.csv from logs/live/
+Inputs:  the live SQLite DB written by core.record_sink (trades + legs tables).
 Outputs: per-decision cash flow, cumulative realized, mark-to-market on the
 unwound-net open position, time-bucketed series, and a fees sensitivity table.
 
 Cash-flow convention (matches src/perp_arb/core/pnl.py): sell brings cash in
 (+price·qty), buy sends cash out (−price·qty). For a mean-reverting two-leg
 arb, sum of per-pair cash flows == realized PnL when net qty per venue = 0;
-any residual venue exposure is marked at the last observed mid.
+any residual venue exposure is marked at the last observed venue mid.
 
-Run:  uv run python scripts/live_pnl.py logs/live/decisions_*.csv logs/live/legs_*.csv
+Run:  uv run python scripts/live_pnl.py logs/live.db [run_id]
 """
 from __future__ import annotations
 
 import sys
 from decimal import Decimal
-from pathlib import Path
 
+import _db
 import pandas as pd
 
 # Round-trip fee bps from configs/taker_taker_wti.yaml (split per leg).
@@ -31,12 +28,14 @@ def _to_dec(x: object) -> Decimal:
     return Decimal(str(x))
 
 
-def compute(dec_path: Path, legs_path: Path) -> None:
-    dec = pd.read_csv(dec_path)
-    legs = pd.read_csv(legs_path)
+def compute(db_path: str, run_id: str | None) -> None:
+    run = _db.load(db_path, run_id)
+    trades, legs = run.trades, run.legs
 
     # Only successful entry fills.
-    legs = legs[(legs["kind"] == "entry") & (legs["success"].astype(str).str.lower() == "true")].copy()
+    legs = legs[(legs["kind"] == "entry") & (legs["success"] == 1)].copy()
+    if legs.empty:
+        sys.exit(f"no successful entry legs for run {run.run_id}")
     legs["filled_qty"] = legs["filled_qty"].apply(_to_dec)
     legs["realized_price"] = legs["realized_price"].apply(_to_dec)
 
@@ -67,53 +66,46 @@ def compute(dec_path: Path, legs_path: Path) -> None:
             "fee": sum(sub["fee"], Decimal("0")),
         }
         for _, leg in sub.iterrows():
-            row[f"{leg['exchange']}_side"] = leg["side"]
-            row[f"{leg['exchange']}_px"] = leg["realized_price"]
-            row[f"{leg['exchange']}_qty"] = leg["filled_qty"]
+            row[f"{leg['venue']}_side"] = leg["side"]
+            row[f"{leg['venue']}_px"] = leg["realized_price"]
+            row[f"{leg['venue']}_qty"] = leg["filled_qty"]
         row["net_cash"] = row["cash"] - row["fee"]
         rows.append(row)
     pairs = pd.DataFrame(rows).sort_values("ts_ms").reset_index(drop=True)
 
-    # Cumulative realized (net of fees), and gross-of-fees for sensitivity.
     pairs["cum_gross"] = pairs["cash"].cumsum().apply(float)
     pairs["cum_net"] = pairs["net_cash"].cumsum().apply(float)
     pairs["cum_fee"] = pairs["fee"].cumsum().apply(float)
 
     # Open position per venue (sum of signed filled qty: buy=+, sell=−).
-    leg_sign = legs.apply(
+    legs["signed_qty"] = legs.apply(
         lambda r: (Decimal("1") if r["side"] == "buy" else Decimal("-1")) * r["filled_qty"],
         axis=1,
     )
-    legs["signed_qty"] = leg_sign
-    open_pos = legs.groupby("exchange")["signed_qty"].apply(lambda s: sum(s, Decimal("0")))
+    open_pos = legs.groupby("venue")["signed_qty"].apply(lambda s: sum(s, Decimal("0")))
 
-    # Mark-to-market on the open position using last decision mids.
-    last_dec = dec.iloc[-1]
-    mids = {"aster": Decimal(str(last_dec["mid_right"])), "lighter": Decimal(str(last_dec["mid_left"]))}
-    # cost basis per venue: signed cash already captures avg entry; the mark = pos * mid
-    # PnL_open = sum over venues of (signed_qty * mid)  +  current sum_cash
-    # because: open_value = signed_qty * mid; entry cash flow already booked.
-    # Realized cumulative cash flow already includes the open legs' cash;
-    # the mark closes them at current mid.
-    mark_cash = sum(open_pos[v] * mids[v] for v in open_pos.index)  # noqa
-    # Closing the open position requires reversing: open buy → sell, open sell → buy.
-    # Reverse cash flow = -signed_qty * mid_close - close_fee.
-    # So PnL = realized_sum_cash + (close cash) - close fee
+    # Mark-to-market on the open position using each venue's last observed mid
+    # (decision-time mid, now stored per-leg).
+    legs["mid"] = pd.to_numeric(legs["mid"], errors="coerce")
+    last_mid = legs.sort_values("ts_ms").groupby("venue")["mid"].last()
+    mids = {v: Decimal(str(last_mid[v])) for v in open_pos.index}
+
+    mark_cash = sum(open_pos[v] * mids[v] for v in open_pos.index)
     close_cash = -mark_cash  # reverse cash flow at mid
-    close_fee = sum(abs(open_pos[v]) * mids[v] * FEE_BPS_PER_LEG / Decimal("10000") for v in open_pos.index)
+    close_fee = sum(abs(open_pos[v]) * mids[v] * FEE_BPS_PER_LEG / Decimal("10000")
+                    for v in open_pos.index)
 
     total_gross_cash = sum(pairs["cash"].tolist(), Decimal("0"))
     total_fees_entry = sum(pairs["fee"].tolist(), Decimal("0"))
     total_realized_after_mark = total_gross_cash + close_cash - close_fee - total_fees_entry
 
-    # Time spans.
     t0_ms = int(pairs["ts_ms"].iloc[0])
     t1_ms = int(pairs["ts_ms"].iloc[-1])
     span_h = (t1_ms - t0_ms) / 3600_000
 
-    # Direction breakdown.
-    dec_idx = dec.set_index("decision_id")
-    pairs["direction"] = pairs["decision_id"].map(dec_idx["direction"])
+    # Direction breakdown — direction now lives on the trades header.
+    dir_by_id = trades.set_index("decision_id")["direction"]
+    pairs["direction"] = pairs["decision_id"].map(dir_by_id)
     by_dir = pairs.groupby("direction").agg(
         n=("cash", "size"),
         gross_cash=("cash", lambda s: float(sum(s, Decimal("0")))),
@@ -121,7 +113,6 @@ def compute(dec_path: Path, legs_path: Path) -> None:
     )
     by_dir["net_after_fee"] = by_dir["gross_cash"] - by_dir["fees"]
 
-    # Hourly cumulative for the “when did pnl happen” question.
     pairs["hour"] = pd.to_datetime(pairs["ts_ms"], unit="ms", utc=True).dt.floor("h")
     hourly = pairs.groupby("hour").agg(
         n=("cash", "size"),
@@ -132,8 +123,8 @@ def compute(dec_path: Path, legs_path: Path) -> None:
     hourly["cum_net"] = hourly["net"].cumsum()
 
     # ---- output ----
-    print(f"=== Run summary ({dec_path.name}) ===")
-    print(f"  decisions={len(dec)}  fired-and-both-filled-pairs={len(pairs)}")
+    print(f"=== Run summary ({run.run_id}) ===")
+    print(f"  fired-and-both-filled-pairs={len(pairs)}")
     print(f"  span:  {pd.to_datetime(t0_ms, unit='ms', utc=True)}"
           f"  →  {pd.to_datetime(t1_ms, unit='ms', utc=True)}   ({span_h:.2f} h)")
     print(f"  fees assumed: {float(FEES_BPS_RT)} bps round-trip "
@@ -160,13 +151,8 @@ def compute(dec_path: Path, legs_path: Path) -> None:
     print("\n=== Sensitivity to fee assumption (round-trip bps) ===")
     print("  bps   total_pnl  $/day")
     for bps in (0, 0.5, 1.0, 1.5, 2.0, 3.0):
-        bps_d = Decimal(str(bps))
-        per_leg = bps_d / Decimal(2)
-        # recompute fees scaled from gross notional
-        notional = sum(
-            (legs["realized_price"] * legs["filled_qty"]).tolist(), Decimal("0")
-        )
-        # close-leg notional ~ |open_pos|·mid summed
+        per_leg = Decimal(str(bps)) / Decimal(2)
+        notional = sum((legs["realized_price"] * legs["filled_qty"]).tolist(), Decimal("0"))
         close_notional = sum(abs(open_pos[v]) * mids[v] for v in open_pos.index)
         total_fee = (notional + close_notional) * per_leg / Decimal("10000")
         pnl = total_gross_cash + close_cash - total_fee
@@ -180,17 +166,8 @@ def compute(dec_path: Path, legs_path: Path) -> None:
     print("\n=== Hourly PnL ===")
     print(hourly.to_string(float_format=lambda x: f"{x:+.4f}"))
 
-    # Persist the per-pair table next to inputs for further drill-down.
-    out_csv = dec_path.parent / f"pnl_pairs_{dec_path.stem.split('_', 2)[-1]}.csv"
-    pairs.assign(
-        cash=pairs["cash"].apply(float),
-        fee=pairs["fee"].apply(float),
-        net_cash=pairs["net_cash"].apply(float),
-    ).to_csv(out_csv, index=False)
-    print(f"\nWrote per-pair table → {out_csv}")
-
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        sys.exit("usage: live_pnl.py decisions_*.csv legs_*.csv")
-    compute(Path(sys.argv[1]), Path(sys.argv[2]))
+    if len(sys.argv) < 2:
+        sys.exit("usage: live_pnl.py <live.db> [run_id]")
+    compute(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)

@@ -20,6 +20,14 @@ dependencies = [
     "lighter-sdk @ git+https://github.com/elliottech/lighter-python.git",
 ]
 
+[project.optional-dependencies]
+# Cloud sync for the live SQLite recorder. Optional: the recorder writes
+# local SQLite without it; only the Turso push needs the client (imported
+# lazily in core.record_sink). Install with `uv sync --extra turso`.
+turso = [
+    "libsql-client>=0.3",
+]
+
 [project.scripts]
 runbot = "perp_arb.runbot:main"
 runbt = "perp_arb.backtest.cli:main"
