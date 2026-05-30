@@ -101,14 +101,6 @@ class TimeEwma:
         self.value = alpha * x + (Decimal(1) - alpha) * self.value
         return self.value
 
-    def bump(self, delta: Decimal, ts_ms: int) -> None:
-        """Add `delta` on top of the current value and stamp `ts_ms` as the
-        decay anchor. Unlike `update`, this does not EWMA-blend — callers
-        use it when they want an exact step (e.g. throttle seeding)."""
-        current = self.value if self.value is not None else Decimal(0)
-        self.value = current + delta
-        self._last_ts_ms = ts_ms
-
 
 @dataclass(frozen=True)
 class SpreadState:

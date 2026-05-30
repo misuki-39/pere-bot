@@ -234,8 +234,7 @@ def _fill_params() -> TakerFillParams:
 
 
 def _inputs(*, a_bid: str, a_ask: str, l_bid: str, l_ask: str,
-            bias: str = "0", pos: str = "0",
-            bump_a_bps: str = "0", bump_b_bps: str = "0") -> AssessInputs:
+            bias: str = "0", pos: str = "0") -> AssessInputs:
     """Build AssessInputs from BBO quotes (qty=1 fits inside top size)."""
     sa = Symbol(exchange="lighter", raw="WTI", base="WTI", quote="USD")
     sb = Symbol(exchange="aster", raw="CLUSDT", base="WTI", quote="USDT")
@@ -250,26 +249,7 @@ def _inputs(*, a_bid: str, a_ask: str, l_bid: str, l_ask: str,
         fills=fills,
         bias=Decimal(bias), is_warm=True,
         position=Decimal(pos),
-        bump_a_bps=Decimal(bump_a_bps),
-        bump_b_bps=Decimal(bump_b_bps),
     )
-
-
-def test_bump_a_raises_threshold_for_direction_a_only() -> None:
-    """A bump on direction A's threshold should suppress an A-edge fire that
-    would otherwise have triggered, while leaving B unaffected."""
-    # +1.5 bps direction-A edge as above
-    inp_a = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000",
-                    bump_a_bps="1.0")  # +1 bps bump → effective threshold 2 bps > 1.5
-    p = _params()
-    d = assess_reversion(p, inp_a)
-    assert d is None, "direction-A bump should suppress this fire"
-
-    # Same bump on B does not affect a direction-A fire opportunity
-    inp_b_bump = _inputs(a_bid="100.015", a_ask="100.020", l_bid="100.000", l_ask="100.000",
-                         bump_b_bps="1.0")
-    d2 = assess_reversion(p, inp_b_bump)
-    assert d2 is not None and d2.outcome is Verdict.FIRED and d2.direction is Direction.A
 
 
 def test_inventory_skew_widens_growing_direction_narrows_flattening() -> None:

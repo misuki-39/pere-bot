@@ -63,11 +63,6 @@ class AssessInputs:
     Caller is likewise responsible for pricing the fills (`compute_taker_fills`)
     and passing the result — a `TakerFills` or a `FillAbort`.
 
-    Optional same-direction throttle bumps (default 0 = throttle off). When the
-    caller maintains a per-direction TimeEwma of "recently fired" bumps,
-    `bump_a_bps` and `bump_b_bps` add directly to that direction's threshold;
-    the pure function does not own the EWMA state.
-
     `position` is the single offsetting position, keyed off the left leg: the
     two legs are equal-magnitude / opposite-sign by construction, so the right
     leg's position is just `-position` and need not be passed separately.
@@ -79,8 +74,6 @@ class AssessInputs:
     bias: Decimal
     is_warm: bool
     position: Decimal
-    bump_a_bps: Decimal = Decimal(0)
-    bump_b_bps: Decimal = Decimal(0)
 
 
 def left_side(direction: Direction) -> Side:
@@ -154,8 +147,8 @@ def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
         p.inventory_skew_bps, kappa_close, x.position,
         Direction.B.sign, p.max_qty)
 
-    total_thresh_A_bps = fee_bps + skew_A_bps + x.bump_a_bps
-    total_thresh_B_bps = fee_bps + skew_B_bps + x.bump_b_bps
+    total_thresh_A_bps = fee_bps + skew_A_bps
+    total_thresh_B_bps = fee_bps + skew_B_bps
 
     threshold_A = ref_mid * total_thresh_A_bps / BPS
     threshold_B = ref_mid * total_thresh_B_bps / BPS

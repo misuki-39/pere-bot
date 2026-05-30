@@ -44,7 +44,8 @@ def _leg(venue: str, side: Side, *, success=True, error=None) -> LegOutcome:
     lg.last_ts_ms = 1_700_000_000_810
     lg.kind = LegKind.ENTRY
     # decision-time per-venue context (stamped by the live strategy)
-    lg.mid = Decimal("88.6175")
+    lg.bbo_bid = Decimal("88.6150")
+    lg.bbo_ask = Decimal("88.6200")
     lg.quote_ts_ms = 1_700_000_000_400
     lg.position_before = Decimal("0.24")
     lg.bbo_bid_size = Decimal("5")
@@ -63,7 +64,6 @@ def _decision(outcome: Verdict, *, did="d-1", legs=None, failure_reason=None) ->
         bias=Decimal("0.0107"), edge_bps=Decimal("1.94"),
         direction=Direction.B if outcome is Verdict.FIRED else None,
         outcome=outcome, timeline=tl,
-        thr_throttle_bps=Decimal("0.5"),
         failure_reason=failure_reason,
     )
     if legs is not None:
@@ -101,13 +101,12 @@ def test_fired_routes_to_trades_and_legs(tmp_path):
     assert t["success"] == 1
     assert t["failure_reason"] is None
     assert t["lat_decision_send_ms"] == 1          # SEND(101) - DECISION(100)
-    assert t["thr_throttle_bps"] == "0.5"
     # per-leg context round-trips losslessly as TEXT
     lg = legrows[0]
     assert lg["venue"] == "lighter"
     assert lg["position_before"] == "0.24"
     assert lg["bbo_bid_size"] == "5" and lg["bbo_ask_size"] == "7"
-    assert lg["mid"] == "88.6175"
+    assert lg["bbo_bid"] == "88.6150" and lg["bbo_ask"] == "88.6200"
     assert lg["realized_price"] == "88.62"
 
 

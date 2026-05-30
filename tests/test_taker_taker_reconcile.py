@@ -183,7 +183,6 @@ def _mk_strategy(
     s._executor = _StubExecutor()
     s._inflight_cap = 0
     s._inflight_dir = {}
-    s._throttle_enabled = False
     s._recorder = None
     return s, leg_a, leg_b, session
 
@@ -321,7 +320,6 @@ async def test_reconcile_rebalance_raise_sets_pending() -> None:
     s._executor = _StubExecutor()
     s._inflight_cap = 0
     s._inflight_dir = {}
-    s._throttle_enabled = False
     s._recorder = None
 
     await s._reconcile_after_failure(Decimal("0"), Decimal("0"))

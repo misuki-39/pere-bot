@@ -12,10 +12,8 @@ job, not ours.
 
 from __future__ import annotations
 
-from decimal import Decimal
-
 from ...core.recording.decision import Direction, Phase, Verdict
-from ...strategy.base import SpreadModel, TimeEwma
+from ...strategy.base import SpreadModel
 from ...strategy.persistence_gate import PersistenceGate
 from ...strategy.reversion_signal import (
     AssessInputs,
@@ -53,13 +51,6 @@ class TakerTakerBT(BacktestStrategy):
             inventory_skew_bps=ctx.inventory_skew_bps,
             inventory_skew_close_bps=ctx.inventory_skew_close_bps,
         )
-        # Same-direction throttle: each FIRED on direction X bumps that
-        # direction's threshold by `throttle_bump_bps`; the bump decays back
-        # toward 0 with `throttle_halflife_s` half-life. Δ=0 = throttle off.
-        self._throttle_enabled = ctx.throttle_bump_bps > 0
-        self._bump_a = TimeEwma(half_life_s=ctx.throttle_halflife_s)
-        self._bump_b = TimeEwma(half_life_s=ctx.throttle_halflife_s)
-        self._throttle_bump_bps = ctx.throttle_bump_bps
         # Per-direction in-flight cap. K=0 disables. K=1 = at most one outstanding
         # entry of that direction at a time; new fires are recorded as
         # BLOCKED_RISK (no intents emitted). State here, not in the engine,
@@ -78,17 +69,6 @@ class TakerTakerBT(BacktestStrategy):
     def on_tick(self, snap: MarketSnapshot, view: EngineView) -> list[OrderIntent]:
         bias = self._spread.update(snap.left_quote.mid - snap.right_quote.mid, snap.ts_ms).center
 
-        # Decay current bumps to "now" before reading them (TimeEwma.update with
-        # the current value acts as a pure time-decay step — alpha applies to
-        # the new sample which equals the current value, so output = current
-        # * (1 - alpha) + current * alpha = current; the side-effect is the
-        # advancement of _last_ts_ms so the *next* update sees the right dt).
-        bump_a = self._bump_a.value if self._bump_a.value is not None else Decimal(0)
-        bump_b = self._bump_b.value if self._bump_b.value is not None else Decimal(0)
-        if self._throttle_enabled and self._bump_a.value is not None:
-            bump_a = self._bump_a.update(Decimal(0), snap.ts_ms)  # decay toward 0
-            bump_b = self._bump_b.update(Decimal(0), snap.ts_ms)
-
         fills = compute_taker_fills(
             self._fill_params, snap.left_book, snap.right_book)
         d = assess_reversion(self._params, AssessInputs(
@@ -99,8 +79,6 @@ class TakerTakerBT(BacktestStrategy):
             bias=bias,
             is_warm=self._spread.is_warm,
             position=view.position(self.ctx.left_venue),
-            bump_a_bps=bump_a if self._throttle_enabled else Decimal(0),
-            bump_b_bps=bump_b if self._throttle_enabled else Decimal(0),
         ))
 
         # Persistence-confirm gate: suppress a FIRED decision until its edge
@@ -137,12 +115,6 @@ class TakerTakerBT(BacktestStrategy):
                 return []
 
         d.timeline.mark_at(Phase.DECISION, snap.ts_ms)
-
-        # Same-direction throttle: bump this direction's threshold; let it
-        # decay over `throttle_halflife_s` (handled at top-of-tick).
-        if self._throttle_enabled:
-            target = self._bump_a if d.direction is Direction.A else self._bump_b
-            target.bump(self._throttle_bump_bps, snap.ts_ms)
 
         # Track this decision for the in-flight cap.
         if self._inflight_cap > 0:

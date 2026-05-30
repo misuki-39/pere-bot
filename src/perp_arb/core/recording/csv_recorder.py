@@ -23,7 +23,7 @@ from .recorder import Recorder
 # These fields are live-SQLite-only telemetry (or non-serialisable); keep them
 # out of the CSV projection so the backtest decisions CSV header/rows are
 # byte-for-byte stable.
-_DECISION_SKIP = {"timeline", "thr_throttle_bps", "failure_reason"}
+_DECISION_SKIP = {"timeline", "failure_reason"}
 
 
 def _decision_header() -> list[str]:

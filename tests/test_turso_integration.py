@@ -47,7 +47,8 @@ def _leg(venue: str, side: Side, px: str) -> LegOutcome:
     lg.send_ts_ms = 1_700_000_000_500
     lg.last_ts_ms = 1_700_000_000_810
     lg.kind = LegKind.ENTRY
-    lg.mid = Decimal(px)
+    lg.bbo_bid = Decimal(px)
+    lg.bbo_ask = Decimal(px)
     lg.quote_ts_ms = 1_700_000_000_400
     lg.position_before = Decimal("0.24")
     lg.bbo_bid_size = Decimal("5")
@@ -64,7 +65,7 @@ def _fired(run_id: str) -> tuple[Decision, list[LegOutcome]]:
         mid_left=Decimal("88.61"), mid_right=Decimal("88.63"),
         left_quote_ts_ms=1, right_quote_ts_ms=1, bias=Decimal("0.0107"),
         edge_bps=Decimal("1.94"), direction=Direction.B, outcome=Verdict.FIRED,
-        timeline=tl, thr_throttle_bps=Decimal("0.5"),
+        timeline=tl,
     )
     legs = [_leg("lighter", Side.BUY, "88.61"), _leg("aster", Side.SELL, "88.63")]
     d.send_ts_ms = legs[0].send_ts_ms
@@ -111,15 +112,14 @@ async def test_turso_roundtrip(tmp_path):
         try:
             # trades: 1 row, success, direction, lat round-tripped
             rs = await client.execute(
-                "SELECT decision_id, direction, success, lat_decision_send_ms, "
-                "thr_throttle_bps FROM trades WHERE run_id=?", [run_id])
+                "SELECT decision_id, direction, success, lat_decision_send_ms "
+                "FROM trades WHERE run_id=?", [run_id])
             assert len(rs.rows) == 1
             row = rs.rows[0]
             assert row[0] == f"{run_id}-f0"
             assert row[1] == "B"
             assert row[2] == 1
             assert row[3] == 2          # SEND(102) - DECISION(100)
-            assert row[4] == "0.5"
 
             # legs: 2 rows; per-venue context lands losslessly as TEXT
             rs = await client.execute(

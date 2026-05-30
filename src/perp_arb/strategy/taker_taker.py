@@ -11,7 +11,7 @@ decisions to
 `TwoLegExecutor`, which owns cid generation, the two-leg gather, WS
 fill tracking, partial-failure unwind, and paper-mode synth. The
 strategy only feeds `ExecutionResult` back into position / risk /
-throttle / heartbeat state — it never sees place acks or WS fills.
+heartbeat state — it never sees place acks or WS fills.
 
 Modes (passed through to the executor at construction time):
   * `paper` — synthetic fills from current book VWAP; no venue submits.
@@ -59,7 +59,7 @@ from ..core.recording.sqlite_recorder import SqliteRecorder
 from ..core.types import LegKind, LegOutcome, MarketInfo, Quote, Side
 from ..risk.manager import RiskManager
 from ..utils.time import now_ms
-from .base import BaseStrategy, SpreadModel, TimeEwma
+from .base import BaseStrategy, SpreadModel
 from .persistence_gate import PersistenceGate, PersistenceParams
 from .reversion_signal import (
     AssessInputs,
@@ -131,9 +131,9 @@ class TakerTakerArbitrage(BaseStrategy):
         self._heartbeat_interval_ms = 300_000  # 5 min; liveness only, trades go to the recorder
         self._risk_blocked = False
         # parameters consumed by the pure decision function.
-        # Wave-1 optimisations (throttle, cap) come from
-        # `s.optimisations` — defaults are all "off" so legacy configs that
-        # omit the block keep their pre-Wave-1 behaviour.
+        # Wave-1 optimisations (cap) come from `s.optimisations` — defaults
+        # are all "off" so legacy configs that omit the block keep their
+        # pre-Wave-1 behaviour.
         opt = s.optimisations
         self._fill_params = TakerFillParams(
             qty=Decimal(str(s.qty)),
@@ -152,14 +152,6 @@ class TakerTakerArbitrage(BaseStrategy):
                 else None
             ),
         )
-
-        # Same-direction throttle: each FILLED on direction X bumps that
-        # direction's threshold by `throttle_bump_bps`; the bump decays
-        # back toward 0 with `throttle_halflife_s` half-life. Δ=0 disables.
-        self._throttle_enabled = opt.throttle_bump_bps > 0
-        self._throttle_bump_bps = Decimal(str(opt.throttle_bump_bps))
-        self._bump_a = TimeEwma(half_life_s=opt.throttle_halflife_s)
-        self._bump_b = TimeEwma(half_life_s=opt.throttle_halflife_s)
 
         # Per-direction in-flight cap. K=0 disables. K=1 = at most one
         # outstanding entry of that direction at a time.
@@ -198,11 +190,6 @@ class TakerTakerArbitrage(BaseStrategy):
             max_levels=s.max_levels,
         )
 
-        if self._throttle_enabled:
-            _log.info(
-                "same-side throttle enabled: bump=%s bps halflife=%ss",
-                self._throttle_bump_bps, opt.throttle_halflife_s,
-            )
         if self._inflight_cap > 0:
             _log.info(
                 "in-flight cap enabled K=%d (note: structural no-op in "
@@ -495,17 +482,6 @@ class TakerTakerArbitrage(BaseStrategy):
         now = now_ms()
         bias = self._spread.update(a_q.mid - b_q.mid, now).center
 
-        # Same-side throttle bumps: decay to "now" before reading. Calling
-        # `update` with the current value advances the internal timestamp
-        # without altering the value, so a follow-up `update(0, now+dt)` in
-        # a later tick decays correctly. We pass 0 here as the new sample
-        # to push the EWMA toward 0 over the halflife.
-        bump_a = Decimal(0)
-        bump_b = Decimal(0)
-        if self._throttle_enabled and self._bump_a.value is not None:
-            bump_a = self._bump_a.update(Decimal(0), now)
-            bump_b = self._bump_b.update(Decimal(0), now)
-
         fills = compute_taker_fills(self._fill_params, a_book, b_book)
         d = assess_reversion(self._params, AssessInputs(
             now_ms=now,
@@ -513,8 +489,6 @@ class TakerTakerArbitrage(BaseStrategy):
             fills=fills,
             bias=bias, is_warm=self._spread.is_warm,
             position=self._pos_a(),
-            bump_a_bps=bump_a,
-            bump_b_bps=bump_b,
         ))
 
         # Persistence-confirm gate: a temporal filter that suppresses a FIRED
@@ -529,10 +503,6 @@ class TakerTakerArbitrage(BaseStrategy):
 
         if d is not None and d.outcome is Verdict.FIRED:
             assert d.direction is not None
-
-            # Persist the chosen direction's throttle bump — the one threshold
-            # component that is path-dependent and so not reconstructable later.
-            d.thr_throttle_bps = bump_a if d.direction is Direction.A else bump_b
 
             # In-flight cap: block if K same-direction entries are already
             # pending. Live's `_evaluating` gate already serializes
@@ -605,11 +575,11 @@ class TakerTakerArbitrage(BaseStrategy):
 
     async def _fire(self, d: Decision, a_q: Quote, b_q: Quote) -> ExecutionResult:
         """Resolve Direction → venue-side intents, delegate execution,
-        then apply the ExecutionResult to position / risk / throttle.
+        then apply the ExecutionResult to position / risk.
 
         Strategy owns the Direction→Side resolution because Direction is
         a strategy concept; the executor only sees concrete `Side`s.
-        Strategy also owns position / risk / throttle updates because
+        Strategy also owns position / risk updates because
         they feed back into the next `_assess`. `a_q`/`b_q` are threaded in
         only to stamp the legs' decision-time per-venue context (mid / quote
         freshness / position / depth) — telemetry the executor never sees."""
@@ -699,12 +669,6 @@ class TakerTakerArbitrage(BaseStrategy):
                     self._risk.record_pnl(pnl)
                     d.realised_pnl = pnl
 
-                # Seed throttle bump only on confirmed FILLED — a partial /
-                # both-fail consumed no edge.
-                if self._throttle_enabled:
-                    target = self._bump_a if d.direction is Direction.A else self._bump_b
-                    target.bump(self._throttle_bump_bps, now_ms())
-
                 _log.info(
                     "[%s] pos_a=%s pos_b=%s pnl_total=%s",
                     d.decision_id,
@@ -729,8 +693,10 @@ class TakerTakerArbitrage(BaseStrategy):
 
 def _stamp_leg_ctx(leg: LegOutcome, q: Quote, position_before: Decimal) -> None:
     """Attach a leg's decision-time per-venue context for the SQLite recorder.
-    Top-of-book sizes come straight off the Quote."""
-    leg.mid = q.mid
+    Raw top-of-book prices + sizes come straight off the Quote — analysis
+    picks the touch by side (SELL→bid, BUY→ask) and can derive mid / spread."""
+    leg.bbo_bid = q.bid
+    leg.bbo_ask = q.ask
     leg.quote_ts_ms = q.ts_ms
     leg.position_before = position_before
     leg.bbo_bid_size = q.bid_size

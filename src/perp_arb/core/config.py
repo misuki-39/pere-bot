@@ -84,12 +84,6 @@ class OptimisationsCfg(BaseModel):
     shrinks (κ_close). Default 0 / None = off. See
     docs/inventory_skew_wti_2026-05-24.md for BT-derived recommendations.
     """
-    # Same-direction threshold throttle. After each FILLED on direction X,
-    # raise X's threshold by `throttle_bump_bps`; decay back over half-life
-    # `throttle_halflife_s`. bump=0 disables.
-    throttle_bump_bps: Decimal = Decimal("0")
-    throttle_halflife_s: float = Field(default=3.0, gt=0)
-
     # Per-direction in-flight cap. K=0 disables. K=1 = at most one outstanding
     # entry of that direction at a time. Note: live's `_evaluating` gate in
     # `taker_taker._schedule_eval` already serializes evaluation, so this is

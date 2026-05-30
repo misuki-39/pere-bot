@@ -130,8 +130,6 @@ def test_mode_override_replaces_yaml_mode(tmp_path: Path) -> None:
 def test_optimisations_defaults_when_block_absent() -> None:
     cfg = StrategyCfg.model_validate(yaml.safe_load(SAMPLE_YAML))
     opt = cfg.optimisations
-    assert opt.throttle_bump_bps == Decimal("0")
-    assert opt.throttle_halflife_s == 3.0
     assert opt.in_flight_cap_per_direction == 0
     # inventory skew default-off: κ_open=0 disables widener; κ_close=None
     # means "symmetric — fall back to κ_open" rather than "explicitly 0".
@@ -155,13 +153,9 @@ def test_optimisations_inventory_skew_round_trips() -> None:
 def test_optimisations_block_fully_populated() -> None:
     raw = yaml.safe_load(SAMPLE_YAML)
     raw["optimisations"] = {
-        "throttle_bump_bps": "2",
-        "throttle_halflife_s": 5.0,
         "in_flight_cap_per_direction": 1,
     }
     cfg = StrategyCfg.model_validate(raw)
-    assert cfg.optimisations.throttle_bump_bps == Decimal("2")
-    assert cfg.optimisations.throttle_halflife_s == 5.0
     assert cfg.optimisations.in_flight_cap_per_direction == 1
 
 
@@ -188,4 +182,4 @@ max_levels: 3
     cfg = StrategyCfg.model_validate(yaml.safe_load(sm_yaml))
     assert cfg.strategy == "spread_monitor"
     # default block fills in
-    assert cfg.optimisations.throttle_bump_bps == Decimal("0")
+    assert cfg.optimisations.in_flight_cap_per_direction == 0

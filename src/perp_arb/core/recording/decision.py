@@ -116,11 +116,6 @@ class Decision:
     # Executor's failure narrative for a fired trade (None = all legs filled).
     # The live SQLite `trades` row's success/failure_reason derive from this —
     # the result summary, sourced from `ExecutionResult.failure_reason`, not the
-    # legs. Like `thr_throttle_bps`: live-SQLite-only, kept out of the CSV.
+    # legs. Live-SQLite-only, kept out of the CSV projection.
     failure_reason: str | None = None
-    # Same-direction throttle bump applied to the chosen direction's threshold
-    # (bps). The only threshold component that is path-dependent and so cannot
-    # be reconstructed post-hoc — the live SQLite recorder persists it on the
-    # `trades` row. Excluded from the CSV projection (backtest stays unchanged).
-    thr_throttle_bps: Decimal = Decimal(0)
     timeline: Timeline = field(default_factory=Timeline)

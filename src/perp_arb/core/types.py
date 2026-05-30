@@ -228,7 +228,8 @@ class LegOutcome:
     # executor does not see them). All None in backtest / CSV path; the live
     # SQLite recorder reads them. Deliberately NOT in `_CSV_FIELDS` so the
     # backtest legs CSV stays byte-for-byte unchanged.
-    mid: Decimal | None = None              # this venue's decision-time mid
+    bbo_bid: Decimal | None = None          # this venue's best bid at decision (SELL fills here)
+    bbo_ask: Decimal | None = None          # this venue's best ask at decision (BUY fills here)
     quote_ts_ms: int | None = None          # this venue's quote freshness at decision
     position_before: Decimal | None = None  # this venue's signed position pre-fire
     bbo_bid_size: Decimal | None = None      # top-of-book bid size at decision
