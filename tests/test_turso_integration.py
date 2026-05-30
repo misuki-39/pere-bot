@@ -47,7 +47,6 @@ def _leg(venue: str, side: Side, px: str) -> LegOutcome:
     lg.send_ts_ms = 1_700_000_000_500
     lg.last_ts_ms = 1_700_000_000_810
     lg.kind = LegKind.ENTRY
-    lg.quote_ts_ms = 1_700_000_000_400
     return lg
 
 
@@ -117,15 +116,14 @@ async def test_turso_roundtrip(tmp_path):
             assert row[3] == 2          # SEND(102) - DECISION(100)
             assert row[4] == "0.24"     # decision-time inventory on trades
 
-            # legs: 2 rows; per-venue context lands losslessly as TEXT
+            # legs: 2 rows; per-venue execution detail lands losslessly as TEXT
             rs = await client.execute(
-                "SELECT venue, side, realized_price, quote_ts_ms "
+                "SELECT venue, side, realized_price "
                 "FROM legs WHERE run_id=? ORDER BY venue", [run_id])
             assert len(rs.rows) == 2
             aster, lighter = rs.rows[0], rs.rows[1]
             assert aster[0] == "aster" and lighter[0] == "lighter"
             assert lighter[2] == "88.61"          # realized_price
-            assert lighter[3] == 1_700_000_000_400  # quote_ts_ms (INTEGER)
 
             # rejection: 1 row, no legs
             rs = await client.execute(

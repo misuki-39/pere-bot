@@ -43,8 +43,6 @@ def _leg(venue: str, side: Side, *, success=True, error=None) -> LegOutcome:
     lg.send_ts_ms = 1_700_000_000_500
     lg.last_ts_ms = 1_700_000_000_810
     lg.kind = LegKind.ENTRY
-    # per-venue decision-time context (stamped by the live strategy)
-    lg.quote_ts_ms = 1_700_000_000_400
     return lg
 
 
@@ -98,10 +96,9 @@ def test_fired_routes_to_trades_and_legs(tmp_path):
     assert t["failure_reason"] is None
     assert t["lat_decision_send_ms"] == 1          # SEND(101) - DECISION(100)
     assert t["position_before"] == "0.24"          # decision-time inventory on trades
-    # per-leg context round-trips losslessly as TEXT
+    # per-leg execution detail round-trips losslessly as TEXT
     lg = legrows[0]
     assert lg["venue"] == "lighter"
-    assert lg["quote_ts_ms"] == 1_700_000_000_400
     assert lg["realized_price"] == "88.62"
 
 

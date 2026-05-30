@@ -82,7 +82,7 @@ class _AlwaysFireStrategy(BacktestStrategy):
         d = Decision(
             decision_id=f"d-{self.intents_built}",
             ts_ms=snap.ts_ms,
-            mid_left=snap.left_quote.mid, mid_right=snap.right_quote.mid,
+            mid_left=snap.left_book.mid, mid_right=snap.right_book.mid,
             left_quote_ts_ms=snap.left_ts_ms, right_quote_ts_ms=snap.right_ts_ms,
             outcome=Verdict.FIRED,
         )

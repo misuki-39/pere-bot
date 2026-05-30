@@ -223,16 +223,6 @@ class LegOutcome:
     send_ts_ms: int | None = None           # local epoch ms at SEND mark (executor stamps)
     kind: LegKind | None = None
 
-    # decision-time per-venue context — stamped by the live strategy after the
-    # execute() gather (the executor does not see it). Per-venue, so it belongs
-    # on the leg, not the per-decision `trades` row: each venue's quote freshness
-    # at decision. (Decision-time inventory is NOT here — it's a single
-    # decision-level quantity on `Decision.position_before` / the trades row;
-    # and the book/BBO isn't re-stored — already folded into `expected_price`.)
-    # None in backtest / CSV path; the live SQLite recorder reads it. Deliberately
-    # NOT in `_CSV_FIELDS` so the backtest legs CSV stays byte-for-byte unchanged.
-    quote_ts_ms: int | None = None          # this venue's quote freshness at decision (staleness forensics)
-
     def add(self, event: OrderSnapshot | FillDelta) -> None:
         """Absorb a WS event. `OrderSnapshot` (lighter cumulative state)
         OVERWRITES filled_qty + _weighted_price_sum; `FillDelta` (aster

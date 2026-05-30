@@ -67,14 +67,17 @@ class TakerTakerBT(BacktestStrategy):
         self._prev_right_ts: int | None = None
 
     def on_tick(self, snap: MarketSnapshot, view: EngineView) -> list[OrderIntent]:
-        bias = self._spread.update(snap.left_quote.mid - snap.right_quote.mid, snap.ts_ms).center
+        # Top-of-book mids; the snapshot is always built one-level, so present.
+        mid_l, mid_r = snap.left_book.mid, snap.right_book.mid
+        assert mid_l is not None and mid_r is not None
+        bias = self._spread.update(mid_l - mid_r, snap.ts_ms).center
 
         fills = compute_taker_fills(
             self._fill_params, snap.left_book, snap.right_book)
         d = assess_reversion(self._params, AssessInputs(
             now_ms=snap.ts_ms,
-            left_quote=snap.left_quote,
-            right_quote=snap.right_quote,
+            mid_left=mid_l, mid_right=mid_r,
+            left_ts_ms=snap.left_ts_ms, right_ts_ms=snap.right_ts_ms,
             fills=fills,
             bias=bias,
             is_warm=self._spread.is_warm,

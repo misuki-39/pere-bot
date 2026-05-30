@@ -36,7 +36,6 @@ from perp_arb.core.types import (
     MarketInfo,
     OrderStatus,
     Position,
-    Quote,
     Side,
     Symbol,
 )
@@ -148,16 +147,6 @@ def _mk_decision(qty: Decimal) -> Decision:
     )
 
 
-def _mk_quote() -> Quote:
-    """Minimal quote stub for `_fire`'s per-leg context stamping."""
-    return Quote(
-        symbol=_SYM_A,
-        bid=Decimal("100"), bid_size=Decimal("1"),
-        ask=Decimal("100"), ask_size=Decimal("1"),
-        ts_ms=1_700_000_000_000,
-    )
-
-
 class _StubExecutor:
     """Replace `_executor`. `on_execute` is invoked synchronously inside
     `execute()` AFTER the strategy snapshots `pre_a`/`pre_b` but BEFORE
@@ -188,7 +177,7 @@ async def test_pending_gets_full_delta_when_ws_did_not_arrive() -> None:
     s, _a, _b = _mk_strategy(qty=qty)
     # Executor does NOT mutate live_size — simulating WS hasn't arrived.
     s._executor = _StubExecutor(qty)
-    await s._fire(_mk_decision(qty), _mk_quote(), _mk_quote())
+    await s._fire(_mk_decision(qty))
     # Direction A: leg_a (lighter) sells, leg_b (aster) buys.
     assert s._pending_a == -qty
     assert s._pending_b == +qty
@@ -214,7 +203,7 @@ async def test_pending_stays_zero_when_ws_already_absorbed_during_await() -> Non
         leg_b.live_size = +qty  # leg_b (aster) bought qty
 
     s._executor = _StubExecutor(qty, on_execute=ws_lands_during_await)
-    await s._fire(_mk_decision(qty), _mk_quote(), _mk_quote())
+    await s._fire(_mk_decision(qty))
     # Critical assertion: pending stays at 0 because WS already absorbed
     # the delta. live_position alone reflects the position.
     assert s._pending_a == Decimal("0")
@@ -237,7 +226,7 @@ async def test_pending_partial_overlay_when_ws_partially_caught_up() -> None:
         leg_b.live_size = +partial
 
     s._executor = _StubExecutor(qty, on_execute=ws_partial_during_await)
-    await s._fire(_mk_decision(qty), _mk_quote(), _mk_quote())
+    await s._fire(_mk_decision(qty))
     # gap_a = delta_a - (post - pre) = -qty - (-partial - 0) = -(qty - partial)
     assert s._pending_a == -(qty - partial)
     assert s._pending_b == +(qty - partial)
@@ -253,7 +242,7 @@ async def test_pending_not_bumped_on_executor_failure() -> None:
     qty = Decimal("0.12")
     s, _a, _b = _mk_strategy(qty=qty)
     s._executor = _StubExecutor(qty, success=False)
-    await s._fire(_mk_decision(qty), _mk_quote(), _mk_quote())
+    await s._fire(_mk_decision(qty))
     assert s._pending_a == Decimal("0")
     assert s._pending_b == Decimal("0")
     assert s._pos_a() == Decimal("0")

@@ -30,8 +30,6 @@ class MarketSnapshot:
     right_venue: str
     left_ts_ms: int
     right_ts_ms: int
-    left_quote: Quote
-    right_quote: Quote
     left_book: OrderBook
     right_book: OrderBook
     vwap_left_sell: Decimal | None
@@ -83,8 +81,6 @@ def build_snapshot(row: BBORow) -> MarketSnapshot:
         ts_ms=row.ts_ms,
         left_venue=row.left_venue, right_venue=row.right_venue,
         left_ts_ms=row.left_ts_ms, right_ts_ms=row.right_ts_ms,
-        left_quote=_quote(row, "left"),
-        right_quote=_quote(row, "right"),
         left_book=_book(row, "left"),
         right_book=_book(row, "right"),
         vwap_left_sell=row.vwap_left_sell, vwap_left_buy=row.vwap_left_buy,

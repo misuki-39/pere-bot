@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from ..core.recording.decision import Decision, Direction, Verdict
-from ..core.types import Quote, Side
+from ..core.types import Side
 from ..utils.precision import BPS
 from .taker_fill_model import FillAbort, TakerFills
 
@@ -63,13 +63,21 @@ class AssessInputs:
     Caller is likewise responsible for pricing the fills (`compute_taker_fills`)
     and passing the result — a `TakerFills` or a `FillAbort`.
 
+    Decision-time market context enters as plain scalars (`mid_*`, `*_ts_ms`),
+    not a venue `Quote`: the only things this function reads are the two mids
+    (threshold reference) and the two quote timestamps (staleness gate). The
+    caller extracts them from the book's top — this function never sees a book
+    or a `Quote`.
+
     `position` is the single offsetting position, keyed off the left leg: the
     two legs are equal-magnitude / opposite-sign by construction, so the right
     leg's position is just `-position` and need not be passed separately.
     """
     now_ms: int
-    left_quote: Quote
-    right_quote: Quote
+    mid_left: Decimal
+    mid_right: Decimal
+    left_ts_ms: int
+    right_ts_ms: int
     fills: TakerFills | FillAbort
     bias: Decimal
     is_warm: bool
@@ -91,8 +99,8 @@ def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
     — a fire, or a noteworthy abort (stale quote / no depth) — or `None` for an
     ordinary non-event (pre-warmup, no positive edge, or the position cap doing
     its job). Pure; never raises for ordinary market states."""
-    mid_left = x.left_quote.mid
-    mid_right = x.right_quote.mid
+    mid_left = x.mid_left
+    mid_right = x.mid_right
 
     def new(
         outcome: Verdict, reason: str | None = None, *,
@@ -104,8 +112,8 @@ def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
             decision_id=f"d-{uuid.uuid4().hex[:10]}",
             ts_ms=x.now_ms,
             mid_left=mid_left, mid_right=mid_right,
-            left_quote_ts_ms=x.left_quote.ts_ms,
-            right_quote_ts_ms=x.right_quote.ts_ms,
+            left_quote_ts_ms=x.left_ts_ms,
+            right_quote_ts_ms=x.right_ts_ms,
             bias=bias,
             vwap_left_sell=v.left_sell, vwap_left_buy=v.left_buy,
             vwap_right_sell=v.right_sell, vwap_right_buy=v.right_buy,
@@ -113,7 +121,7 @@ def assess_reversion(p: AssessParams, x: AssessInputs) -> Decision | None:
             outcome=outcome, abort_reason=reason,
         )
 
-    if (x.now_ms - max(x.left_quote.ts_ms, x.right_quote.ts_ms)) > p.max_stale_ms:
+    if (x.now_ms - max(x.left_ts_ms, x.right_ts_ms)) > p.max_stale_ms:
         return new(Verdict.ABORT_STALE, "quote older than max_stale_ms")
 
     if not x.is_warm:

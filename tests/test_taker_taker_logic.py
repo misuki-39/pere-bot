@@ -245,7 +245,8 @@ def _inputs(*, a_bid: str, a_ask: str, l_bid: str, l_ask: str,
     fills = compute_taker_fills(_fill_params(), a_book, b_book)
     return AssessInputs(
         now_ms=0,
-        left_quote=a_q, right_quote=b_q,
+        mid_left=a_q.mid, mid_right=b_q.mid,
+        left_ts_ms=a_q.ts_ms, right_ts_ms=b_q.ts_ms,
         fills=fills,
         bias=Decimal(bias), is_warm=True,
         position=Decimal(pos),

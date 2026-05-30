@@ -56,7 +56,7 @@ from ..core.recording.decision import (
     Verdict,
 )
 from ..core.recording.sqlite_recorder import SqliteRecorder
-from ..core.types import LegKind, LegOutcome, MarketInfo, Quote, Side
+from ..core.types import LegKind, MarketInfo, Side
 from ..risk.manager import RiskManager
 from ..utils.time import now_ms
 from .base import BaseStrategy, SpreadModel
@@ -454,38 +454,44 @@ class TakerTakerArbitrage(BaseStrategy):
 
         a_book = self._leg_a().order_book(self._leg_a_market())
         b_book = self._leg_b().order_book(self._leg_b_market())
-        a_q = self._leg_a().best_quote(self._leg_a_market())
-        b_q = self._leg_b().best_quote(self._leg_b_market())
-        if a_book is None or b_book is None or a_q is None or b_q is None:
+        if a_book is None or b_book is None:
             return
 
-        d = self._assess(a_book, b_book, a_q, b_q)
+        d = self._assess(a_book, b_book)
         if d is None:
             return
         result: ExecutionResult | None = None
         try:
             if d.outcome is Verdict.FIRED:
-                result = await self._fire(d, a_q, b_q)
+                result = await self._fire(d)
         finally:
             if self._recorder:
                 self._recorder.emit(d)
                 if result is not None:
                     self._recorder.emit_legs(d.decision_id, d.ts_ms, result.legs)
 
-    def _assess(self, a_book, b_book, a_q, b_q) -> Decision | None:
-        """Thin wrapper around the pure `assess_reversion` decision math.
+    def _assess(self, a_book, b_book) -> Decision | None:
+        """Thin wrapper around the pure `assess_reversion` decision math, and
+        the single seam that turns raw books into the signal's inputs: depth
+        fills (via the fill model) + top-of-book mid/ts. The pure signal never
+        sees a book or a Quote.
 
         Live-only responsibilities kept here: update the EWMA, run the
         operational `RiskManager` gates (halted / consecutive-failures / daily
         PnL — the pure function only checks the structural `max_qty` cap), and
         emit the throttled heartbeat log."""
         now = now_ms()
-        bias = self._spread.update(a_q.mid - b_q.mid, now).center
+        # Top-of-book mids. Drivers only publish two-sided books, so once the
+        # caller has a non-None book its `mid` is present.
+        mid_a, mid_b = a_book.mid, b_book.mid
+        assert mid_a is not None and mid_b is not None
+        bias = self._spread.update(mid_a - mid_b, now).center
 
         fills = compute_taker_fills(self._fill_params, a_book, b_book)
         d = assess_reversion(self._params, AssessInputs(
             now_ms=now,
-            left_quote=a_q, right_quote=b_q,
+            mid_left=mid_a, mid_right=mid_b,
+            left_ts_ms=a_book.ts_ms, right_ts_ms=b_book.ts_ms,
             fills=fills,
             bias=bias, is_warm=self._spread.is_warm,
             position=self._pos_a(),
@@ -495,10 +501,10 @@ class TakerTakerArbitrage(BaseStrategy):
         # decision until its edge has survived the confirmation window. A
         # no-op when disabled. Runs BEFORE the cap / risk gates so those only
         # ever see a confirmed fire.
-        left_ticked = a_q.ts_ms != self._prev_a_ts
-        right_ticked = b_q.ts_ms != self._prev_b_ts
-        self._prev_a_ts = a_q.ts_ms
-        self._prev_b_ts = b_q.ts_ms
+        left_ticked = a_book.ts_ms != self._prev_a_ts
+        right_ticked = b_book.ts_ms != self._prev_b_ts
+        self._prev_a_ts = a_book.ts_ms
+        self._prev_b_ts = b_book.ts_ms
         d = self._gate.admit(d, left_ticked=left_ticked, right_ticked=right_ticked)
 
         if d is not None and d.outcome is Verdict.FIRED:
@@ -538,7 +544,7 @@ class TakerTakerArbitrage(BaseStrategy):
                 self._risk_blocked = False
                 _log.info("risk block cleared — resuming entries")
 
-        self._maybe_heartbeat(now, a_q.mid, b_q.mid, bias, d)
+        self._maybe_heartbeat(now, mid_a, mid_b, bias, d)
         return d
 
     def _maybe_heartbeat(
@@ -573,16 +579,14 @@ class TakerTakerArbitrage(BaseStrategy):
 
     # ---- order firing ----
 
-    async def _fire(self, d: Decision, a_q: Quote, b_q: Quote) -> ExecutionResult:
+    async def _fire(self, d: Decision) -> ExecutionResult:
         """Resolve Direction → venue-side intents, delegate execution,
         then apply the ExecutionResult to position / risk.
 
         Strategy owns the Direction→Side resolution because Direction is
         a strategy concept; the executor only sees concrete `Side`s.
         Strategy also owns position / risk updates because
-        they feed back into the next `_assess`. `a_q`/`b_q` are threaded in
-        only to stamp the legs' decision-time per-venue context (mid / quote
-        freshness / position / depth) — telemetry the executor never sees."""
+        they feed back into the next `_assess`."""
         assert d.direction is not None
         qty = self.cfg.strategy.qty
         # Decision-time position the signal saw (left leg = the single position
@@ -621,11 +625,6 @@ class TakerTakerArbitrage(BaseStrategy):
                 timeline=d.timeline,
             )
             d.failure_reason = result.failure_reason
-            # Stamp each leg's per-venue context (quote freshness). result.legs
-            # is ordered [leg_a, leg_b], lining up with a_q/b_q.
-            if len(result.legs) == 2:
-                _stamp_leg_ctx(result.legs[0], a_q)
-                _stamp_leg_ctx(result.legs[1], b_q)
             entry_legs = [lg for lg in result.legs if lg.kind is LegKind.ENTRY]
             assert len(entry_legs) == 2
             d.send_ts_ms = entry_legs[0].send_ts_ms
@@ -690,11 +689,3 @@ class TakerTakerArbitrage(BaseStrategy):
         # Hand the execution result back so the caller can record the legs
         # separately (Decision no longer carries them).
         return result
-
-
-def _stamp_leg_ctx(leg: LegOutcome, q: Quote) -> None:
-    """Attach a leg's per-venue decision-time context: this venue's quote
-    freshness (staleness forensics). That's all the leg owns — fill quality is
-    `realized − expected_price` (the book is already folded into expected_price),
-    and decision-time inventory is a decision-level fact on the `trades` row."""
-    leg.quote_ts_ms = q.ts_ms
