@@ -6,7 +6,6 @@ from __future__ import annotations
 import csv
 from decimal import Decimal
 
-import perp_arb.core.decision as decmod
 from perp_arb.core.csv_recorder import (
     CsvRecorder,
     _decision_header,
@@ -24,7 +23,7 @@ from perp_arb.core.types import LegKind, LegOutcome, OrderStatus, Side
 
 def test_timeline_span_none_until_both_marks(monkeypatch) -> None:
     clock = {"t": 1000}
-    monkeypatch.setattr(decmod, "mono_ms", lambda: clock["t"])
+    monkeypatch.setattr("perp_arb.core.decision.mono_ms", lambda: clock["t"])
     tl = Timeline()
     assert tl.span("decision", "send") is None
     tl.mark("decision")
@@ -57,7 +56,7 @@ def _read(path):
 
 def test_fired_decision_emits_one_decision_row_and_two_leg_rows(tmp_path, monkeypatch) -> None:
     clock = {"t": 0}
-    monkeypatch.setattr(decmod, "mono_ms", lambda: clock["t"])
+    monkeypatch.setattr("perp_arb.core.decision.mono_ms", lambda: clock["t"])
     rec = CsvRecorder(tmp_path, run_ts="TEST")
 
     d = Decision(
