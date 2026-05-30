@@ -65,7 +65,7 @@ _SCHEMA: dict[str, dict] = {
                  ("direction", "TEXT"), ("edge_bps", "TEXT"), ("bias", "TEXT"),
                  ("send_ts_ms", "INTEGER"), ("lat_decision_send_ms", "INTEGER"),
                  ("realised_pnl", "TEXT"), ("success", "INTEGER"),
-                 ("failure_reason", "TEXT")),
+                 ("failure_reason", "TEXT"), ("position_before", "TEXT")),
         "unique": "decision_id",
     },
     "legs": {
@@ -75,7 +75,7 @@ _SCHEMA: dict[str, dict] = {
                  ("realized_price", "TEXT"), ("status", "TEXT"), ("success", "INTEGER"),
                  ("error_message", "TEXT"), ("client_id", "TEXT"), ("total_fee", "TEXT"),
                  ("send_ts_ms", "INTEGER"), ("fill_ts_ms", "INTEGER"), ("kind", "TEXT"),
-                 ("quote_ts_ms", "INTEGER"), ("position_before", "TEXT")),
+                 ("quote_ts_ms", "INTEGER")),
         "unique": "decision_id, venue, kind",
     },
 }
@@ -218,7 +218,7 @@ class SqliteRecorder(Recorder):
             d.direction.value if d.direction else None,
             _txt(d.edge_bps.quantize(Decimal("0.1"))), _txt(d.bias),
             _int(d.send_ts_ms), _int(d.timeline.latencies()["lat_decision_send_ms"]),
-            _txt(d.realised_pnl), int(success), failure,
+            _txt(d.realised_pnl), int(success), failure, _txt(d.position_before),
         )
 
     def _leg_row(self, decision_id: str, ts_ms: int, lg: LegOutcome) -> tuple:
@@ -229,7 +229,7 @@ class SqliteRecorder(Recorder):
             _txt(lg.avg_price), lg.status.value, int(lg.success), lg.error_message,
             lg.client_id, _txt(lg.total_fee), _int(lg.send_ts_ms), _int(lg.fill_ts_ms),
             lg.kind.value if lg.kind else None,
-            _int(lg.quote_ts_ms), _txt(lg.position_before),
+            _int(lg.quote_ts_ms),
         )
 
     # ----- Turso sync (background) -----

@@ -48,7 +48,6 @@ def _leg(venue: str, side: Side, px: str) -> LegOutcome:
     lg.last_ts_ms = 1_700_000_000_810
     lg.kind = LegKind.ENTRY
     lg.quote_ts_ms = 1_700_000_000_400
-    lg.position_before = Decimal("0.24")
     return lg
 
 
@@ -61,7 +60,7 @@ def _fired(run_id: str) -> tuple[Decision, list[LegOutcome]]:
         mid_left=Decimal("88.61"), mid_right=Decimal("88.63"),
         left_quote_ts_ms=1, right_quote_ts_ms=1, bias=Decimal("0.0107"),
         edge_bps=Decimal("1.94"), direction=Direction.B, outcome=Verdict.FIRED,
-        timeline=tl,
+        timeline=tl, position_before=Decimal("0.24"),
     )
     legs = [_leg("lighter", Side.BUY, "88.61"), _leg("aster", Side.SELL, "88.63")]
     d.send_ts_ms = legs[0].send_ts_ms
@@ -108,25 +107,25 @@ async def test_turso_roundtrip(tmp_path):
         try:
             # trades: 1 row, success, direction, lat round-tripped
             rs = await client.execute(
-                "SELECT decision_id, direction, success, lat_decision_send_ms "
-                "FROM trades WHERE run_id=?", [run_id])
+                "SELECT decision_id, direction, success, lat_decision_send_ms, "
+                "position_before FROM trades WHERE run_id=?", [run_id])
             assert len(rs.rows) == 1
             row = rs.rows[0]
             assert row[0] == f"{run_id}-f0"
             assert row[1] == "B"
             assert row[2] == 1
             assert row[3] == 2          # SEND(102) - DECISION(100)
+            assert row[4] == "0.24"     # decision-time inventory on trades
 
             # legs: 2 rows; per-venue context lands losslessly as TEXT
             rs = await client.execute(
-                "SELECT venue, side, realized_price, position_before, quote_ts_ms "
+                "SELECT venue, side, realized_price, quote_ts_ms "
                 "FROM legs WHERE run_id=? ORDER BY venue", [run_id])
             assert len(rs.rows) == 2
             aster, lighter = rs.rows[0], rs.rows[1]
             assert aster[0] == "aster" and lighter[0] == "lighter"
             assert lighter[2] == "88.61"          # realized_price
-            assert lighter[3] == "0.24"           # position_before
-            assert lighter[4] == 1_700_000_000_400  # quote_ts_ms (INTEGER)
+            assert lighter[3] == 1_700_000_000_400  # quote_ts_ms (INTEGER)
 
             # rejection: 1 row, no legs
             rs = await client.execute(

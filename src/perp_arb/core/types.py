@@ -224,14 +224,14 @@ class LegOutcome:
     kind: LegKind | None = None
 
     # decision-time per-venue context — stamped by the live strategy after the
-    # execute() gather (the executor does not see them). These carry what
-    # `expected_price` can't: execution quality is `realized vs expected_price`
-    # (both already recorded), so the book/BBO is NOT re-stored here — it was
-    # already folded into `expected_price`. All None in backtest / CSV path; the
-    # live SQLite recorder reads them. Deliberately NOT in `_CSV_FIELDS` so the
-    # backtest legs CSV stays byte-for-byte unchanged.
+    # execute() gather (the executor does not see it). Per-venue, so it belongs
+    # on the leg, not the per-decision `trades` row: each venue's quote freshness
+    # at decision. (Decision-time inventory is NOT here — it's a single
+    # decision-level quantity on `Decision.position_before` / the trades row;
+    # and the book/BBO isn't re-stored — already folded into `expected_price`.)
+    # None in backtest / CSV path; the live SQLite recorder reads it. Deliberately
+    # NOT in `_CSV_FIELDS` so the backtest legs CSV stays byte-for-byte unchanged.
     quote_ts_ms: int | None = None          # this venue's quote freshness at decision (staleness forensics)
-    position_before: Decimal | None = None  # this venue's signed position pre-fire (entry vs reverse)
 
     def add(self, event: OrderSnapshot | FillDelta) -> None:
         """Absorb a WS event. `OrderSnapshot` (lighter cumulative state)

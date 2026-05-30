@@ -43,9 +43,8 @@ def _leg(venue: str, side: Side, *, success=True, error=None) -> LegOutcome:
     lg.send_ts_ms = 1_700_000_000_500
     lg.last_ts_ms = 1_700_000_000_810
     lg.kind = LegKind.ENTRY
-    # decision-time per-venue context (stamped by the live strategy)
+    # per-venue decision-time context (stamped by the live strategy)
     lg.quote_ts_ms = 1_700_000_000_400
-    lg.position_before = Decimal("0.24")
     return lg
 
 
@@ -61,6 +60,7 @@ def _decision(outcome: Verdict, *, did="d-1", legs=None, failure_reason=None) ->
         direction=Direction.B if outcome is Verdict.FIRED else None,
         outcome=outcome, timeline=tl,
         failure_reason=failure_reason,
+        position_before=Decimal("0.24"),
     )
     if legs is not None:
         d.send_ts_ms = legs[0].send_ts_ms
@@ -97,10 +97,10 @@ def test_fired_routes_to_trades_and_legs(tmp_path):
     assert t["success"] == 1
     assert t["failure_reason"] is None
     assert t["lat_decision_send_ms"] == 1          # SEND(101) - DECISION(100)
+    assert t["position_before"] == "0.24"          # decision-time inventory on trades
     # per-leg context round-trips losslessly as TEXT
     lg = legrows[0]
     assert lg["venue"] == "lighter"
-    assert lg["position_before"] == "0.24"
     assert lg["quote_ts_ms"] == 1_700_000_000_400
     assert lg["realized_price"] == "88.62"
 

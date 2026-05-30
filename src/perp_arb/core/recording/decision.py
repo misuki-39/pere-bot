@@ -118,4 +118,10 @@ class Decision:
     # the result summary, sourced from `ExecutionResult.failure_reason`, not the
     # legs. Live-SQLite-only, kept out of the CSV projection.
     failure_reason: str | None = None
+    # Decision-time signed position the signal saw (the left-leg `pos_a` that
+    # drives inventory-skew / the position cap) — the *state the decision was
+    # made in*, not an execution detail, so it lives on the `trades` row, not on
+    # legs. Can't be reconstructed post-hoc (WS-truth inventory; startup seed is
+    # not in the DB). Live-SQLite-only, kept out of the CSV projection.
+    position_before: Decimal | None = None
     timeline: Timeline = field(default_factory=Timeline)

@@ -585,9 +585,11 @@ class TakerTakerArbitrage(BaseStrategy):
         freshness / position / depth) — telemetry the executor never sees."""
         assert d.direction is not None
         qty = self.cfg.strategy.qty
-        # Decision-time positions, captured before the execute() await mutates
-        # the WS/overlay view.
-        pos_a_before, pos_b_before = self._pos_a(), self._pos_b()
+        # Decision-time position the signal saw (left leg = the single position
+        # that drives skew / cap), captured before the execute() await mutates
+        # the WS/overlay view. A decision-level fact → recorded on the trades row.
+        pos_a_before = self._pos_a()
+        d.position_before = pos_a_before
         a_side, b_side = left_side(d.direction), right_side(d.direction)
         if d.direction is Direction.A:
             a_exp, b_exp = d.vwap_left_sell, d.vwap_right_buy
@@ -619,12 +621,11 @@ class TakerTakerArbitrage(BaseStrategy):
                 timeline=d.timeline,
             )
             d.failure_reason = result.failure_reason
-            # Stamp each leg's decision-time per-venue context. result.legs is
-            # ordered [leg_a, leg_b]; a_q/b_q and the pre-fire positions line up
-            # by that order. Quote already carries top-of-book sizes.
+            # Stamp each leg's per-venue context (quote freshness). result.legs
+            # is ordered [leg_a, leg_b], lining up with a_q/b_q.
             if len(result.legs) == 2:
-                _stamp_leg_ctx(result.legs[0], a_q, pos_a_before)
-                _stamp_leg_ctx(result.legs[1], b_q, pos_b_before)
+                _stamp_leg_ctx(result.legs[0], a_q)
+                _stamp_leg_ctx(result.legs[1], b_q)
             entry_legs = [lg for lg in result.legs if lg.kind is LegKind.ENTRY]
             assert len(entry_legs) == 2
             d.send_ts_ms = entry_legs[0].send_ts_ms
@@ -691,11 +692,9 @@ class TakerTakerArbitrage(BaseStrategy):
         return result
 
 
-def _stamp_leg_ctx(leg: LegOutcome, q: Quote, position_before: Decimal) -> None:
-    """Attach a leg's decision-time per-venue context for the SQLite recorder.
-    Only what `expected_price` can't carry: quote freshness (staleness
-    forensics) and the pre-fire position (entry vs reverse / inventory). The
-    book itself is not re-stamped — it was already folded into `expected_price`,
-    against which fill quality (`realized − expected`) is measured."""
+def _stamp_leg_ctx(leg: LegOutcome, q: Quote) -> None:
+    """Attach a leg's per-venue decision-time context: this venue's quote
+    freshness (staleness forensics). That's all the leg owns — fill quality is
+    `realized − expected_price` (the book is already folded into expected_price),
+    and decision-time inventory is a decision-level fact on the `trades` row."""
     leg.quote_ts_ms = q.ts_ms
-    leg.position_before = position_before
