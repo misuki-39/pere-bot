@@ -39,8 +39,8 @@ from .decision import Decision, Verdict
 from .recorder import Recorder
 
 if TYPE_CHECKING:
-    from .config import TursoCfg
-    from .types import LegOutcome
+    from ..config import TursoCfg
+    from ..types import LegOutcome
 
 _log = logging.getLogger(__name__)
 

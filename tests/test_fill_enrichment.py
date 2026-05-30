@@ -19,17 +19,17 @@ from pathlib import Path
 
 import pytest
 
-from perp_arb.core.csv_recorder import (
+from perp_arb.core.exchange import BaseExchange
+from perp_arb.core.recording.csv_recorder import (
     CsvRecorder,
     _decision_header,
     _leg_header,
 )
-from perp_arb.core.decision import (
+from perp_arb.core.recording.decision import (
     Decision,
     Direction,
     Verdict,
 )
-from perp_arb.core.exchange import BaseExchange
 from perp_arb.core.types import (
     FillDelta,
     LegKind,

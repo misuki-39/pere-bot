@@ -10,8 +10,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 
-from ..core.csv_recorder import CsvRecorder
-from ..core.recorder import Recorder
+from ..core.recording.csv_recorder import CsvRecorder
+from ..core.recording.recorder import Recorder
 from ..strategy.persistence_gate import PersistenceParams
 from .base import StrategyContext
 from .dataset import load_capture

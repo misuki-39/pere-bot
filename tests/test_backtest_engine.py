@@ -16,8 +16,8 @@ from perp_arb.backtest.fills import FillModelKind
 from perp_arb.backtest.intents import OrderIntent
 from perp_arb.backtest.latency import BookIndex, LatencyModel
 from perp_arb.backtest.snapshot import MarketSnapshot
-from perp_arb.core.csv_recorder import CsvRecorder
-from perp_arb.core.decision import Decision, Verdict
+from perp_arb.core.recording.csv_recorder import CsvRecorder
+from perp_arb.core.recording.decision import Decision, Verdict
 from perp_arb.core.types import Side
 
 

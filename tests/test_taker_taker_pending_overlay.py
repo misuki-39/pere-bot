@@ -22,14 +22,14 @@ from decimal import Decimal
 
 import pytest
 
-from perp_arb.core.decision import (
+from perp_arb.core.executor import ExecutionResult
+from perp_arb.core.recording.decision import (
     Decision,
     Direction,
     Phase,
     Timeline,
     Verdict,
 )
-from perp_arb.core.executor import ExecutionResult
 from perp_arb.core.types import (
     LegKind,
     LegOutcome,

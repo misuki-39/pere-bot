@@ -32,9 +32,9 @@ from decimal import Decimal
 
 from ..utils.precision import vwap_fill
 from ..utils.time import now_ms
-from .decision import Phase, Timeline
 from .exchange import BaseExchange
 from .pnl import pair_pnl_from_legs
+from .recording.decision import Phase, Timeline
 from .types import LegKind, LegOutcome, MarketInfo, OrderStatus, Side
 
 _log = logging.getLogger(__name__)

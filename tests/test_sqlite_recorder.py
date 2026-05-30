@@ -1,4 +1,4 @@
-"""Tests for the live SQLite recorder (core/sqlite_recorder.py).
+"""Tests for the live SQLite recorder (core/recording/sqlite_recorder.py).
 
 Covers: outcome routing into the three-table model, local round-trip of the
 per-leg context fields, ON CONFLICT idempotency, and the Turso sync cursor
@@ -12,8 +12,8 @@ import sqlite3
 from decimal import Decimal
 
 from perp_arb.core.config import TursoCfg
-from perp_arb.core.decision import Decision, Direction, Phase, Timeline, Verdict
-from perp_arb.core.sqlite_recorder import SqliteRecorder
+from perp_arb.core.recording.decision import Decision, Direction, Phase, Timeline, Verdict
+from perp_arb.core.recording.sqlite_recorder import SqliteRecorder
 from perp_arb.core.types import LegKind, LegOutcome, OrderStatus, Side
 
 _RUN = "20260530T120000Z"

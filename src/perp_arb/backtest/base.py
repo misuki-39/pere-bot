@@ -17,7 +17,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from decimal import Decimal
 
-from ..core.recorder import Recorder
+from ..core.recording.recorder import Recorder
 from ..strategy.persistence_gate import PersistenceParams
 from .fills import FillModelKind
 from .intents import FillEvent, OrderIntent

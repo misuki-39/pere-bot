@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
 
-from ..utils.time import mono_ms
+from ...utils.time import mono_ms
 
 
 class Verdict(StrEnum):

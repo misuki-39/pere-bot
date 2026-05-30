@@ -23,8 +23,8 @@ from decimal import Decimal
 import pytest
 
 from perp_arb.core.config import TursoCfg
-from perp_arb.core.decision import Decision, Direction, Phase, Timeline, Verdict
-from perp_arb.core.sqlite_recorder import _SYNCED_TABLES, SqliteRecorder, _http_url
+from perp_arb.core.recording.decision import Decision, Direction, Phase, Timeline, Verdict
+from perp_arb.core.recording.sqlite_recorder import _SYNCED_TABLES, SqliteRecorder, _http_url
 from perp_arb.core.types import LegKind, LegOutcome, OrderStatus, Side
 
 libsql_client = pytest.importorskip(

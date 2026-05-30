@@ -18,7 +18,7 @@ from perp_arb.backtest.fills import FillModelKind
 from perp_arb.backtest.latency import LatencyModel
 from perp_arb.backtest.runner import build_context
 from perp_arb.backtest.strategies import TakerTakerBT
-from perp_arb.core.csv_recorder import CsvRecorder
+from perp_arb.core.recording.csv_recorder import CsvRecorder
 
 
 def _row(ts: int, mid_left: str, mid_right: str, *,

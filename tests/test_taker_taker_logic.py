@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from perp_arb.core.decision import Direction, Verdict
+from perp_arb.core.recording.decision import Direction, Verdict
 from perp_arb.core.types import BookLevel, OrderBook, Quote, Symbol
 from perp_arb.strategy.base import SpreadModel, TimeEwma
 from perp_arb.strategy.reversion_signal import (

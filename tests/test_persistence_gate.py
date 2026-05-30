@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from perp_arb.core.decision import Decision, Direction, Verdict
+from perp_arb.core.recording.decision import Decision, Direction, Verdict
 from perp_arb.strategy.persistence_gate import PersistenceGate, PersistenceParams
 
 

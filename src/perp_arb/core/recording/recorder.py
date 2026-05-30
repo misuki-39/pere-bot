@@ -17,8 +17,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
+from ..types import LegOutcome
 from .decision import Decision
-from .types import LegOutcome
 
 
 class Recorder(ABC):

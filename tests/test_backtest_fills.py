@@ -7,7 +7,7 @@ from decimal import Decimal
 from perp_arb.backtest.dataset import BBORow
 from perp_arb.backtest.fills import BBOFill, FillModelKind, VwapFill
 from perp_arb.backtest.intents import OrderIntent
-from perp_arb.core.decision import Decision, Verdict
+from perp_arb.core.recording.decision import Decision, Verdict
 from perp_arb.core.types import Side
 
 
